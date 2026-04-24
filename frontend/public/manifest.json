@@ -1,0 +1,16 @@
+{
+  "short_name": "UGCad.io",
+  "name": "UGCad.io - UGC Marketplace",
+  "description": "Connect Creators with Brands Seamlessly",
+  "icons": [
+    {
+      "src": "ugcad-logo.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#667eea",
+  "background_color": "#ffffff"
+}
