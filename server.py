@@ -969,23 +969,6 @@ async def send_message(data: ChatMessage, current_user: dict = Depends(get_curre
         "warning_count": user.get('warning_count', 0) if warning_issued else None
     }
 
-@api_router.get("/chat/{other_user_id}")
-async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_current_user)):
-    messages = await db.messages.find({
-        "$or": [
-            {"sender_id": current_user['id'], "recipient_id": other_user_id},
-            {"sender_id": other_user_id, "recipient_id": current_user['id']}
-        ]
-    }, {"_id": 0}).sort("timestamp", 1).to_list(1000)
-    
-    # Mark as read
-    await db.messages.update_many(
-        {"sender_id": other_user_id, "recipient_id": current_user['id']},
-        {"$set": {"read": True}}
-    )
-    
-    return messages
-
 @api_router.get("/chat/conversations")
 async def get_conversations(current_user: dict = Depends(get_current_user)):
     messages = await db.messages.find({
@@ -994,27 +977,35 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
             {"recipient_id": current_user['id']}
         ]
     }, {"_id": 0}).to_list(10000)
-    
-    # Group by conversation partner
+
+    # Group by conversation partner and compute unread count per partner
     conversations = {}
+    unread_per_partner = {}
+
     for msg in messages:
         # Skip system messages for conversation grouping
         if msg['sender_id'] == 'system':
             continue
-            
+
         other_id = msg['recipient_id'] if msg['sender_id'] == current_user['id'] else msg['sender_id']
-        
+
+        # Count unread from this partner
+        if msg['sender_id'] == other_id and msg['recipient_id'] == current_user['id'] and not msg.get('read'):
+            unread_per_partner[other_id] = unread_per_partner.get(other_id, 0) + 1
+
         # Update conversation only if this is a newer message
         if other_id not in conversations or msg['timestamp'] > conversations[other_id]['last_message']['timestamp']:
-            other_user = await db.users.find_one({"id": other_id}, {"_id": 0, "nickname": 1, "role": 1})
+            other_user = await db.users.find_one({"id": other_id}, {"_id": 0, "nickname": 1, "role": 1, "profile_picture": 1})
             if other_user:  # Only add if user exists
                 conversations[other_id] = {
                     "user_id": other_id,
                     "nickname": other_user.get('nickname', 'Unknown'),
                     "role": other_user.get('role', ''),
-                    "last_message": msg
+                    "profile_picture": other_user.get('profile_picture'),
+                    "last_message": msg,
+                    "unread_count": unread_per_partner.get(other_id, 0)
                 }
-    
+
     return list(conversations.values())
 
 @api_router.get("/chat/unread-count")
@@ -1034,6 +1025,23 @@ async def get_user_warnings(current_user: dict = Depends(get_current_user)):
         "banned": user.get('banned', False),
         "last_warning_at": user.get('last_warning_at')
     }
+
+@api_router.get("/chat/{other_user_id}")
+async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_current_user)):
+    messages = await db.messages.find({
+        "$or": [
+            {"sender_id": current_user['id'], "recipient_id": other_user_id},
+            {"sender_id": other_user_id, "recipient_id": current_user['id']}
+        ]
+    }, {"_id": 0}).sort("timestamp", 1).to_list(1000)
+
+    # Mark as read
+    await db.messages.update_many(
+        {"sender_id": other_user_id, "recipient_id": current_user['id']},
+        {"$set": {"read": True}}
+    )
+
+    return messages
 
 @api_router.get("/admin/violations")
 async def get_all_violations(current_user: dict = Depends(get_current_user)):
@@ -1201,6 +1209,49 @@ async def request_revision(work_id: str, feedback: str, current_user: dict = Dep
     )
     
     return {"message": "Revision requested"}
+
+@api_router.get("/deals/my")
+async def get_my_deals(current_user: dict = Depends(get_current_user)):
+    if current_user['role'] != UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Only creators can access this")
+
+    campaigns = await db.campaigns.find({
+        "selected_creator": current_user['id'],
+        "status": {"$in": ["in_progress", "completed"]}
+    }, {"_id": 0}).to_list(100)
+
+    result = []
+    for campaign in campaigns:
+        my_bid = next((b for b in (campaign.get('bids') or []) if b['creator_id'] == current_user['id']), None)
+
+        shipment = None
+        if campaign.get('requires_shipment'):
+            shipment = await db.shipments.find_one({"campaign_id": campaign['id']}, {"_id": 0})
+
+        work = await db.work_submissions.find_one(
+            {"campaign_id": campaign['id'], "creator_id": current_user['id']},
+            {"_id": 0}
+        )
+
+        escrow = await db.escrow.find_one({"campaign_id": campaign['id']}, {"_id": 0})
+
+        result.append({
+            "campaign": campaign,
+            "my_bid": my_bid,
+            "shipment": shipment,
+            "work_submission": work,
+            "escrow": escrow
+        })
+
+    return result
+
+@api_router.get("/work/campaign/{campaign_id}")
+async def get_work_by_campaign(campaign_id: str, current_user: dict = Depends(get_current_user)):
+    work = await db.work_submissions.find_one(
+        {"campaign_id": campaign_id, "creator_id": current_user['id']},
+        {"_id": 0}
+    )
+    return work or {}
 
 # Review Routes
 @api_router.post("/reviews")
