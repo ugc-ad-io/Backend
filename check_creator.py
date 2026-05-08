@@ -5,7 +5,7 @@ async def check_creator():
     client = AsyncIOMotorClient('mongodb://localhost:27017')
     db = client['test_database']
     
-    user = await db.users.find_one({'email': 'creator@test.com'}, {'_id': 0, 'password': 0})
+    user = await db.users.find_one({'email': 'testcreator@test.com'}, {'_id': 0, 'password': 0})
     
     if user:
         print("Creator found:")
