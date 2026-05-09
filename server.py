@@ -1135,7 +1135,7 @@ async def get_chat_for_admin(user1_id: str, user2_id: str, current_user: dict = 
 async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
         raise HTTPException(status_code=403, detail="Only creators can submit work")
-    
+
     work_doc = {
         "id": str(uuid.uuid4()),
         "campaign_id": data.campaign_id,
@@ -1146,8 +1146,15 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         "submitted_at": datetime.now(timezone.utc).isoformat(),
         "revisions": []
     }
-    
+
     await db.work_submissions.insert_one(work_doc)
+
+    # Update campaign status to work_submitted
+    await db.campaigns.update_one(
+        {"id": data.campaign_id},
+        {"$set": {"status": "work_submitted"}}
+    )
+
     return {"message": "Work submitted successfully"}
 
 @api_router.post("/work/{work_id}/approve")
@@ -1252,6 +1259,27 @@ async def get_work_by_campaign(campaign_id: str, current_user: dict = Depends(ge
         {"_id": 0}
     )
     return work or {}
+
+@api_router.get("/work/pending-review")
+async def get_work_pending_review(current_user: dict = Depends(get_current_user)):
+    """Get all work submissions pending review for a business"""
+    if current_user['role'] != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only businesses can review work")
+
+    # Get all campaigns for this business
+    campaigns = await db.campaigns.find(
+        {"business_id": current_user['id']},
+        {"_id": 0, "id": 1}
+    ).to_list(1000)
+    campaign_ids = [c['id'] for c in campaigns]
+
+    # Get work submissions for these campaigns
+    work_submissions = await db.work_submissions.find(
+        {"campaign_id": {"$in": campaign_ids}, "status": WorkStatus.SUBMITTED},
+        {"_id": 0}
+    ).to_list(1000)
+
+    return work_submissions
 
 # Review Routes
 @api_router.post("/reviews")
