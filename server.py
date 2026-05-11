@@ -774,6 +774,44 @@ async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Dep
     
     return {"message": "Bid submitted successfully"}
 
+@api_router.get("/bids/my")
+async def get_my_bids(current_user: dict = Depends(get_current_user)):
+    if current_user['role'] != UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Only creators can access their bids")
+
+    campaigns = await db.campaigns.find(
+        {"bids.creator_id": current_user['id']},
+        {"_id": 0}
+    ).to_list(1000)
+
+    result = []
+    for campaign in campaigns:
+        my_bid = next(
+            (bid for bid in campaign.get('bids', []) if bid.get('creator_id') == current_user['id']),
+            None
+        )
+        if not my_bid:
+            continue
+
+        selected_creator = campaign.get('selected_creator')
+        if selected_creator == current_user['id']:
+            bid_status = "approved"
+        elif selected_creator:
+            bid_status = "rejected"
+        else:
+            bid_status = "pending"
+
+        campaign_details = {key: value for key, value in campaign.items() if key != 'bids'}
+        result.append({
+            "campaign": campaign_details,
+            "my_bid": my_bid,
+            "bid_status": bid_status,
+            "campaign_status": campaign.get('status'),
+            "submitted_at": my_bid.get('submitted_at')
+        })
+
+    return result
+
 @api_router.post("/campaigns/{campaign_id}/select-creator")
 async def select_creator(campaign_id: str, creator_id: str, current_user: dict = Depends(get_current_user)):
     campaign = await db.campaigns.find_one({"id": campaign_id})
