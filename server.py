@@ -1281,6 +1281,22 @@ async def get_work_pending_review(current_user: dict = Depends(get_current_user)
 
     return work_submissions
 
+@api_router.get("/work/{work_id}")
+async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_user)):
+    """Get a single work submission by ID"""
+    work = await db.work_submissions.find_one({"id": work_id}, {"_id": 0})
+
+    if not work:
+        raise HTTPException(status_code=404, detail="Work not found")
+
+    # Verify authorization - user must be creator or the business reviewing it
+    if current_user['id'] != work['creator_id']:
+        campaign = await db.campaigns.find_one({"id": work['campaign_id']})
+        if campaign['business_id'] != current_user['id']:
+            raise HTTPException(status_code=403, detail="Not authorized to view this work")
+
+    return work
+
 # Review Routes
 @api_router.post("/reviews")
 async def submit_review(data: ReviewSubmit, current_user: dict = Depends(get_current_user)):
