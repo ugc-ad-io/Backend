@@ -200,6 +200,18 @@ class CampaignCreate(BaseModel):
     budget_min: float
     budget_max: float
     brief_text: str
+    deadline: Optional[str] = None
+    due_date: Optional[str] = None
+    content_requirements: Optional[Dict[str, bool]] = None
+    revision_limit: Optional[int] = 2
+    campaign_basics: Optional[str] = None
+    deliverables: Optional[str] = None
+    creative_requirements: Optional[str] = None
+    creative_restrictions: Optional[str] = None
+    style_guidance: Optional[str] = None
+    usage_rights: Optional[str] = None
+    timeline_budget: Optional[str] = None
+    review_summary: Optional[str] = None
     brief_attachments: List[str] = []
     requires_shipment: bool = False
     shipment_option: Optional[str] = 'no'  # 'yes', 'no', 'not_sure'
@@ -229,6 +241,9 @@ class ReviewSubmit(BaseModel):
 class ShipmentUpdate(BaseModel):
     campaign_id: str
     tracking_number: str
+    courier_name: Optional[str] = None
+    courier_tracking_url: Optional[str] = None
+    courier_status: Optional[str] = "shipped"
     courier_slip: str
     expected_delivery: str
     shipment_checklist: Dict[str, bool]
@@ -315,6 +330,36 @@ class BroadcastNotification(BaseModel):
     target_user_ids: Optional[List[str]] = None  # Specific user IDs
     link: Optional[str] = None
 
+class DealReceiptSubmit(BaseModel):
+    received_at: Optional[str] = None
+    unboxing_video_url: str
+    items_damaged: bool = False
+    damage_report: Optional[str] = None
+
+class DealContentSubmit(BaseModel):
+    video_url: str
+    caption_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    raw_footage_url: Optional[str] = None
+    creator_note: Optional[str] = None
+
+class DealRevisionResponseSubmit(BaseModel):
+    response: str
+    note: Optional[str] = None
+
+class DealChatSubmit(BaseModel):
+    message: str
+    attachment_urls: List[str] = []
+
+class DealActionCardSubmit(BaseModel):
+    type: str
+    message: str
+    attachment_urls: List[str] = []
+
+class DealIssueSubmit(BaseModel):
+    message: Optional[str] = None
+    attachment_urls: List[str] = []
+
 class StaffCreate(BaseModel):
     email: EmailStr
     nickname: str
@@ -370,6 +415,467 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def parse_iso(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+
+def hours_until(value: Optional[str]) -> Optional[int]:
+    target = parse_iso(value)
+    if not target:
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    return int((target - datetime.now(timezone.utc)).total_seconds() // 3600)
+
+def make_deal_id(campaign: dict) -> str:
+    if campaign.get('deal_id'):
+        return campaign['deal_id']
+    campaign_id = str(campaign.get('id', ''))
+    try:
+        number = uuid.UUID(campaign_id).int % 9000 + 1000
+    except (TypeError, ValueError):
+        number = sum(ord(ch) for ch in campaign_id) % 9000 + 1000
+    return f"DEAL-{number}"
+
+def get_required_assets(campaign: dict) -> dict:
+    checklist = campaign.get('content_requirements') or campaign.get('shipment_checklist') or {}
+    return {
+        "final_video": True,
+        "caption_script": bool(
+            checklist.get('caption_script') or
+            checklist.get('caption') or
+            campaign.get('caption_required')
+        ),
+        "thumbnail": bool(checklist.get('thumbnail') or campaign.get('thumbnail_required')),
+        "raw_footage": bool(
+            checklist.get('raw_footage') or
+            checklist.get('raw_files') or
+            campaign.get('raw_footage_required')
+        )
+    }
+
+def get_brief_sections(campaign: dict) -> List[dict]:
+    brief_text = campaign.get('brief_text') or ''
+    budget_text = f"Budget: {campaign.get('budget_min', 0)} - {campaign.get('budget_max', 0)} INR"
+    objectives = campaign.get('objectives') or []
+    objective_text = ', '.join(objectives) if objectives else brief_text
+    fields = [
+        ("Campaign Basics", campaign.get('campaign_basics') or brief_text),
+        ("Deliverables", campaign.get('deliverables') or objective_text),
+        ("Creative Requirements", campaign.get('creative_requirements') or brief_text),
+        ("Creative Restrictions", campaign.get('creative_restrictions') or campaign.get('restrictions') or ''),
+        ("Style Guidance", campaign.get('style_guidance') or campaign.get('tone') or ''),
+        ("Usage Rights", campaign.get('usage_rights') or campaign.get('usage') or ''),
+        ("Timeline & Budget", campaign.get('timeline_budget') or budget_text),
+        ("Review Summary", campaign.get('review_summary') or brief_text)
+    ]
+    return [{"title": title, "content": content or "Not specified"} for title, content in fields]
+
+def normalize_shipment(campaign: dict, shipment: Optional[dict]) -> dict:
+    shipment = shipment or {}
+    raw_status = shipment.get('courier_status') or shipment.get('status')
+    status_map = {
+        "shipped": "shipped",
+        "in_transit": "in_transit",
+        "delivered": "delivered",
+        "received": "delivered"
+    }
+    return {
+        "required": bool(campaign.get('requires_shipment')),
+        "tracking_id": shipment.get('tracking_id') or shipment.get('tracking_number'),
+        "courier_name": shipment.get('courier_name') or shipment.get('courier'),
+        "courier_tracking_url": shipment.get('courier_tracking_url') or shipment.get('tracking_url'),
+        "courier_status": status_map.get(raw_status, raw_status),
+        "expected_delivery_at": shipment.get('expected_delivery_at') or shipment.get('expected_delivery'),
+        "delivered_at": shipment.get('delivered_at')
+    }
+
+def normalize_receipt(shipment: Optional[dict], receipt: Optional[dict]) -> dict:
+    shipment = shipment or {}
+    receipt = receipt or {}
+    damage = receipt.get('damage_report') or shipment.get('dispute', {}).get('reason')
+    return {
+        "received_at": receipt.get('received_at') or shipment.get('received_at'),
+        "unboxing_video_url": (
+            receipt.get('unboxing_video_url') or
+            receipt.get('unboxing_video') or
+            shipment.get('unboxing_video_url') or
+            shipment.get('unboxing_video')
+        ),
+        "items_damaged": bool(receipt.get('items_damaged') or shipment.get('dispute', {}).get('reported')),
+        "damage_report": damage
+    }
+
+def normalize_escrow(escrow: Optional[dict], my_bid: Optional[dict], state: Optional[str] = None) -> dict:
+    escrow = escrow or {}
+    amount = float(escrow.get('amount') or escrow.get('held_amount') or (my_bid or {}).get('amount') or 0)
+    status_value = escrow.get('status') or ("released" if state == "Paid — Complete" else "held")
+    status_map = {
+        "held": "held",
+        "released": "released",
+        "on_hold": "on_hold",
+        "disputed": "on_hold"
+    }
+    deductions = escrow.get('deductions') or [
+        {"label": "TDS", "amount": 0},
+        {"label": "Penalty", "amount": 0}
+    ]
+    net_payable = escrow.get('net_payable')
+    if net_payable is None:
+        net_payable = amount - sum(float(item.get('amount') or 0) for item in deductions)
+    return {
+        "status": status_map.get(status_value, "held"),
+        "held_amount": amount,
+        "currency": escrow.get('currency') or "INR",
+        "net_payable": net_payable,
+        "deductions": deductions,
+        "estimated_payout_at": escrow.get('estimated_payout_at') or escrow.get('released_at')
+    }
+
+def normalize_content_submission(campaign: dict, content_versions: List[dict], work: Optional[dict]) -> dict:
+    versions = []
+    for version in content_versions:
+        versions.append({
+            "version": version.get('version'),
+            "video_url": version.get('video_url'),
+            "caption_url": version.get('caption_url'),
+            "thumbnail_url": version.get('thumbnail_url'),
+            "raw_footage_url": version.get('raw_footage_url'),
+            "submitted_at": version.get('submitted_at'),
+            "status": version.get('status', 'submitted')
+        })
+    if work and not versions:
+        work_files = work.get('work_files') or []
+        versions.append({
+            "version": 1,
+            "video_url": work_files[0] if work_files else None,
+            "caption_url": None,
+            "thumbnail_url": None,
+            "raw_footage_url": None,
+            "submitted_at": work.get('submitted_at'),
+            "status": work.get('status', 'submitted')
+        })
+    return {
+        "required_assets": get_required_assets(campaign),
+        "versions": versions,
+        "watermark_required_until_approval": True
+    }
+
+def normalize_revision_tracker(work: Optional[dict], response: Optional[dict]) -> dict:
+    revisions = (work or {}).get('revisions') or []
+    latest = revisions[-1] if revisions else {}
+    requested_changes = latest.get('requested_changes')
+    if not requested_changes and latest.get('feedback'):
+        requested_changes = [line.strip() for line in latest['feedback'].splitlines() if line.strip()]
+    return {
+        "revision_count_used": len(revisions),
+        "revision_limit": (work or {}).get('revision_limit', 2),
+        "latest_feedback": latest.get('feedback'),
+        "requested_changes": requested_changes or [],
+        "new_deadline_at": latest.get('new_deadline_at'),
+        "creator_response": (response or {}).get('response')
+    }
+
+def compute_deal_state(campaign: dict, shipment: Optional[dict], receipt: dict, work: Optional[dict], escrow: Optional[dict], action_cards: List[dict]) -> dict:
+    damaged = receipt.get('items_damaged') or any(card.get('type') == 'damage_report' and card.get('status') == 'open' for card in action_cards)
+    disputed = any(card.get('type') in ['raise_dispute', 'escalate_to_admin'] and card.get('status') == 'open' for card in action_cards)
+    shipment_status = (shipment or {}).get('status') or (shipment or {}).get('courier_status')
+    work_status = (work or {}).get('status')
+    escrow_status = (escrow or {}).get('status')
+
+    if damaged:
+        state, party, action = "Damaged/Wrong Product Reported", "brand", "Resolve damage report"
+        started = receipt.get('received_at') or now_iso()
+    elif disputed:
+        state, party, action = "Disputed", "admin", "Await admin resolution"
+        started = now_iso()
+    elif escrow_status == "released" and campaign.get('status') == CampaignStatus.COMPLETED:
+        state, party, action = "Paid — Complete", "system", "Deal complete"
+        started = (escrow or {}).get('released_at') or (work or {}).get('approved_at')
+    elif work_status == WorkStatus.APPROVED or campaign.get('status') == CampaignStatus.COMPLETED:
+        state, party, action = "Approved — Payment Processing", "system", "Process payout"
+        started = (work or {}).get('approved_at') or campaign.get('updated_at')
+    elif work_status == WorkStatus.REVISION_REQUESTED:
+        state, party, action = "Revision Requested", "creator", "Submit revised content"
+        revisions = (work or {}).get('revisions') or []
+        started = (revisions[-1] if revisions else {}).get('requested_at') or (work or {}).get('submitted_at')
+    elif work_status == WorkStatus.SUBMITTED or campaign.get('status') == "work_submitted":
+        state, party, action = "Content Submitted — Awaiting Review", "brand", "Review submitted content"
+        started = (work or {}).get('submitted_at')
+    elif receipt.get('received_at') or shipment_status == "received":
+        state, party, action = "Received — Content in Progress", "creator", "Submit content"
+        started = receipt.get('received_at') or (shipment or {}).get('received_at')
+    elif shipment_status == "delivered":
+        state, party, action = "Delivered — Awaiting Receipt Confirmation", "creator", "Confirm receipt"
+        started = (shipment or {}).get('delivered_at') or (shipment or {}).get('updated_at')
+    elif shipment_status in ["shipped", "in_transit"]:
+        state, party, action = "Shipped — In Transit", "creator", "Track shipment"
+        started = (shipment or {}).get('updated_at')
+    elif campaign.get('requires_shipment'):
+        state, party, action = "Accepted — Awaiting Shipment", "brand", "Upload shipment tracking"
+        started = campaign.get('work_started_at') or campaign.get('created_at')
+    else:
+        state, party, action = "Received — Content in Progress", "creator", "Submit content"
+        started = campaign.get('work_started_at') or campaign.get('created_at')
+
+    next_deadline = (
+        (work or {}).get('due_at') or
+        (shipment or {}).get('expected_delivery_at') or
+        (shipment or {}).get('expected_delivery') or
+        campaign.get('deadline') or
+        campaign.get('due_date')
+    )
+    return {
+        "current_state": state,
+        "active_party": party,
+        "primary_next_action": action,
+        "state_started_at": started,
+        "next_deadline_at": next_deadline,
+        "deadline_countdown_hours": hours_until(next_deadline)
+    }
+
+def map_sender_type(sender_id: str, campaign: dict, creator_id: str, sender_role: Optional[str] = None) -> str:
+    if sender_id == "system":
+        return "system"
+    if sender_role in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
+        return "admin"
+    if sender_id == creator_id:
+        return "creator"
+    if sender_id == campaign.get('business_id'):
+        return "brand"
+    return sender_role or "system"
+
+async def insert_deal_activity(campaign: dict, actor_type: str, actor_name: str, event_type: str, message: str) -> dict:
+    event = {
+        "id": str(uuid.uuid4()),
+        "deal_id": make_deal_id(campaign),
+        "campaign_id": campaign['id'],
+        "timestamp": now_iso(),
+        "actor_type": actor_type,
+        "actor_name": actor_name,
+        "event_type": event_type,
+        "message": message
+    }
+    await db.deal_activity.insert_one(event)
+    return event
+
+async def insert_deal_system_message(campaign: dict, message: str) -> dict:
+    msg = {
+        "id": str(uuid.uuid4()),
+        "deal_id": make_deal_id(campaign),
+        "campaign_id": campaign['id'],
+        "sender_id": "system",
+        "sender_name": "System",
+        "sender_type": "system",
+        "message": message,
+        "attachment_urls": [],
+        "created_at": now_iso(),
+        "read_by": []
+    }
+    await db.deal_messages.insert_one(msg)
+    return msg
+
+async def get_campaign_by_deal_id(deal_id: str) -> Optional[dict]:
+    campaign = await db.campaigns.find_one({"$or": [{"deal_id": deal_id}, {"id": deal_id}]}, {"_id": 0})
+    if campaign:
+        return campaign
+    campaigns = await db.campaigns.find({}, {"_id": 0}).to_list(10000)
+    return next((item for item in campaigns if make_deal_id(item) == deal_id), None)
+
+def ensure_deal_access(campaign: dict, current_user: dict):
+    role = current_user.get('role')
+    if role == UserRole.CREATOR and campaign.get('selected_creator') == current_user['id']:
+        return
+    if role == UserRole.BUSINESS and campaign.get('business_id') == current_user['id']:
+        return
+    if role in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
+        return
+    raise HTTPException(status_code=403, detail="Not authorized for this deal")
+
+async def get_deal_context(deal_id: str, current_user: dict) -> dict:
+    campaign = await get_campaign_by_deal_id(deal_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    ensure_deal_access(campaign, current_user)
+    creator = await db.users.find_one({"id": campaign.get('selected_creator')}, {"_id": 0, "password": 0})
+    if not creator:
+        raise HTTPException(status_code=404, detail="Creator not found for deal")
+    brand = await db.users.find_one({"id": campaign.get('business_id')}, {"_id": 0, "password": 0})
+    if not brand:
+        raise HTTPException(status_code=404, detail="Brand not found for deal")
+    my_bid = next((bid for bid in campaign.get('bids', []) if bid.get('creator_id') == creator['id']), None)
+    shipment = await db.shipments.find_one({"campaign_id": campaign['id']}, {"_id": 0})
+    receipt = await db.deal_receipts.find_one({"campaign_id": campaign['id']}, {"_id": 0})
+    work = await db.work_submissions.find_one(
+        {"campaign_id": campaign['id'], "creator_id": creator['id']},
+        {"_id": 0},
+        sort=[("submitted_at", -1)]
+    )
+    escrow = await db.escrow.find_one({"campaign_id": campaign['id']}, {"_id": 0})
+    content_versions = await db.deal_content_submissions.find(
+        {"campaign_id": campaign['id'], "creator_id": creator['id']},
+        {"_id": 0}
+    ).sort("version", 1).to_list(100)
+    revision_response = await db.deal_revision_responses.find_one(
+        {"campaign_id": campaign['id'], "creator_id": creator['id']},
+        {"_id": 0},
+        sort=[("created_at", -1)]
+    )
+    action_cards = await db.deal_action_cards.find({"campaign_id": campaign['id']}, {"_id": 0}).sort("created_at", 1).to_list(100)
+    activity = await db.deal_activity.find({"campaign_id": campaign['id']}, {"_id": 0}).sort("timestamp", 1).to_list(200)
+    return {
+        "campaign": campaign,
+        "creator": creator,
+        "brand": brand,
+        "my_bid": my_bid,
+        "shipment": shipment,
+        "receipt": receipt,
+        "work": work,
+        "escrow": escrow,
+        "content_versions": content_versions,
+        "revision_response": revision_response,
+        "action_cards": action_cards,
+        "activity": activity
+    }
+
+async def build_deal_response(context: dict, viewer: dict) -> dict:
+    campaign = context['campaign']
+    creator = context['creator']
+    brand = context['brand']
+    normalized_shipment = normalize_shipment(campaign, context['shipment'])
+    normalized_receipt = normalize_receipt(context['shipment'], context['receipt'])
+    state = compute_deal_state(campaign, context['shipment'], normalized_receipt, context['work'], context['escrow'], context['action_cards'])
+    escrow = normalize_escrow(context['escrow'], context['my_bid'], state['current_state'])
+    content_submission = normalize_content_submission(campaign, context['content_versions'], context['work'])
+    revision_tracker = normalize_revision_tracker(context['work'], context['revision_response'])
+
+    legacy_messages = await db.messages.find({
+        "$or": [
+            {"sender_id": creator['id'], "recipient_id": brand['id']},
+            {"sender_id": brand['id'], "recipient_id": creator['id']},
+            {"sender_id": "system", "recipient_id": {"$in": [creator['id'], brand['id']]}}
+        ]
+    }, {"_id": 0}).sort("timestamp", 1).to_list(100)
+    deal_messages = await db.deal_messages.find({"campaign_id": campaign['id']}, {"_id": 0}).sort("created_at", 1).to_list(100)
+    messages = []
+    for msg in legacy_messages:
+        messages.append({
+            "id": msg.get('id'),
+            "sender_type": map_sender_type(msg.get('sender_id'), campaign, creator['id']),
+            "sender_name": msg.get('sender_nickname') or msg.get('sender_name') or 'User',
+            "message": msg.get('message'),
+            "attachment_urls": msg.get('attachment_urls', []),
+            "created_at": msg.get('timestamp')
+        })
+    for msg in deal_messages:
+        messages.append({
+            "id": msg.get('id'),
+            "sender_type": msg.get('sender_type') or map_sender_type(msg.get('sender_id'), campaign, creator['id']),
+            "sender_name": msg.get('sender_name') or msg.get('sender_nickname') or 'User',
+            "message": msg.get('message'),
+            "attachment_urls": msg.get('attachment_urls', []),
+            "created_at": msg.get('created_at') or msg.get('timestamp')
+        })
+    messages.sort(key=lambda item: item.get('created_at') or '')
+    unread_count = await db.messages.count_documents({"sender_id": brand['id'], "recipient_id": viewer['id'], "read": False})
+    unread_count += await db.deal_messages.count_documents({
+        "campaign_id": campaign['id'],
+        "sender_id": {"$ne": viewer['id']},
+        "read_by": {"$ne": viewer['id']}
+    })
+
+    activity_feed = context['activity'] or []
+    if not activity_feed:
+        activity_feed = []
+        if context['shipment']:
+            activity_feed.append({
+                "id": f"{campaign['id']}-shipment",
+                "timestamp": context['shipment'].get('updated_at') or campaign.get('work_started_at'),
+                "actor_type": "brand",
+                "actor_name": brand.get('nickname') or brand.get('email') or 'Brand',
+                "event_type": "tracking_uploaded",
+                "message": "Shipment tracking was uploaded."
+            })
+        if normalized_receipt.get('received_at'):
+            activity_feed.append({
+                "id": f"{campaign['id']}-receipt",
+                "timestamp": normalized_receipt['received_at'],
+                "actor_type": "creator",
+                "actor_name": creator.get('nickname') or creator.get('email') or 'Creator',
+                "event_type": "receipt_confirmed",
+                "message": "Product receipt was confirmed."
+            })
+        if context['work']:
+            activity_feed.append({
+                "id": f"{campaign['id']}-work",
+                "timestamp": context['work'].get('submitted_at'),
+                "actor_type": "creator",
+                "actor_name": creator.get('nickname') or creator.get('email') or 'Creator',
+                "event_type": "content_submitted",
+                "message": "Content was submitted for brand review."
+            })
+        if context['escrow'] and context['escrow'].get('released_at'):
+            activity_feed.append({
+                "id": f"{campaign['id']}-payment",
+                "timestamp": context['escrow'].get('released_at'),
+                "actor_type": "system",
+                "actor_name": "System",
+                "event_type": "payment_released",
+                "message": "Payment was released."
+            })
+
+    campaign_details = {key: value for key, value in campaign.items() if key != 'bids'}
+    can_mark_received = bool(campaign.get('requires_shipment')) and normalized_shipment.get('courier_status') in ['delivered', 'shipped', 'in_transit'] and not normalized_receipt.get('received_at')
+    can_submit_content = viewer.get('role') == UserRole.CREATOR and creator['id'] == viewer['id'] and state['active_party'] == 'creator' and state['current_state'] in [
+        "Received — Content in Progress",
+        "Revision Requested"
+    ]
+
+    return {
+        "deal_id": make_deal_id(campaign),
+        "campaign": campaign_details,
+        "brand": {
+            "id": brand.get('id'),
+            "name": brand.get('profile', {}).get('business_name') or brand.get('business_name') or brand.get('nickname') or brand.get('email'),
+            "handle": brand.get('nickname') if str(brand.get('nickname', '')).startswith('@') else f"@{brand.get('nickname', brand.get('id', 'brand'))}",
+            "logo_url": brand.get('profile', {}).get('logo') or brand.get('logo') or brand.get('profile_photo')
+        },
+        "creator": {
+            "id": creator.get('id'),
+            "name": creator.get('full_name') or creator.get('nickname') or creator.get('email'),
+            "handle": creator.get('nickname') if str(creator.get('nickname', '')).startswith('@') else f"@{creator.get('nickname', creator.get('id', 'creator'))}",
+            "profile_photo": creator.get('profile_photo') or creator.get('profile_picture')
+        },
+        **state,
+        "deadline": state.get('next_deadline_at'),
+        "escrow": escrow,
+        "my_bid": context['my_bid'],
+        "shipment": normalized_shipment,
+        "receipt": normalized_receipt,
+        "brief_sections": get_brief_sections(campaign),
+        "activity_feed": activity_feed,
+        "content_submission": content_submission,
+        "revision_tracker": revision_tracker,
+        "chat_summary": {
+            "thread_id": make_deal_id(campaign),
+            "messages": messages,
+            "unread_count": unread_count
+        },
+        "action_cards": context['action_cards'],
+        "unread_count": unread_count,
+        "can_submit_content": can_submit_content,
+        "can_mark_received": can_mark_received,
+        "can_raise_dispute": viewer.get('role') in [UserRole.CREATOR, UserRole.BUSINESS],
+        "can_report_damage": viewer.get('role') == UserRole.CREATOR and bool(campaign.get('requires_shipment')) and not normalized_receipt.get('items_damaged')
+    }
 
 # Auth Routes
 @api_router.post("/auth/signup")
@@ -1174,6 +1680,10 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
     if current_user['role'] != UserRole.CREATOR:
         raise HTTPException(status_code=403, detail="Only creators can submit work")
 
+    campaign = await db.campaigns.find_one({"id": data.campaign_id}, {"_id": 0})
+    if not campaign or campaign.get('selected_creator') != current_user['id']:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
     work_doc = {
         "id": str(uuid.uuid4()),
         "campaign_id": data.campaign_id,
@@ -1192,6 +1702,9 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         {"id": data.campaign_id},
         {"$set": {"status": "work_submitted"}}
     )
+
+    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", "Content was submitted for brand review.")
+    await insert_deal_system_message(campaign, "Content was submitted and is awaiting brand review.")
 
     return {"message": "Work submitted successfully"}
 
@@ -1230,6 +1743,9 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
         {"id": work['campaign_id']},
         {"$set": {"status": CampaignStatus.COMPLETED}}
     )
+
+    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "payment_released", "Work was approved and payment was released.")
+    await insert_deal_system_message(campaign, "Work was approved and payment was released.")
     
     return {"message": "Work approved and payment released"}
 
@@ -1252,6 +1768,9 @@ async def request_revision(work_id: str, feedback: str, current_user: dict = Dep
         {"id": work_id},
         {"$set": {"status": WorkStatus.REVISION_REQUESTED}, "$push": {"revisions": revision}}
     )
+
+    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "revision_requested", "Brand requested content revisions.")
+    await insert_deal_system_message(campaign, "Brand requested content revisions.")
     
     return {"message": "Revision requested"}
 
@@ -1261,34 +1780,263 @@ async def get_my_deals(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Only creators can access this")
 
     campaigns = await db.campaigns.find({
-        "selected_creator": current_user['id'],
-        "status": {"$in": ["in_progress", "completed"]}
+        "selected_creator": current_user['id']
     }, {"_id": 0}).to_list(100)
 
     result = []
     for campaign in campaigns:
-        my_bid = next((b for b in (campaign.get('bids') or []) if b['creator_id'] == current_user['id']), None)
-
-        shipment = None
-        if campaign.get('requires_shipment'):
-            shipment = await db.shipments.find_one({"campaign_id": campaign['id']}, {"_id": 0})
-
-        work = await db.work_submissions.find_one(
-            {"campaign_id": campaign['id'], "creator_id": current_user['id']},
-            {"_id": 0}
-        )
-
-        escrow = await db.escrow.find_one({"campaign_id": campaign['id']}, {"_id": 0})
-
-        result.append({
-            "campaign": campaign,
-            "my_bid": my_bid,
-            "shipment": shipment,
-            "work_submission": work,
-            "escrow": escrow
-        })
+        context = await get_deal_context(make_deal_id(campaign), current_user)
+        result.append(await build_deal_response(context, current_user))
 
     return result
+
+@api_router.post("/deals/{deal_id}/receipt")
+async def submit_deal_receipt(deal_id: str, data: DealReceiptSubmit, current_user: dict = Depends(get_current_user)):
+    if current_user['role'] != UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Only creators can submit receipts")
+    context = await get_deal_context(deal_id, current_user)
+    campaign = context['campaign']
+    if campaign.get('selected_creator') != current_user['id']:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    received_at = data.received_at or now_iso()
+    receipt_doc = {
+        "id": str(uuid.uuid4()),
+        "deal_id": make_deal_id(campaign),
+        "campaign_id": campaign['id'],
+        "creator_id": current_user['id'],
+        "received_at": received_at,
+        "unboxing_video_url": data.unboxing_video_url,
+        "items_damaged": data.items_damaged,
+        "damage_report": data.damage_report,
+        "created_at": now_iso()
+    }
+    await db.deal_receipts.update_one(
+        {"campaign_id": campaign['id'], "creator_id": current_user['id']},
+        {"$set": receipt_doc},
+        upsert=True
+    )
+    shipment_update = {
+        "status": "received",
+        "received_at": received_at,
+        "unboxing_video": data.unboxing_video_url
+    }
+    if data.items_damaged:
+        shipment_update["dispute"] = {
+            "reported": True,
+            "reason": data.damage_report,
+            "reported_at": now_iso()
+        }
+        await db.deal_action_cards.insert_one({
+            "id": str(uuid.uuid4()),
+            "deal_id": make_deal_id(campaign),
+            "campaign_id": campaign['id'],
+            "type": "damage_report",
+            "title": "Damaged or wrong product reported",
+            "status": "open",
+            "created_at": now_iso(),
+            "created_by": current_user['id'],
+            "message": data.damage_report,
+            "attachment_urls": [data.unboxing_video_url] if data.unboxing_video_url else []
+        })
+    await db.shipments.update_one({"campaign_id": campaign['id']}, {"$set": shipment_update}, upsert=True)
+    await insert_deal_activity(
+        campaign,
+        "creator",
+        current_user.get('nickname', 'Creator'),
+        "unboxing_uploaded" if data.unboxing_video_url else "receipt_confirmed",
+        "Receipt confirmed with unboxing video." if data.unboxing_video_url else "Receipt confirmed."
+    )
+    if data.items_damaged:
+        await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "dispute_raised", "Damaged or wrong product reported.")
+        await insert_deal_system_message(campaign, "Damaged or wrong product has been reported by the creator.")
+    return {"message": "Receipt submitted"}
+
+@api_router.post("/deals/{deal_id}/content")
+async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_user: dict = Depends(get_current_user)):
+    if current_user['role'] != UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Only creators can submit content")
+    context = await get_deal_context(deal_id, current_user)
+    campaign = context['campaign']
+    if campaign.get('selected_creator') != current_user['id']:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    required = get_required_assets(campaign)
+    missing = []
+    if required['final_video'] and not data.video_url:
+        missing.append('video_url')
+    if required['caption_script'] and not data.caption_url:
+        missing.append('caption_url')
+    if required['thumbnail'] and not data.thumbnail_url:
+        missing.append('thumbnail_url')
+    if required['raw_footage'] and not data.raw_footage_url:
+        missing.append('raw_footage_url')
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required assets: {', '.join(missing)}")
+
+    existing_versions = await db.deal_content_submissions.count_documents({
+        "campaign_id": campaign['id'],
+        "creator_id": current_user['id']
+    })
+    version = existing_versions + 1
+    submission = {
+        "id": str(uuid.uuid4()),
+        "deal_id": make_deal_id(campaign),
+        "campaign_id": campaign['id'],
+        "creator_id": current_user['id'],
+        "version": version,
+        "video_url": data.video_url,
+        "caption_url": data.caption_url,
+        "thumbnail_url": data.thumbnail_url,
+        "raw_footage_url": data.raw_footage_url,
+        "creator_note": data.creator_note,
+        "submitted_at": now_iso(),
+        "status": "submitted"
+    }
+    await db.deal_content_submissions.insert_one(submission)
+    work_doc = {
+        "id": str(uuid.uuid4()),
+        "campaign_id": campaign['id'],
+        "creator_id": current_user['id'],
+        "work_files": [url for url in [data.video_url, data.caption_url, data.thumbnail_url, data.raw_footage_url] if url],
+        "description": data.creator_note or f"Deal content submission v{version}",
+        "status": WorkStatus.SUBMITTED,
+        "submitted_at": submission['submitted_at'],
+        "revisions": []
+    }
+    await db.work_submissions.insert_one(work_doc)
+    await db.campaigns.update_one({"id": campaign['id']}, {"$set": {"status": "work_submitted", "updated_at": now_iso()}})
+    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", f"Content version {version} submitted for review.")
+    await insert_deal_system_message(campaign, f"Content version {version} was submitted and is awaiting brand review.")
+    return {"message": "Content submitted", "version": version}
+
+@api_router.post("/deals/{deal_id}/revision-response")
+async def submit_revision_response(deal_id: str, data: DealRevisionResponseSubmit, current_user: dict = Depends(get_current_user)):
+    if current_user['role'] != UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Only creators can respond to revisions")
+    if data.response not in ["accepted", "scope_creep", "partial_dispute"]:
+        raise HTTPException(status_code=400, detail="Invalid revision response")
+    context = await get_deal_context(deal_id, current_user)
+    campaign = context['campaign']
+    if campaign.get('selected_creator') != current_user['id']:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    response_doc = {
+        "id": str(uuid.uuid4()),
+        "deal_id": make_deal_id(campaign),
+        "campaign_id": campaign['id'],
+        "creator_id": current_user['id'],
+        "response": data.response,
+        "note": data.note,
+        "created_at": now_iso()
+    }
+    await db.deal_revision_responses.insert_one(response_doc)
+    event_type = "revision_requested" if data.response == "accepted" else "dispute_raised"
+    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), event_type, f"Creator responded to revision: {data.response}.")
+    await insert_deal_system_message(campaign, f"Creator responded to revision request: {data.response}.")
+    return {"message": "Revision response submitted"}
+
+@api_router.get("/deals/{deal_id}/chat")
+async def get_deal_chat(deal_id: str, current_user: dict = Depends(get_current_user)):
+    context = await get_deal_context(deal_id, current_user)
+    deal = await build_deal_response(context, current_user)
+    await db.deal_messages.update_many(
+        {"campaign_id": context['campaign']['id'], "sender_id": {"$ne": current_user['id']}},
+        {"$addToSet": {"read_by": current_user['id']}}
+    )
+    return deal["chat_summary"]
+
+@api_router.post("/deals/{deal_id}/chat")
+async def post_deal_chat(deal_id: str, data: DealChatSubmit, current_user: dict = Depends(get_current_user)):
+    context = await get_deal_context(deal_id, current_user)
+    campaign = context['campaign']
+    sender_type = map_sender_type(current_user['id'], campaign, context['creator']['id'], current_user.get('role'))
+    message_doc = {
+        "id": str(uuid.uuid4()),
+        "deal_id": make_deal_id(campaign),
+        "campaign_id": campaign['id'],
+        "sender_id": current_user['id'],
+        "sender_name": current_user.get('nickname') or current_user.get('email') or 'User',
+        "sender_type": sender_type,
+        "message": data.message,
+        "attachment_urls": data.attachment_urls,
+        "created_at": now_iso(),
+        "read_by": [current_user['id']]
+    }
+    await db.deal_messages.insert_one(message_doc)
+    return {"message": "Message sent", "chat_message": {key: value for key, value in message_doc.items() if key != "_id"}}
+
+@api_router.post("/deals/{deal_id}/action-card")
+async def create_deal_action_card(deal_id: str, data: DealActionCardSubmit, current_user: dict = Depends(get_current_user)):
+    if data.type not in ["milestone_update", "damage_report", "escalate_to_admin", "raise_dispute"]:
+        raise HTTPException(status_code=400, detail="Invalid action card type")
+    context = await get_deal_context(deal_id, current_user)
+    campaign = context['campaign']
+    title_map = {
+        "milestone_update": "Milestone update",
+        "damage_report": "Damage report",
+        "escalate_to_admin": "Escalated to admin",
+        "raise_dispute": "Dispute raised"
+    }
+    card = {
+        "id": str(uuid.uuid4()),
+        "deal_id": make_deal_id(campaign),
+        "campaign_id": campaign['id'],
+        "type": data.type,
+        "title": title_map[data.type],
+        "status": "open",
+        "created_at": now_iso(),
+        "created_by": current_user['id'],
+        "message": data.message,
+        "attachment_urls": data.attachment_urls
+    }
+    await db.deal_action_cards.insert_one(card)
+    event_type = "dispute_raised" if data.type in ["damage_report", "escalate_to_admin", "raise_dispute"] else "tracking_uploaded"
+    await insert_deal_activity(campaign, map_sender_type(current_user['id'], campaign, context['creator']['id'], current_user.get('role')), current_user.get('nickname', 'User'), event_type, data.message)
+    await insert_deal_system_message(campaign, f"{title_map[data.type]}: {data.message}")
+    return {"message": "Action card created", "action_card": {key: value for key, value in card.items() if key != "_id"}}
+
+async def create_issue_action(deal_id: str, current_user: dict, issue_type: str, title: str, activity_message: str, payload: DealIssueSubmit):
+    context = await get_deal_context(deal_id, current_user)
+    campaign = context['campaign']
+    card = {
+        "id": str(uuid.uuid4()),
+        "deal_id": make_deal_id(campaign),
+        "campaign_id": campaign['id'],
+        "type": issue_type,
+        "title": title,
+        "status": "open",
+        "created_at": now_iso(),
+        "created_by": current_user['id'],
+        "message": payload.message,
+        "attachment_urls": payload.attachment_urls
+    }
+    await db.deal_action_cards.insert_one(card)
+    if issue_type in ["raise_dispute", "escalate_to_admin"]:
+        await db.escrow.update_one({"campaign_id": campaign['id']}, {"$set": {"status": "on_hold", "updated_at": now_iso()}}, upsert=True)
+    await insert_deal_activity(
+        campaign,
+        map_sender_type(current_user['id'], campaign, context['creator']['id'], current_user.get('role')),
+        current_user.get('nickname', 'User'),
+        "dispute_raised",
+        activity_message
+    )
+    await insert_deal_system_message(campaign, activity_message)
+    return {"message": title, "action_card": {key: value for key, value in card.items() if key != "_id"}}
+
+@api_router.post("/deals/{deal_id}/dispute")
+async def raise_deal_dispute(deal_id: str, data: DealIssueSubmit, current_user: dict = Depends(get_current_user)):
+    return await create_issue_action(deal_id, current_user, "raise_dispute", "Dispute raised", data.message or "A dispute was raised on this deal.", data)
+
+@api_router.post("/deals/{deal_id}/escalate")
+async def escalate_deal(deal_id: str, data: DealIssueSubmit, current_user: dict = Depends(get_current_user)):
+    return await create_issue_action(deal_id, current_user, "escalate_to_admin", "Escalated to admin", data.message or "This deal was escalated to admin support.", data)
+
+@api_router.post("/deals/{deal_id}/damage-report")
+async def report_deal_damage(deal_id: str, data: DealIssueSubmit, current_user: dict = Depends(get_current_user)):
+    if current_user['role'] != UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Only creators can report damage")
+    return await create_issue_action(deal_id, current_user, "damage_report", "Damage report created", data.message or "Damaged or wrong product was reported.", data)
 
 @api_router.get("/work/campaign/{campaign_id}")
 async def get_work_by_campaign(campaign_id: str, current_user: dict = Depends(get_current_user)):
@@ -1376,11 +2124,14 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
     shipment_doc = {
         "campaign_id": data.campaign_id,
         "tracking_number": data.tracking_number,
+        "courier_name": data.courier_name,
+        "courier_tracking_url": data.courier_tracking_url,
+        "courier_status": data.courier_status or "shipped",
         "courier_slip": data.courier_slip,
         "expected_delivery": data.expected_delivery,
         "shipment_checklist": data.shipment_checklist,
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        "status": "shipped"
+        "status": data.courier_status or "shipped"
     }
     
     await db.shipments.update_one(
@@ -1388,6 +2139,9 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
         {"$set": shipment_doc},
         upsert=True
     )
+
+    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "tracking_uploaded", "Shipment tracking was uploaded.")
+    await insert_deal_system_message(campaign, "Shipment tracking was uploaded by the brand.")
     
     return {"message": "Shipment details updated"}
 
@@ -1414,6 +2168,29 @@ async def receive_shipment(data: ShipmentReceive, current_user: dict = Depends(g
         {"campaign_id": data.campaign_id},
         {"$set": update_data}
     )
+
+    await insert_deal_activity(
+        campaign,
+        "creator",
+        current_user.get('nickname', 'Creator'),
+        "unboxing_uploaded" if data.unboxing_video else "receipt_confirmed",
+        "Shipment receipt confirmed with unboxing video." if data.unboxing_video else "Shipment receipt confirmed."
+    )
+    if data.items_damaged:
+        await db.deal_action_cards.insert_one({
+            "id": str(uuid.uuid4()),
+            "deal_id": make_deal_id(campaign),
+            "campaign_id": campaign['id'],
+            "type": "damage_report",
+            "title": "Damaged or wrong product reported",
+            "status": "open",
+            "created_at": now_iso(),
+            "created_by": current_user['id'],
+            "message": data.dispute_reason,
+            "attachment_urls": [data.unboxing_video] if data.unboxing_video else []
+        })
+        await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "dispute_raised", "Damaged or wrong product reported.")
+        await insert_deal_system_message(campaign, "Damaged or wrong product has been reported by the creator.")
     
     return {"message": "Shipment marked as received"}
 
