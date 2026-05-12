@@ -226,6 +226,7 @@ class BidCreate(BaseModel):
 class ChatMessage(BaseModel):
     recipient_id: str
     message: str
+    attachment_urls: List[str] = []
 
 class WorkSubmission(BaseModel):
     campaign_id: str
@@ -1499,6 +1500,7 @@ async def send_message(data: ChatMessage, current_user: dict = Depends(get_curre
         "sender_nickname": current_user['nickname'],
         "recipient_id": data.recipient_id,
         "message": data.message,
+        "attachment_urls": data.attachment_urls,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "read": False,
         "filtered": message_filtered
@@ -1578,6 +1580,9 @@ async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_
             {"sender_id": other_user_id, "recipient_id": current_user['id']}
         ]
     }, {"_id": 0}).sort("timestamp", 1).to_list(1000)
+
+    for msg in messages:
+        msg["attachment_urls"] = msg.get("attachment_urls", [])
 
     # Mark as read
     await db.messages.update_many(
