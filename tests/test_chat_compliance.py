@@ -1,212 +1,253 @@
+import uuid
+
 import pytest
 from fastapi import HTTPException
 
 import server
 
 
-class FakeCursor:
-    def __init__(self, docs):
-        self.docs = docs
-
-    def sort(self, *_args):
-        return self
-
-    async def to_list(self, _limit):
-        return [doc.copy() for doc in self.docs]
+TEST_PREFIX = "test-chat-compliance"
 
 
-def get_value(doc, path):
-    value = doc
-    for part in path.split("."):
-        if isinstance(value, list):
-            return any(get_value(item, ".".join(path.split(".")[path.split(".").index(part):])) for item in value)
-        if not isinstance(value, dict):
-            return None
-        value = value.get(part)
-    return value
+def ids():
+    suffix = str(uuid.uuid4())
+    return {
+        "brand_id": f"{TEST_PREFIX}-brand-{suffix}",
+        "creator_id": f"{TEST_PREFIX}-creator-{suffix}",
+        "campaign_id": f"{TEST_PREFIX}-campaign-{suffix}",
+        "upload_url": f"/uploads/{TEST_PREFIX}-{suffix}.png",
+    }
 
 
-def matches(doc, query):
-    for key, expected in query.items():
-        if key == "$or":
-            if not any(matches(doc, item) for item in expected):
-                return False
-            continue
-        actual = get_value(doc, key)
-        if isinstance(expected, dict):
-            if "$ne" in expected and actual == expected["$ne"]:
-                return False
-            if "$in" in expected and actual not in expected["$in"]:
-                return False
-            if "$nin" in expected and actual in expected["$nin"]:
-                return False
-            if "$gt" in expected and not (actual and actual > expected["$gt"]):
-                return False
-            if "$gte" in expected and not (actual and actual >= expected["$gte"]):
-                return False
-            if "$all" in expected and not all(item in (actual or []) for item in expected["$all"]):
-                return False
-            continue
-        if actual != expected:
-            return False
-    return True
+def business(user_id, balance=6000, approval_status="approved"):
+    return {
+        "id": user_id,
+        "email": f"{user_id}@example.com",
+        "nickname": "Test Brand",
+        "role": "business",
+        "approval_status": approval_status,
+        "balance": balance,
+        "profile": {"website": "https://brand.example.com"},
+    }
 
 
-class FakeCollection:
-    def __init__(self, docs=None):
-        self.docs = docs or []
-
-    async def find_one(self, query, *_args, **_kwargs):
-        return next((doc.copy() for doc in self.docs if matches(doc, query)), None)
-
-    def find(self, query=None, *_args, **_kwargs):
-        query = query or {}
-        return FakeCursor([doc for doc in self.docs if matches(doc, query)])
-
-    async def insert_one(self, doc):
-        self.docs.append(doc.copy())
-
-    async def count_documents(self, query):
-        return len([doc for doc in self.docs if matches(doc, query)])
-
-    async def update_one(self, query, update, **_kwargs):
-        doc = next((item for item in self.docs if matches(item, query)), None)
-        if not doc:
-            doc = query.copy()
-            self.docs.append(doc)
-        apply_update(doc, update)
-
-    async def update_many(self, query, update, **_kwargs):
-        for doc in self.docs:
-            if matches(doc, query):
-                apply_update(doc, update)
+def creator(user_id):
+    return {
+        "id": user_id,
+        "email": f"{user_id}@example.com",
+        "nickname": "Test Creator",
+        "role": "creator",
+        "approval_status": "approved",
+        "balance": 0,
+    }
 
 
-def apply_update(doc, update):
-    for key, value in update.get("$set", {}).items():
-        doc[key] = value
-    for key, value in update.get("$addToSet", {}).items():
-        doc.setdefault(key, [])
-        if value not in doc[key]:
-            doc[key].append(value)
-    for key in update.get("$unset", {}):
-        doc.pop(key, None)
+async def cleanup(test_ids):
+    user_ids = [test_ids["brand_id"], test_ids["creator_id"]]
+    campaign_ids = [test_ids["campaign_id"]]
+    collections = [
+        server.db.users,
+        server.db.campaigns,
+        server.db.messages,
+        server.db.chat_action_cards,
+        server.db.uploaded_files,
+        server.db.violations,
+        server.db.chat_strikes,
+        server.db.chat_pauses,
+        server.db.in_app_notifications,
+        server.db.admin_notifications,
+        server.db.chat_false_positive_reviews,
+        server.db.chat_typing,
+        server.db.escrow,
+        server.db.campaign_invites,
+        server.db.creator_invitations,
+        server.db.private_invitations,
+    ]
+    for collection in collections:
+        await collection.delete_many({
+            "$or": [
+                {"id": {"$regex": f"^{TEST_PREFIX}"}},
+                {"user_id": {"$in": user_ids}},
+                {"sender_id": {"$in": user_ids}},
+                {"recipient_id": {"$in": user_ids}},
+                {"participants": {"$all": user_ids}},
+                {"business_id": test_ids["brand_id"]},
+                {"creator_id": test_ids["creator_id"]},
+                {"campaign_id": {"$in": campaign_ids}},
+                {"file_url": test_ids["upload_url"]},
+            ]
+        })
 
 
-class FakeDB:
-    def __init__(self):
-        self.users = FakeCollection()
-        self.campaigns = FakeCollection()
-        self.messages = FakeCollection()
-        self.chat_action_cards = FakeCollection()
-        self.uploaded_files = FakeCollection()
-        self.violations = FakeCollection()
-        self.chat_strikes = FakeCollection()
-        self.chat_pauses = FakeCollection()
-        self.in_app_notifications = FakeCollection()
-        self.admin_notifications = FakeCollection()
-        self.chat_false_positive_reviews = FakeCollection()
-        self.chat_typing = FakeCollection()
-        self.escrow = FakeCollection()
-
-    def __getitem__(self, name):
-        if not hasattr(self, name):
-            setattr(self, name, FakeCollection())
-        return getattr(self, name)
-
-
-@pytest.fixture()
-def fake_db(monkeypatch):
-    db = FakeDB()
-    monkeypatch.setattr(server, "db", db)
-    return db
-
-
-def business(balance=6000, approval_status="approved"):
-    return {"id": "brand-1", "nickname": "Brand", "role": "business", "approval_status": approval_status, "balance": balance}
-
-
-def creator():
-    return {"id": "creator-1", "nickname": "Creator", "role": "creator", "approval_status": "approved", "balance": 0}
+async def seed_pair(with_deal=False, brand_balance=6000, approval_status="approved"):
+    test_ids = ids()
+    await cleanup(test_ids)
+    brand = business(test_ids["brand_id"], balance=brand_balance, approval_status=approval_status)
+    crt = creator(test_ids["creator_id"])
+    await server.db.users.insert_many([brand, crt])
+    if with_deal:
+        await server.db.campaigns.insert_one({
+            "id": test_ids["campaign_id"],
+            "business_id": test_ids["brand_id"],
+            "selected_creator": test_ids["creator_id"],
+            "status": "in_progress",
+            "title": "Test Campaign",
+        })
+    return test_ids, brand, crt
 
 
 @pytest.mark.asyncio
-async def test_text_message_send(fake_db):
-    fake_db.users.docs = [business(), creator()]
-    payload = server.ChatMessage(recipient_id="creator-1", message="Hello", attachment_urls=[])
-    await server.send_message(payload, business())
-    assert fake_db.messages.docs[0]["message"] == "Hello"
+async def test_text_message_send_real_db():
+    test_ids, brand, _crt = await seed_pair()
+    try:
+        payload = server.ChatMessage(recipient_id=test_ids["creator_id"], message="Hello", attachment_urls=[])
+        await server.send_message(payload, brand)
+        saved = await server.db.messages.find_one({"sender_id": test_ids["brand_id"], "recipient_id": test_ids["creator_id"]})
+        assert saved["message"] == "Hello"
+        assert saved["status"] == "delivered"
+    finally:
+        await cleanup(test_ids)
 
 
 @pytest.mark.asyncio
-async def test_attachment_only_message_send(fake_db):
-    fake_db.users.docs = [business(), creator()]
-    fake_db.uploaded_files.docs = [{"file_url": "/uploads/a.png", "filename": "a.png", "content_type": "image/png", "size": 100, "kind": "image"}]
-    payload = server.ChatMessage(recipient_id="creator-1", message="", attachment_urls=["/uploads/a.png"])
-    await server.send_message(payload, business())
-    assert fake_db.messages.docs[0]["attachment_urls"] == ["/uploads/a.png"]
+async def test_attachment_only_message_send_real_db():
+    test_ids, brand, _crt = await seed_pair()
+    try:
+        await server.db.uploaded_files.insert_one({
+            "id": f"{TEST_PREFIX}-upload-{uuid.uuid4()}",
+            "file_url": test_ids["upload_url"],
+            "filename": "test.png",
+            "content_type": "image/png",
+            "size": 100,
+            "kind": "image",
+            "uploaded_by": test_ids["brand_id"],
+        })
+        payload = server.ChatMessage(recipient_id=test_ids["creator_id"], message="", attachment_urls=[test_ids["upload_url"]])
+        await server.send_message(payload, brand)
+        saved = await server.db.messages.find_one({"sender_id": test_ids["brand_id"], "recipient_id": test_ids["creator_id"]})
+        assert saved["message"] == ""
+        assert saved["attachment_urls"] == [test_ids["upload_url"]]
+    finally:
+        await cleanup(test_ids)
 
 
 @pytest.mark.asyncio
-async def test_blocked_contact_info_message_logs_strike(fake_db):
-    fake_db.users.docs = [business(), creator()]
-    payload = server.ChatMessage(recipient_id="creator-1", message="Call 98765 43210", attachment_urls=[])
-    with pytest.raises(HTTPException) as exc:
-        await server.send_message(payload, business())
-    assert exc.value.status_code == 400
-    assert fake_db.messages.docs == []
-    assert len(fake_db.violations.docs) == 1
-    assert len(fake_db.chat_strikes.docs) == 1
+async def test_blocked_contact_info_message_real_db():
+    test_ids, brand, _crt = await seed_pair()
+    try:
+        payload = server.ChatMessage(recipient_id=test_ids["creator_id"], message="Call 98765 43210", attachment_urls=[])
+        with pytest.raises(HTTPException) as exc:
+            await server.send_message(payload, brand)
+        assert exc.value.status_code == 400
+        assert await server.db.messages.count_documents({"sender_id": test_ids["brand_id"]}) == 0
+        assert await server.db.violations.count_documents({"user_id": test_ids["brand_id"]}) == 1
+        assert await server.db.chat_strikes.count_documents({"user_id": test_ids["brand_id"]}) == 1
+    finally:
+        await cleanup(test_ids)
 
 
 @pytest.mark.asyncio
-async def test_strike_progression_sets_action_cards_only(fake_db):
-    fake_db.users.docs = [business()]
-    for _ in range(3):
-        await server.log_chat_violation(business(), "creator-1", "wa.me/abc", [{"type": "contact_link", "severity": "high"}])
-    assert fake_db.users.docs[0].get("action_cards_only_until")
+async def test_strike_progression_real_db():
+    test_ids, brand, _crt = await seed_pair()
+    try:
+        for _ in range(3):
+            await server.log_chat_violation(
+                brand,
+                test_ids["creator_id"],
+                "wa.me/test",
+                [{"type": "contact_link", "severity": "high"}],
+            )
+        updated = await server.db.users.find_one({"id": test_ids["brand_id"]})
+        assert updated.get("action_cards_only_until")
+    finally:
+        await cleanup(test_ids)
 
 
 @pytest.mark.asyncio
-async def test_brand_wallet_gate(fake_db):
-    fake_db.users.docs = [business(balance=100), creator()]
-    with pytest.raises(HTTPException) as exc:
-        await server.validate_chat_access(business(balance=100), "creator-1")
-    assert exc.value.status_code == 403
+async def test_brand_wallet_gate_real_db():
+    test_ids, brand, _crt = await seed_pair(brand_balance=100)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await server.validate_chat_access(brand, test_ids["creator_id"])
+        assert exc.value.status_code == 403
+    finally:
+        await cleanup(test_ids)
 
 
 @pytest.mark.asyncio
-async def test_creator_relationship_gate(fake_db):
-    fake_db.users.docs = [business(), creator()]
-    with pytest.raises(HTTPException):
-        await server.validate_chat_access(creator(), "brand-1")
-    fake_db.campaigns.docs = [{"id": "campaign-1", "business_id": "brand-1", "selected_creator": "creator-1", "status": "in_progress"}]
-    recipient = await server.validate_chat_access(creator(), "brand-1")
-    assert recipient["id"] == "brand-1"
+async def test_creator_relationship_gate_real_db():
+    test_ids, _brand, crt = await seed_pair()
+    try:
+        with pytest.raises(HTTPException):
+            await server.validate_chat_access(crt, test_ids["brand_id"])
+
+        await server.db.campaigns.insert_one({
+            "id": test_ids["campaign_id"],
+            "business_id": test_ids["brand_id"],
+            "selected_creator": test_ids["creator_id"],
+            "status": "in_progress",
+            "title": "Test Campaign",
+        })
+        recipient = await server.validate_chat_access(crt, test_ids["brand_id"])
+        assert recipient["id"] == test_ids["brand_id"]
+    finally:
+        await cleanup(test_ids)
 
 
 @pytest.mark.asyncio
-async def test_action_card_creation_and_immutability(fake_db):
-    fake_db.users.docs = [business(), creator()]
-    data = server.ChatActionCardCreate(
-        recipient_id="creator-1",
-        type="custom_offer",
-        fields={"deliverable_type": "video", "quantity": 1, "duration": "30s", "price": 12000, "timeline": "7 days", "usage_rights": "organic"},
-    )
-    await server.create_chat_action_card(data, business())
-    original_fields = fake_db.chat_action_cards.docs[0]["fields"].copy()
-    await server.respond_chat_action_card(fake_db.chat_action_cards.docs[0]["id"], server.ChatActionCardRespond(action="accept"), creator())
-    assert fake_db.chat_action_cards.docs[0]["fields"] == original_fields
+async def test_action_card_creation_and_immutability_real_db():
+    test_ids, brand, crt = await seed_pair()
+    try:
+        data = server.ChatActionCardCreate(
+            recipient_id=test_ids["creator_id"],
+            type="custom_offer",
+            fields={
+                "deliverable_type": "video",
+                "quantity": 1,
+                "duration": "30s",
+                "price": 12000,
+                "timeline": "7 days",
+                "usage_rights": "organic",
+            },
+        )
+        await server.create_chat_action_card(data, brand)
+        card = await server.db.chat_action_cards.find_one({"sender_id": test_ids["brand_id"]})
+        original_fields = card["fields"].copy()
+        await server.respond_chat_action_card(card["id"], server.ChatActionCardRespond(action="accept"), crt)
+        updated = await server.db.chat_action_cards.find_one({"id": card["id"]})
+        assert updated["fields"] == original_fields
+        assert updated["status"] == "accept"
+    finally:
+        await cleanup(test_ids)
 
 
 @pytest.mark.asyncio
-async def test_chat_history_returns_messages_and_action_cards(fake_db):
-    fake_db.users.docs = [business(), creator()]
-    fake_db.campaigns.docs = [{"id": "campaign-1", "business_id": "brand-1", "selected_creator": "creator-1", "status": "in_progress"}]
-    fake_db.messages.docs = [{"id": "m1", "sender_id": "brand-1", "recipient_id": "creator-1", "message": "Hi", "timestamp": "2026-01-01T00:00:00+00:00", "read": False}]
-    fake_db.chat_action_cards.docs = [{"id": "c1", "participants": ["brand-1", "creator-1"], "sender_id": "brand-1", "recipient_id": "creator-1", "type": "milestone_update", "fields": {"status": "sent"}, "status": "open", "created_at": "2026-01-01T00:01:00+00:00", "read_by": []}]
-    items = await server.get_chat_history("brand-1", creator())
-    assert [item["item_type"] for item in items] == ["message", "action_card"]
+async def test_chat_history_returns_messages_and_action_cards_real_db():
+    test_ids, brand, crt = await seed_pair(with_deal=True)
+    try:
+        await server.db.messages.insert_one({
+            "id": f"{TEST_PREFIX}-message-{uuid.uuid4()}",
+            "sender_id": test_ids["brand_id"],
+            "recipient_id": test_ids["creator_id"],
+            "message": "Hi",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "read": False,
+        })
+        await server.db.chat_action_cards.insert_one({
+            "id": f"{TEST_PREFIX}-card-{uuid.uuid4()}",
+            "participants": [test_ids["brand_id"], test_ids["creator_id"]],
+            "sender_id": test_ids["brand_id"],
+            "recipient_id": test_ids["creator_id"],
+            "type": "milestone_update",
+            "fields": {"status": "sent"},
+            "status": "open",
+            "created_at": "2026-01-01T00:01:00+00:00",
+            "read_by": [],
+        })
+        items = await server.get_chat_history(test_ids["brand_id"], crt)
+        assert [item["item_type"] for item in items] == ["message", "action_card"]
+    finally:
+        await cleanup(test_ids)
 
 
 def test_attachment_validation_rejects_unsupported_file():
