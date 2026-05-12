@@ -357,6 +357,23 @@ class DealActionCardSubmit(BaseModel):
     message: str
     attachment_urls: List[str] = []
 
+class ChatFalsePositiveRequest(BaseModel):
+    reason: Optional[str] = None
+
+class ChatFalsePositiveReview(BaseModel):
+    status: str
+    note: Optional[str] = None
+
+class ChatActionCardCreate(BaseModel):
+    recipient_id: str
+    type: str
+    fields: Dict[str, Any]
+    deal_id: Optional[str] = None
+
+class ChatActionCardRespond(BaseModel):
+    action: str
+    note: Optional[str] = None
+
 class DealIssueSubmit(BaseModel):
     message: Optional[str] = None
     attachment_urls: List[str] = []
@@ -435,6 +452,407 @@ def hours_until(value: Optional[str]) -> Optional[int]:
     if target.tzinfo is None:
         target = target.replace(tzinfo=timezone.utc)
     return int((target - datetime.now(timezone.utc)).total_seconds() // 3600)
+
+CONTACT_INFO_BLOCK_DETAIL = "Your message appears to contain contact information. This cannot be shared on UGCAD.IO to protect both parties."
+MIN_BRAND_CHAT_BALANCE = 5000
+CHAT_PAUSE_SECONDS = 60 * 60
+ACTION_CARDS_ONLY_DAYS = 14
+ROLLING_STRIKE_DAYS = 30
+IMAGE_MAX_BYTES = 10 * 1024 * 1024
+PDF_MAX_BYTES = 25 * 1024 * 1024
+VIDEO_MAX_BYTES = 50 * 1024 * 1024
+MAX_IMAGES_PER_CHAT_MESSAGE = 5
+MAX_VIDEO_SECONDS = 30
+
+IMAGE_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/gif"}
+PDF_CONTENT_TYPES = {"application/pdf"}
+VIDEO_CONTENT_TYPES = {"video/mp4", "video/quicktime", "video/webm", "video/x-msvideo", "video/mpeg", "video/3gpp", "video/x-matroska"}
+CONTACT_URL_DOMAINS = ["wa.me", "t.me", "telegram.me", "linktr.ee", "linktree", "about.me", "beacons.ai", "carrd.co"]
+SOCIAL_PLATFORM_PATTERN = re.compile(r"\b(instagram|insta|whatsapp|telegram|linkedin|twitter|youtube|yt|x\.com)\b", re.IGNORECASE)
+OBFUSCATED_EMAIL_PATTERN = re.compile(r"\b[\w.-]+\s+(?:at|\[at\]|\(at\))\s+[\w.-]+\s+(?:dot|\[dot\]|\(dot\))\s+[a-z]{2,}\b", re.IGNORECASE)
+PHONE_SEQUENCE_PATTERN = re.compile(r"(?<!\w)(?:\+?\d[\s().-]*){10,15}(?!\w)")
+
+ACTION_CARD_TYPES = {
+    "custom_offer",
+    "private_invitation",
+    "counter_offer",
+    "revision_request",
+    "milestone_update",
+    "damage_report",
+    "escalate_to_admin",
+    "raise_dispute"
+}
+
+ACTIVE_DEAL_STATUSES = {CampaignStatus.IN_PROGRESS, "work_submitted"}
+ARCHIVED_DEAL_STATUSES = {CampaignStatus.COMPLETED, CampaignStatus.REJECTED}
+
+def thread_key_for(user_id: str, other_user_id: str) -> str:
+    return ":".join(sorted([user_id, other_user_id]))
+
+def get_attachment_kind(content_type: Optional[str], filename: str = "") -> str:
+    lower_name = (filename or "").lower()
+    if content_type in IMAGE_CONTENT_TYPES or lower_name.endswith((".jpg", ".jpeg", ".png", ".gif")):
+        return "image"
+    if content_type in PDF_CONTENT_TYPES or lower_name.endswith(".pdf"):
+        return "pdf"
+    if content_type in VIDEO_CONTENT_TYPES or lower_name.endswith((".mp4", ".mov", ".webm", ".avi", ".mpeg", ".mpg", ".3gp", ".mkv")):
+        return "video"
+    return "other"
+
+def validate_upload_payload(content_type: Optional[str], filename: str, size: int, duration_seconds: Optional[float] = None) -> str:
+    kind = get_attachment_kind(content_type, filename)
+    if kind == "image" and size <= IMAGE_MAX_BYTES:
+        return kind
+    if kind == "pdf" and size <= PDF_MAX_BYTES:
+        return kind
+    if kind == "video" and size <= VIDEO_MAX_BYTES and (duration_seconds is None or duration_seconds <= MAX_VIDEO_SECONDS):
+        return kind
+    if kind == "other":
+        raise HTTPException(status_code=400, detail="Unsupported file type. Upload jpg, png, gif, pdf, or supported video files.")
+    if kind == "image":
+        raise HTTPException(status_code=400, detail="Images must be 10 MB or smaller.")
+    if kind == "pdf":
+        raise HTTPException(status_code=400, detail="PDFs must be 25 MB or smaller.")
+    raise HTTPException(status_code=400, detail="Videos must be 50 MB or smaller and 30 seconds or shorter.")
+
+def get_video_duration_seconds(_content: bytes, _filename: str, _content_type: Optional[str]) -> Optional[float]:
+    """Placeholder for ffprobe/moviepy integration. None means duration could not be determined."""
+    return None
+
+def scan_image_for_contact_info(_content: bytes, _filename: str = "") -> dict:
+    """Placeholder OCR hook. Return safe until pytesseract or another OCR provider is configured."""
+    return {"safe": True, "violations": []}
+
+def extract_domain(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    cleaned = url.lower().strip()
+    cleaned = re.sub(r"^https?://", "", cleaned)
+    cleaned = re.sub(r"^www\.", "", cleaned)
+    return cleaned.split("/")[0] or None
+
+def brand_allowed_domains(*users: dict) -> List[str]:
+    domains = []
+    for user in users:
+        if not user or user.get("role") != UserRole.BUSINESS:
+            continue
+        profile = user.get("profile") or {}
+        for url in [profile.get("website"), user.get("website"), user.get("business_website")]:
+            domain = extract_domain(url)
+            if domain:
+                domains.append(domain)
+    return domains
+
+def check_contact_info_policy(message: str, allowed_domains: Optional[List[str]] = None) -> dict:
+    text = message or ""
+    violations = []
+    allowed_domains = allowed_domains or []
+
+    emails = EMAIL_PATTERN.findall(text)
+    if emails:
+        violations.append({"type": "email", "content": emails, "severity": "high"})
+
+    phones = PHONE_PATTERN.findall(text)
+    if phones:
+        violations.append({"type": "phone", "content": [str(phone) for phone in phones], "severity": "high"})
+
+    social_handles = SOCIAL_HANDLES_PATTERN.findall(text)
+    if social_handles:
+        violations.append({"type": "social_handle", "content": social_handles, "severity": "medium"})
+
+    obfuscated_emails = OBFUSCATED_EMAIL_PATTERN.findall(text)
+    if obfuscated_emails:
+        violations.append({"type": "obfuscated_email", "content": obfuscated_emails, "severity": "high"})
+
+    phone_matches = []
+    for match in PHONE_SEQUENCE_PATTERN.findall(text):
+        digits = re.sub(r"\D", "", match)
+        if 10 <= len(digits) <= 15:
+            phone_matches.append(match.strip())
+    if phone_matches:
+        violations.append({"type": "phone", "content": phone_matches, "severity": "high"})
+
+    platforms = SOCIAL_PLATFORM_PATTERN.findall(text)
+    if platforms:
+        violations.append({"type": "social_platform", "content": sorted(set(platforms)), "severity": "medium"})
+
+    urls = URL_PATTERN.findall(text)
+    blocked_urls = []
+    for url in urls:
+        lower_url = url.lower()
+        domain = extract_domain(url)
+        is_allowed_public_brand_site = domain and any(domain == allowed or domain.endswith(f".{allowed}") for allowed in allowed_domains)
+        is_safe_public_site = any(domain_name in lower_url for domain_name in SAFE_DOMAINS)
+        if any(domain_name in lower_url for domain_name in CONTACT_URL_DOMAINS):
+            blocked_urls.append(url)
+        elif not is_allowed_public_brand_site and not is_safe_public_site:
+            blocked_urls.append(url)
+    if blocked_urls:
+        violations.append({"type": "contact_link", "content": blocked_urls, "severity": "high"})
+
+    deduped = []
+    seen = set()
+    for violation in violations:
+        key = (violation.get("type"), str(violation.get("content")))
+        if key not in seen:
+            deduped.append(violation)
+            seen.add(key)
+    return {"safe": len(deduped) == 0, "violations": deduped}
+
+async def notify_admins(title: str, message: str, link: Optional[str] = None):
+    notification = {
+        "id": str(uuid.uuid4()),
+        "title": title,
+        "message": message,
+        "type": "warning",
+        "link": link,
+        "target_roles": [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF],
+        "read_by": [],
+        "created_at": now_iso(),
+        "created_by": "system"
+    }
+    await db.in_app_notifications.insert_one(notification)
+    await db.admin_notifications.insert_one(notification.copy())
+
+async def find_chat_deal(user_id: str, other_user_id: str) -> Optional[dict]:
+    return await db.campaigns.find_one({
+        "$or": [
+            {"business_id": user_id, "selected_creator": other_user_id},
+            {"business_id": other_user_id, "selected_creator": user_id},
+        ]
+    }, {"_id": 0})
+
+async def creator_has_chat_relationship(creator_id: str, brand_id: str) -> bool:
+    if await find_chat_deal(creator_id, brand_id):
+        return True
+    invite_query = {
+        "creator_id": creator_id,
+        "business_id": brand_id,
+        "status": {"$nin": ["rejected", "expired"]}
+    }
+    for collection_name in ["campaign_invites", "creator_invitations", "private_invitations"]:
+        if await db[collection_name].find_one(invite_query, {"_id": 0}):
+            return True
+    invite = await db.chat_action_cards.find_one({
+        "sender_id": brand_id,
+        "recipient_id": creator_id,
+        "type": "private_invitation"
+    }, {"_id": 0})
+    return bool(invite)
+
+async def validate_chat_access(current_user: dict, recipient_id: str, allow_action_cards_only: bool = False):
+    recipient = await db.users.find_one({"id": recipient_id}, {"_id": 0, "password": 0})
+    if not recipient:
+        raise HTTPException(status_code=404, detail="Recipient not found")
+    if current_user["id"] == recipient_id:
+        raise HTTPException(status_code=400, detail="You cannot send chat messages to yourself")
+
+    pause = await db.chat_pauses.find_one({
+        "user_id": current_user["id"],
+        "paused_until": {"$gt": now_iso()}
+    }, {"_id": 0})
+    if pause:
+        raise HTTPException(status_code=403, detail="Chat is temporarily paused due to contact-info policy violations.")
+
+    action_cards_until = parse_iso(current_user.get("action_cards_only_until"))
+    if action_cards_until and action_cards_until > datetime.now(timezone.utc) and not allow_action_cards_only:
+        raise HTTPException(status_code=403, detail="Free-form chat is temporarily unavailable. Please use Action Cards for this thread.")
+
+    role = current_user.get("role")
+    recipient_role = recipient.get("role")
+    if role == UserRole.BUSINESS:
+        fresh_user = await db.users.find_one({"id": current_user["id"]}, {"_id": 0})
+        if fresh_user.get("approval_status") != ApprovalStatus.APPROVED:
+            raise HTTPException(status_code=403, detail="Brand profile must be approved before starting chat.")
+        if float(fresh_user.get("balance") or 0) < MIN_BRAND_CHAT_BALANCE:
+            raise HTTPException(status_code=403, detail="Brand wallet balance must be at least INR 5,000 to start chat.")
+    elif role == UserRole.CREATOR and recipient_role == UserRole.BUSINESS:
+        if not await creator_has_chat_relationship(current_user["id"], recipient_id):
+            raise HTTPException(status_code=403, detail="Creators can chat only with brands who invited them or with whom they have a deal.")
+    elif role not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
+        raise HTTPException(status_code=403, detail="Chat is only available to creators, brands, and staff.")
+    return recipient
+
+async def log_chat_violation(current_user: dict, recipient_id: Optional[str], original_content: str, violations: List[dict], source: str = "message", deal_id: Optional[str] = None) -> dict:
+    created_at = now_iso()
+    thread_key = thread_key_for(current_user["id"], recipient_id) if recipient_id else None
+    if not deal_id and recipient_id:
+        deal = await find_chat_deal(current_user["id"], recipient_id)
+        deal_id = make_deal_id(deal) if deal else None
+
+    violation_doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": current_user["id"],
+        "user_nickname": current_user.get("nickname"),
+        "recipient_id": recipient_id,
+        "thread_key": thread_key,
+        "deal_id": deal_id,
+        "source": source,
+        "original_message": original_content,
+        "violations": violations,
+        "status": "blocked",
+        "false_positive_status": None,
+        "timestamp": created_at
+    }
+    await db.violations.insert_one(violation_doc)
+
+    since = (datetime.now(timezone.utc) - timedelta(days=ROLLING_STRIKE_DAYS)).isoformat()
+    per_deal_count = await db.chat_strikes.count_documents({
+        "user_id": current_user["id"],
+        "deal_id": deal_id,
+        "invalidated": {"$ne": True}
+    }) if deal_id else 0
+    rolling_count = await db.chat_strikes.count_documents({
+        "user_id": current_user["id"],
+        "created_at": {"$gte": since},
+        "invalidated": {"$ne": True}
+    })
+    strike_number = max(per_deal_count, rolling_count) + 1
+    severity = "warning"
+    if strike_number == 2:
+        severity = "paused"
+    elif strike_number == 3:
+        severity = "action_cards_only"
+    elif strike_number >= 4 or any(v.get("severity") == "flagrant" for v in violations):
+        severity = "suspended"
+
+    strike_doc = {
+        "id": str(uuid.uuid4()),
+        "violation_id": violation_doc["id"],
+        "user_id": current_user["id"],
+        "recipient_id": recipient_id,
+        "thread_key": thread_key,
+        "deal_id": deal_id,
+        "strike_number": strike_number,
+        "severity": severity,
+        "violations": violations,
+        "created_at": created_at,
+        "invalidated": False
+    }
+    await db.chat_strikes.insert_one(strike_doc)
+
+    user_updates = {"warning_count": strike_number, "last_warning_at": created_at}
+    if severity == "paused":
+        paused_until = (datetime.now(timezone.utc) + timedelta(seconds=CHAT_PAUSE_SECONDS)).isoformat()
+        await db.chat_pauses.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": current_user["id"],
+            "recipient_id": recipient_id,
+            "thread_key": thread_key,
+            "deal_id": deal_id,
+            "paused_until": paused_until,
+            "created_at": created_at,
+            "reason": "contact_info_attempt"
+        })
+        await notify_admins("Chat policy strike", f"{current_user.get('nickname', current_user['id'])} received a second chat contact-info strike.")
+    elif severity == "action_cards_only":
+        user_updates["action_cards_only_until"] = (datetime.now(timezone.utc) + timedelta(days=ACTION_CARDS_ONLY_DAYS)).isoformat()
+        await notify_admins("Action Cards only mode enabled", f"{current_user.get('nickname', current_user['id'])} reached a third chat contact-info strike.")
+    elif severity == "suspended":
+        user_updates.update({"banned": True, "banned_reason": "Chat contact-info policy violations pending admin review"})
+        await notify_admins("Account suspended for review", f"{current_user.get('nickname', current_user['id'])} reached repeated or flagrant chat contact-info violations.")
+
+    await db.users.update_one({"id": current_user["id"]}, {"$set": user_updates})
+    return {"violation": violation_doc, "strike": strike_doc}
+
+async def validate_message_attachments(attachment_urls: List[str]):
+    if len(attachment_urls) > MAX_IMAGES_PER_CHAT_MESSAGE:
+        # A message can include up to five image attachments; this also caps mixed simple file-only payloads.
+        raise HTTPException(status_code=400, detail="A chat message can include at most 5 attachments.")
+    if not attachment_urls:
+        return
+    uploads = await db.uploaded_files.find({"file_url": {"$in": attachment_urls}}, {"_id": 0}).to_list(100)
+    upload_by_url = {item["file_url"]: item for item in uploads}
+    image_count = 0
+    for url in attachment_urls:
+        meta = upload_by_url.get(url, {})
+        kind = meta.get("kind") or get_attachment_kind(meta.get("content_type"), meta.get("filename") or url)
+        if kind == "other":
+            raise HTTPException(status_code=400, detail=f"Unsupported attachment: {url}")
+        if kind == "image":
+            image_count += 1
+            if image_count > MAX_IMAGES_PER_CHAT_MESSAGE:
+                raise HTTPException(status_code=400, detail="A chat message can include at most 5 images.")
+        if meta.get("size"):
+            validate_upload_payload(meta.get("content_type"), meta.get("filename") or url, int(meta["size"]), meta.get("duration_seconds"))
+
+def message_to_chat_item(msg: dict) -> dict:
+    created_at = msg.get("created_at") or msg.get("timestamp")
+    read_by = msg.get("read_by") or ([msg.get("recipient_id")] if msg.get("read") else [])
+    return {
+        **msg,
+        "item_type": "message",
+        "created_at": created_at,
+        "timestamp": created_at,
+        "attachment_urls": msg.get("attachment_urls", []),
+        "read": bool(msg.get("read")),
+        "read_by": read_by,
+        "read_at": msg.get("read_at"),
+        "status": msg.get("status") or ("read" if read_by else "delivered")
+    }
+
+def action_card_to_chat_item(card: dict) -> dict:
+    return {
+        **card,
+        "item_type": "action_card",
+        "message": card.get("message") or card.get("title") or card.get("type"),
+        "attachment_urls": card.get("attachment_urls", []),
+        "read": bool(card.get("read")),
+        "read_by": card.get("read_by", []),
+        "timestamp": card.get("created_at")
+    }
+
+def get_action_card_available_actions(card_type: str) -> List[str]:
+    if card_type in ["custom_offer", "private_invitation", "counter_offer"]:
+        return ["accept", "reject", "counter"]
+    if card_type in ["revision_request", "damage_report", "escalate_to_admin", "raise_dispute"]:
+        return ["acknowledge", "resolve"]
+    return ["acknowledge"]
+
+def require_fields(fields: Dict[str, Any], required: List[str], card_type: str):
+    missing = [field for field in required if fields.get(field) in [None, "", []]]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"{card_type} requires: {', '.join(missing)}")
+
+async def validate_action_card_payload(data: ChatActionCardCreate, current_user: dict):
+    if data.type not in ACTION_CARD_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid action card type")
+    fields = data.fields or {}
+    if data.type == "custom_offer":
+        require_fields(fields, ["deliverable_type", "quantity", "duration", "price", "timeline", "usage_rights"], "custom_offer")
+        fields.setdefault("expires_at", (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat())
+    elif data.type == "private_invitation":
+        require_fields(fields, ["campaign_name", "deliverable_summary", "budget", "timeline", "usage_rights", "full_brief_link"], "private_invitation")
+        fields.setdefault("response_deadline", (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat())
+    elif data.type == "counter_offer":
+        require_fields(fields, ["modified_price", "revisions", "timeline", "usage_rights", "diff_vs_original"], "counter_offer")
+        existing_rounds = await db.chat_action_cards.count_documents({
+            "thread_key": thread_key_for(current_user["id"], data.recipient_id),
+            "type": "counter_offer"
+        })
+        if existing_rounds >= 3:
+            raise HTTPException(status_code=400, detail="Counter offers are limited to 3 rounds.")
+        fields["round"] = existing_rounds + 1
+    elif data.type == "revision_request":
+        items = fields.get("revision_items") or fields.get("items") or []
+        if not isinstance(items, list) or not 1 <= len(items) <= 5:
+            raise HTTPException(status_code=400, detail="Revision request requires 1 to 5 revision items.")
+        if data.deal_id:
+            campaign = await get_campaign_by_deal_id(data.deal_id)
+            if campaign and campaign.get("status") != "work_submitted":
+                raise HTTPException(status_code=400, detail="Revision requests are allowed only during Content Submitted - Awaiting Review.")
+    elif data.type == "milestone_update":
+        require_fields(fields, ["status"], "milestone_update")
+    elif data.type == "damage_report":
+        require_fields(fields, ["reason", "description", "severity"], "damage_report")
+    elif data.type == "escalate_to_admin":
+        require_fields(fields, ["summary", "category"], "escalate_to_admin")
+        summary_length = len(str(fields.get("summary", "")))
+        if summary_length < 100 or summary_length > 500:
+            raise HTTPException(status_code=400, detail="Escalation summary must be 100 to 500 characters.")
+    elif data.type == "raise_dispute":
+        require_fields(fields, ["summary", "category"], "raise_dispute")
+    return fields
 
 def make_deal_id(campaign: dict) -> str:
     if campaign.get('deal_id'):
@@ -1448,52 +1866,17 @@ You can now communicate directly with {creator['nickname']} to coordinate the wo
 # Chat Routes
 @api_router.post("/chat/send")
 async def send_message(data: ChatMessage, current_user: dict = Depends(get_current_user)):
-    # Check content safety
-    safety_check = check_content_safety(data.message)
-    
-    original_message = data.message
-    message_filtered = False
-    warning_issued = False
-    
+    recipient = await validate_chat_access(current_user, data.recipient_id)
+    if not data.message and not data.attachment_urls:
+        raise HTTPException(status_code=400, detail="Message text or at least one attachment is required.")
+    await validate_message_attachments(data.attachment_urls)
+
+    safety_check = check_contact_info_policy(data.message, brand_allowed_domains(current_user, recipient))
     if not safety_check["safe"]:
-        # Sanitize the message
-        data.message = sanitize_message(data.message)
-        message_filtered = True
-        
-        # Log violation
-        violation_doc = {
-            "id": str(uuid.uuid4()),
-            "user_id": current_user['id'],
-            "user_nickname": current_user['nickname'],
-            "original_message": original_message,
-            "filtered_message": data.message,
-            "violations": safety_check["violations"],
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        await db.violations.insert_one(violation_doc)
-        
-        # Update user warning count
-        user = await db.users.find_one({"id": current_user['id']})
-        warning_count = user.get('warning_count', 0) + 1
-        
-        await db.users.update_one(
-            {"id": current_user['id']},
-            {"$set": {
-                "warning_count": warning_count,
-                "last_warning_at": datetime.now(timezone.utc).isoformat()
-            }}
-        )
-        
-        warning_issued = True
-        
-        # Check if user should be banned (3+ warnings)
-        if warning_count >= 3:
-            await db.users.update_one(
-                {"id": current_user['id']},
-                {"$set": {"banned": True, "banned_reason": "Multiple chat policy violations"}}
-            )
-            raise HTTPException(status_code=403, detail="Account banned for repeated violations")
-    
+        await log_chat_violation(current_user, data.recipient_id, data.message, safety_check["violations"], "message")
+        raise HTTPException(status_code=400, detail=CONTACT_INFO_BLOCK_DETAIL)
+
+    created_at = now_iso()
     message_doc = {
         "id": str(uuid.uuid4()),
         "sender_id": current_user['id'],
@@ -1501,18 +1884,21 @@ async def send_message(data: ChatMessage, current_user: dict = Depends(get_curre
         "recipient_id": data.recipient_id,
         "message": data.message,
         "attachment_urls": data.attachment_urls,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": created_at,
+        "created_at": created_at,
         "read": False,
-        "filtered": message_filtered
+        "read_by": [current_user['id']],
+        "delivered_at": created_at,
+        "status": "delivered",
+        "filtered": False
     }
     
     await db.messages.insert_one(message_doc)
     
     return {
         "message": "Message sent",
-        "filtered": message_filtered,
-        "warning_issued": warning_issued,
-        "warning_count": user.get('warning_count', 0) if warning_issued else None
+        "filtered": False,
+        "chat_message": {key: value for key, value in message_doc.items() if key != "_id"}
     }
 
 @api_router.get("/chat/conversations")
@@ -1524,41 +1910,65 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
         ]
     }, {"_id": 0}).to_list(10000)
 
-    # Group by conversation partner and compute unread count per partner
+    action_cards = await db.chat_action_cards.find({
+        "$or": [
+            {"sender_id": current_user['id']},
+            {"recipient_id": current_user['id']}
+        ]
+    }, {"_id": 0}).to_list(10000)
+
     conversations = {}
     unread_per_partner = {}
 
-    for msg in messages:
-        # Skip system messages for conversation grouping
-        if msg['sender_id'] == 'system':
+    for item in [message_to_chat_item(msg) for msg in messages] + [action_card_to_chat_item(card) for card in action_cards]:
+        if item.get('sender_id') == 'system':
             continue
 
-        other_id = msg['recipient_id'] if msg['sender_id'] == current_user['id'] else msg['sender_id']
+        other_id = item['recipient_id'] if item['sender_id'] == current_user['id'] else item['sender_id']
+        item_timestamp = item.get("created_at") or item.get("timestamp") or ""
 
-        # Count unread from this partner
-        if msg['sender_id'] == other_id and msg['recipient_id'] == current_user['id'] and not msg.get('read'):
+        if item['sender_id'] == other_id and item['recipient_id'] == current_user['id'] and current_user['id'] not in item.get('read_by', []) and not item.get('read'):
             unread_per_partner[other_id] = unread_per_partner.get(other_id, 0) + 1
 
-        # Update conversation only if this is a newer message
-        if other_id not in conversations or msg['timestamp'] > conversations[other_id]['last_message']['timestamp']:
+        if other_id not in conversations or item_timestamp > conversations[other_id]['timestamp']:
             other_user = await db.users.find_one({"id": other_id}, {"_id": 0, "nickname": 1, "role": 1, "profile_picture": 1})
             if other_user:  # Only add if user exists
+                deal = await find_chat_deal(current_user['id'], other_id)
+                deal_status = deal.get("status") if deal else None
+                if deal_status in ACTIVE_DEAL_STATUSES:
+                    thread_classification = "active_deal"
+                elif deal_status in ARCHIVED_DEAL_STATUSES:
+                    thread_classification = "archived"
+                else:
+                    thread_classification = "no_deal"
+                snippet = item.get("message") or item.get("title") or item.get("type") or ""
                 conversations[other_id] = {
                     "user_id": other_id,
                     "nickname": other_user.get('nickname', 'Unknown'),
                     "role": other_user.get('role', ''),
                     "profile_picture": other_user.get('profile_picture'),
-                    "last_message": msg,
-                    "unread_count": unread_per_partner.get(other_id, 0)
+                    "last_message": item,
+                    "last_item_snippet": snippet[:120],
+                    "timestamp": item_timestamp,
+                    "unread_count": unread_per_partner.get(other_id, 0),
+                    "associated_deal_status": deal_status,
+                    "thread_classification": thread_classification
                 }
 
-    return list(conversations.values())
+    for other_id, count in unread_per_partner.items():
+        if other_id in conversations:
+            conversations[other_id]["unread_count"] = count
+    return sorted(conversations.values(), key=lambda item: item.get("timestamp") or "", reverse=True)
 
 @api_router.get("/chat/unread-count")
 async def get_unread_count(current_user: dict = Depends(get_current_user)):
     count = await db.messages.count_documents({
         "recipient_id": current_user['id'],
         "read": False
+    })
+    count += await db.chat_action_cards.count_documents({
+        "recipient_id": current_user['id'],
+        "read_by": {"$ne": current_user['id']}
     })
     return {"unread_count": count}
 
@@ -1569,11 +1979,146 @@ async def get_user_warnings(current_user: dict = Depends(get_current_user)):
     return {
         "warning_count": user.get('warning_count', 0),
         "banned": user.get('banned', False),
-        "last_warning_at": user.get('last_warning_at')
+        "last_warning_at": user.get('last_warning_at'),
+        "action_cards_only_until": user.get("action_cards_only_until")
     }
+
+@api_router.post("/chat/violations/{violation_id}/false-positive")
+async def request_chat_false_positive(violation_id: str, data: ChatFalsePositiveRequest, current_user: dict = Depends(get_current_user)):
+    violation = await db.violations.find_one({"id": violation_id}, {"_id": 0})
+    if not violation:
+        raise HTTPException(status_code=404, detail="Violation not found")
+    if violation.get("user_id") != current_user["id"] and current_user["role"] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
+        raise HTTPException(status_code=403, detail="Not authorized for this violation")
+    request_doc = {
+        "id": str(uuid.uuid4()),
+        "violation_id": violation_id,
+        "user_id": violation.get("user_id"),
+        "requested_by": current_user["id"],
+        "reason": data.reason,
+        "status": "pending",
+        "created_at": now_iso(),
+        "reviewed_at": None,
+        "reviewed_by": None
+    }
+    await db.chat_false_positive_reviews.insert_one(request_doc)
+    await db.violations.update_one({"id": violation_id}, {"$set": {"false_positive_status": "pending"}})
+    return {"message": "False-positive review submitted", "review": request_doc}
+
+@api_router.post("/admin/chat/violations/{violation_id}/false-positive-review")
+async def review_chat_false_positive(violation_id: str, data: ChatFalsePositiveReview, current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if data.status not in ["approved", "rejected"]:
+        raise HTTPException(status_code=400, detail="Review status must be approved or rejected")
+    violation = await db.violations.find_one({"id": violation_id}, {"_id": 0})
+    if not violation:
+        raise HTTPException(status_code=404, detail="Violation not found")
+    reviewed_at = now_iso()
+    await db.chat_false_positive_reviews.update_many(
+        {"violation_id": violation_id, "status": "pending"},
+        {"$set": {"status": data.status, "note": data.note, "reviewed_at": reviewed_at, "reviewed_by": current_user["id"]}}
+    )
+    await db.violations.update_one(
+        {"id": violation_id},
+        {"$set": {"false_positive_status": data.status, "false_positive_reviewed_at": reviewed_at, "false_positive_reviewed_by": current_user["id"]}}
+    )
+    if data.status == "approved":
+        await db.chat_strikes.update_many({"violation_id": violation_id}, {"$set": {"invalidated": True, "invalidated_at": reviewed_at, "invalidated_by": current_user["id"]}})
+        active_strikes = await db.chat_strikes.count_documents({"user_id": violation["user_id"], "invalidated": {"$ne": True}})
+        await db.users.update_one(
+            {"id": violation["user_id"]},
+            {"$set": {"warning_count": active_strikes}, "$unset": {"action_cards_only_until": ""}}
+        )
+        await db.chat_pauses.update_many({"user_id": violation["user_id"]}, {"$set": {"invalidated": True, "paused_until": reviewed_at}})
+    return {"message": "False-positive review updated", "status": data.status}
+
+@api_router.post("/chat/action-cards")
+async def create_chat_action_card(data: ChatActionCardCreate, current_user: dict = Depends(get_current_user)):
+    await validate_chat_access(current_user, data.recipient_id, allow_action_cards_only=True)
+    fields = await validate_action_card_payload(data, current_user)
+    created_at = now_iso()
+    card = {
+        "id": str(uuid.uuid4()),
+        "thread_key": thread_key_for(current_user["id"], data.recipient_id),
+        "participants": sorted([current_user["id"], data.recipient_id]),
+        "sender_id": current_user["id"],
+        "sender_nickname": current_user.get("nickname"),
+        "recipient_id": data.recipient_id,
+        "deal_id": data.deal_id,
+        "type": data.type,
+        "fields": fields,
+        "status": "open",
+        "created_at": created_at,
+        "available_actions": get_action_card_available_actions(data.type),
+        "read_by": [current_user["id"]],
+        "immutable": True
+    }
+    await db.chat_action_cards.insert_one(card)
+    if data.type in ["damage_report", "raise_dispute"] and data.deal_id:
+        campaign = await get_campaign_by_deal_id(data.deal_id)
+        if campaign:
+            await db.escrow.update_one({"campaign_id": campaign["id"]}, {"$set": {"status": "on_hold", "updated_at": created_at}}, upsert=True)
+            await db.campaigns.update_one({"id": campaign["id"]}, {"$set": {"chat_issue_status": data.type, "updated_at": created_at}})
+    if data.type in ["damage_report", "escalate_to_admin", "raise_dispute"] or fields.get("notify_admin"):
+        await notify_admins("Chat action card needs attention", f"{current_user.get('nickname', current_user['id'])} created {data.type}.")
+    return {"message": "Action card created", "action_card": {key: value for key, value in card.items() if key != "_id"}}
+
+@api_router.post("/chat/action-cards/{card_id}/respond")
+async def respond_chat_action_card(card_id: str, data: ChatActionCardRespond, current_user: dict = Depends(get_current_user)):
+    card = await db.chat_action_cards.find_one({"id": card_id}, {"_id": 0})
+    if not card:
+        raise HTTPException(status_code=404, detail="Action card not found")
+    if current_user["id"] not in card.get("participants", []):
+        raise HTTPException(status_code=403, detail="Not authorized for this action card")
+    if card.get("status") not in ["open", "pending"]:
+        raise HTTPException(status_code=400, detail="Action card has already been responded to.")
+    if data.action not in card.get("available_actions", []):
+        raise HTTPException(status_code=400, detail="Action is not available for this card.")
+    response = {
+        "action": data.action,
+        "note": data.note,
+        "responded_by": current_user["id"],
+        "responded_at": now_iso()
+    }
+    await db.chat_action_cards.update_one(
+        {"id": card_id},
+        {"$set": {"status": data.action, "response": response}, "$addToSet": {"read_by": current_user["id"]}}
+    )
+    updated = await db.chat_action_cards.find_one({"id": card_id}, {"_id": 0})
+    return {"message": "Action card response saved", "action_card": updated}
+
+@api_router.post("/chat/{other_user_id}/typing")
+async def set_chat_typing(other_user_id: str, current_user: dict = Depends(get_current_user)):
+    await validate_chat_access(current_user, other_user_id, allow_action_cards_only=True)
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=6)).isoformat()
+    doc = {
+        "thread_key": thread_key_for(current_user["id"], other_user_id),
+        "user_id": current_user["id"],
+        "other_user_id": other_user_id,
+        "updated_at": now_iso(),
+        "expires_at": expires_at
+    }
+    await db.chat_typing.update_one(
+        {"thread_key": doc["thread_key"], "user_id": current_user["id"]},
+        {"$set": doc},
+        upsert=True
+    )
+    return {"typing": True, "expires_at": expires_at}
+
+@api_router.get("/chat/{other_user_id}/typing")
+async def get_chat_typing(other_user_id: str, current_user: dict = Depends(get_current_user)):
+    now = now_iso()
+    typing = await db.chat_typing.find_one({
+        "thread_key": thread_key_for(current_user["id"], other_user_id),
+        "user_id": other_user_id,
+        "expires_at": {"$gt": now}
+    }, {"_id": 0})
+    return {"typing": bool(typing), "user_id": other_user_id if typing else None, "expires_at": typing.get("expires_at") if typing else None}
 
 @api_router.get("/chat/{other_user_id}")
 async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_current_user)):
+    await validate_chat_access(current_user, other_user_id, allow_action_cards_only=True)
     messages = await db.messages.find({
         "$or": [
             {"sender_id": current_user['id'], "recipient_id": other_user_id},
@@ -1581,16 +2126,24 @@ async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_
         ]
     }, {"_id": 0}).sort("timestamp", 1).to_list(1000)
 
-    for msg in messages:
-        msg["attachment_urls"] = msg.get("attachment_urls", [])
+    action_cards = await db.chat_action_cards.find({
+        "participants": {"$all": [current_user['id'], other_user_id]}
+    }, {"_id": 0}).sort("created_at", 1).to_list(1000)
 
-    # Mark as read
-    await db.messages.update_many(
-        {"sender_id": other_user_id, "recipient_id": current_user['id']},
-        {"$set": {"read": True}}
-    )
+    if not current_user.get("disable_read_receipts"):
+        read_at = now_iso()
+        await db.messages.update_many(
+            {"sender_id": other_user_id, "recipient_id": current_user['id']},
+            {"$set": {"read": True, "read_at": read_at, "status": "read"}, "$addToSet": {"read_by": current_user['id']}}
+        )
+        await db.chat_action_cards.update_many(
+            {"recipient_id": current_user['id'], "participants": {"$all": [current_user['id'], other_user_id]}},
+            {"$addToSet": {"read_by": current_user['id']}, "$set": {"read_at": read_at}}
+        )
 
-    return messages
+    items = [message_to_chat_item(msg) for msg in messages] + [action_card_to_chat_item(card) for card in action_cards]
+    items.sort(key=lambda item: item.get("created_at") or item.get("timestamp") or "")
+    return items
 
 @api_router.get("/admin/violations")
 async def get_all_violations(current_user: dict = Depends(get_current_user)):
@@ -2599,20 +3152,11 @@ async def reject_withdrawal(withdrawal_id: str, reason: str, current_user: dict 
 
 @api_router.post("/upload/file")
 async def upload_file(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
-    """Upload files (videos, images) for profile or portfolio"""
+    """Upload files for profiles, portfolios, and chat attachments."""
     # Create uploads directory if it doesn't exist
     upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads")))
     upload_dir.mkdir(exist_ok=True)
 
-    # Validate file type
-    allowed_types = [
-        'image/jpeg', 'image/png', 'image/jpg', 'image/webp', 'image/gif',
-        'video/mp4', 'video/quicktime', 'video/webm', 'video/x-msvideo', 
-        'video/mpeg', 'video/3gpp', 'video/x-matroska'
-    ]
-    if file.content_type not in allowed_types:
-        raise HTTPException(status_code=400, detail=f"File type '{file.content_type}' not allowed. Allowed types: images (JPEG, PNG, WebP, GIF) and videos (MP4, MOV, WebM, AVI, MPEG)")
-    
     # Generate unique filename
     file_ext = Path(file.filename).suffix
     unique_filename = f"{current_user['id']}_{uuid.uuid4()}{file_ext}"
@@ -2621,12 +3165,33 @@ async def upload_file(file: UploadFile = File(...), current_user: dict = Depends
     # Save file
     try:
         content = await file.read()
+        duration_seconds = get_video_duration_seconds(content, file.filename, file.content_type)
+        kind = validate_upload_payload(file.content_type, file.filename, len(content), duration_seconds)
+        if kind == "image":
+            scan = scan_image_for_contact_info(content, file.filename)
+            if not scan.get("safe", True):
+                await log_chat_violation(current_user, None, file.filename or "image_upload", scan.get("violations", []), "image_ocr")
+                raise HTTPException(status_code=400, detail=CONTACT_INFO_BLOCK_DETAIL)
         with open(file_path, 'wb') as f:
             f.write(content)
         
-        # Return file URL
         file_url = f"/uploads/{unique_filename}"
-        return {"file_url": file_url, "filename": unique_filename}
+        metadata = {
+            "id": str(uuid.uuid4()),
+            "file_url": file_url,
+            "filename": unique_filename,
+            "original_filename": file.filename,
+            "content_type": file.content_type,
+            "size": len(content),
+            "kind": kind,
+            "duration_seconds": duration_seconds,
+            "uploaded_by": current_user["id"],
+            "created_at": now_iso()
+        }
+        await db.uploaded_files.insert_one(metadata)
+        return {key: value for key, value in metadata.items() if key != "_id"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
 
