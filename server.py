@@ -37,7 +37,7 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
-app = FastAPI()
+app = FastAPI(title="UGCad Backend API")
 api_router = APIRouter(prefix="/api")
 security = HTTPBearer()
 
