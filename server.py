@@ -854,6 +854,75 @@ async def validate_action_card_payload(data: ChatActionCardCreate, current_user:
         require_fields(fields, ["summary", "category"], "raise_dispute")
     return fields
 
+def to_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+def month_start(dt: datetime) -> datetime:
+    return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
+
+def add_months(dt: datetime, months: int) -> datetime:
+    month = dt.month - 1 + months
+    year = dt.year + month // 12
+    month = month % 12 + 1
+    return datetime(year, month, 1, tzinfo=timezone.utc)
+
+def is_between_iso(value: Optional[str], start: datetime, end: datetime) -> bool:
+    parsed = parse_iso(value)
+    if not parsed:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return start <= parsed < end
+
+def campaign_budget_total(campaign: dict) -> float:
+    if campaign.get("budget"):
+        return to_float(campaign.get("budget"))
+    budget_min = to_float(campaign.get("budget_min"))
+    budget_max = to_float(campaign.get("budget_max"))
+    if budget_min and budget_max:
+        return budget_max
+    return budget_min or budget_max
+
+def campaign_category(campaign: dict) -> str:
+    return (
+        campaign.get("industry_category") or
+        campaign.get("category") or
+        campaign.get("product_type") or
+        ((campaign.get("objectives") or ["Other"])[0] if isinstance(campaign.get("objectives"), list) else campaign.get("objectives")) or
+        "Other"
+    )
+
+def selected_bid_amount(campaign: dict) -> float:
+    selected_creator = campaign.get("selected_creator")
+    for bid in campaign.get("bids", []):
+        if bid.get("creator_id") == selected_creator:
+            return to_float(bid.get("amount"))
+    return 0.0
+
+def dashboard_stage(campaign: dict, work: Optional[dict], shipment: Optional[dict]) -> dict:
+    status_value = campaign.get("status")
+    work_status = (work or {}).get("status")
+    shipment_status = (shipment or {}).get("status") or (shipment or {}).get("courier_status")
+    if work_status == WorkStatus.SUBMITTED or status_value == "work_submitted":
+        return {"stage": "awaiting_review", "stage_label": "Awaiting Review", "next_action": "review", "next_action_label": "Review"}
+    if work_status == WorkStatus.REVISION_REQUESTED:
+        return {"stage": "revision_requested", "stage_label": "Revision Requested", "next_action": "await_revision", "next_action_label": "Await Revision"}
+    if work_status == WorkStatus.APPROVED or status_value == CampaignStatus.COMPLETED:
+        return {"stage": "completed", "stage_label": "Completed", "next_action": "none", "next_action_label": "None"}
+    if shipment_status in ["shipped", "in_transit", "delivered"]:
+        return {"stage": "in_transit", "stage_label": "In Transit", "next_action": "track", "next_action_label": "Track"}
+    if campaign.get("requires_shipment"):
+        return {"stage": "awaiting_shipment", "stage_label": "Awaiting Shipment", "next_action": "upload_shipment", "next_action_label": "Upload Shipment"}
+    return {"stage": "in_progress", "stage_label": "In Progress", "next_action": "monitor", "next_action_label": "Monitor"}
+
+def percent_change(current: int, previous: int) -> float:
+    if previous == 0:
+        return 100.0 if current > 0 else 0.0
+    return round(((current - previous) / previous) * 100, 2)
+
 def make_deal_id(campaign: dict) -> str:
     if campaign.get('deal_id'):
         return campaign['deal_id']
@@ -1367,6 +1436,234 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
 @api_router.get("/auth/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
     return {k: v for k, v in current_user.items() if k != 'password'}
+
+@api_router.get("/business/dashboard")
+async def get_business_dashboard(current_user: dict = Depends(get_current_user)):
+    if current_user.get('role') != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only business users can access this dashboard")
+
+    business_id = current_user['id']
+    campaigns = await db.campaigns.find({"business_id": business_id}, {"_id": 0}).to_list(10000)
+    campaign_ids = [campaign.get("id") for campaign in campaigns if campaign.get("id")]
+
+    escrows = await db.escrow.find({"campaign_id": {"$in": campaign_ids}}, {"_id": 0}).to_list(10000) if campaign_ids else []
+    work_submissions = await db.work_submissions.find({"campaign_id": {"$in": campaign_ids}}, {"_id": 0}).to_list(10000) if campaign_ids else []
+    shipments = await db.shipments.find({"campaign_id": {"$in": campaign_ids}}, {"_id": 0}).to_list(10000) if campaign_ids else []
+    reviews = await db.reviews.find({"campaign_id": {"$in": campaign_ids}}, {"_id": 0}).to_list(10000) if campaign_ids else []
+
+    escrow_by_campaign = {escrow.get("campaign_id"): escrow for escrow in escrows}
+    shipment_by_campaign = {shipment.get("campaign_id"): shipment for shipment in shipments}
+    work_by_campaign = {}
+    for work in sorted(work_submissions, key=lambda item: item.get("submitted_at") or item.get("created_at") or "", reverse=True):
+        work_by_campaign.setdefault(work.get("campaign_id"), work)
+
+    now = datetime.now(timezone.utc)
+    current_month_start = month_start(now)
+    next_month_start = add_months(current_month_start, 1)
+    previous_month_start = add_months(current_month_start, -1)
+    week_start = now - timedelta(days=7)
+    previous_week_start = now - timedelta(days=14)
+
+    active_statuses = {CampaignStatus.ACTIVE, CampaignStatus.IN_PROGRESS, "work_submitted"}
+    active_campaigns = [campaign for campaign in campaigns if campaign.get("status") in active_statuses]
+    selected_active_campaigns = [campaign for campaign in active_campaigns if campaign.get("selected_creator")]
+
+    active_this_week = [
+        campaign for campaign in active_campaigns
+        if is_between_iso(campaign.get("updated_at") or campaign.get("created_at"), week_start, now + timedelta(seconds=1))
+    ]
+    active_previous_week = [
+        campaign for campaign in active_campaigns
+        if is_between_iso(campaign.get("updated_at") or campaign.get("created_at"), previous_week_start, week_start)
+    ]
+
+    selected_active_ids = {campaign.get("id") for campaign in selected_active_campaigns}
+    held_escrows = [
+        escrow for escrow in escrows
+        if escrow.get("campaign_id") in selected_active_ids and escrow.get("status") in ["held", "on_hold", "disputed"]
+    ]
+    in_escrow = sum(to_float(escrow.get("amount") or escrow.get("held_amount")) for escrow in held_escrows)
+
+    approved_work = [work for work in work_submissions if work.get("status") == WorkStatus.APPROVED]
+    reviewed_work = [work for work in work_submissions if work.get("status") in [WorkStatus.APPROVED, WorkStatus.REVISION_REQUESTED]]
+    delivered_this_month = len([
+        work for work in approved_work
+        if is_between_iso(work.get("approved_at") or work.get("updated_at"), current_month_start, next_month_start)
+    ])
+    delivered_previous_month = len([
+        work for work in approved_work
+        if is_between_iso(work.get("approved_at") or work.get("updated_at"), previous_month_start, current_month_start)
+    ])
+    approval_rate = round((len(approved_work) / len(reviewed_work)) * 100, 2) if reviewed_work else 0
+    avg_rating = round(sum(to_float(review.get("rating")) for review in reviews) / len(reviews), 2) if reviews else 0
+
+    campaign_performance = []
+    for offset in range(5, -1, -1):
+        start = add_months(current_month_start, -offset)
+        end = add_months(start, 1)
+        applications_received = sum(
+            1
+            for campaign in campaigns
+            for bid in campaign.get("bids", [])
+            if is_between_iso(bid.get("submitted_at"), start, end)
+        )
+        deals_closed = len([
+            campaign for campaign in campaigns
+            if campaign.get("status") == CampaignStatus.COMPLETED
+            and is_between_iso(campaign.get("completed_at") or campaign.get("updated_at"), start, end)
+        ])
+        approved_deliveries = len([
+            work for work in approved_work
+            if is_between_iso(work.get("approved_at") or work.get("updated_at"), start, end)
+        ])
+        month_spend = sum(
+            to_float(escrow.get("amount") or escrow.get("held_amount"))
+            for escrow in escrows
+            if is_between_iso(escrow.get("released_at") or escrow.get("updated_at") or escrow.get("created_at"), start, end)
+        )
+        campaign_performance.append({
+            "month": start.strftime("%b"),
+            "deals_closed": deals_closed,
+            "approved_deliveries": approved_deliveries,
+            "applications_received": applications_received,
+            "spend_k": round(month_spend / 1000, 2)
+        })
+
+    viewed_brief = await db.campaign_views.count_documents({"campaign_id": {"$in": campaign_ids}}) if campaign_ids else 0
+    applications_total = sum(len(campaign.get("bids", [])) for campaign in campaigns)
+    accepted_total = len([campaign for campaign in campaigns if campaign.get("selected_creator")])
+    live_total = len(selected_active_campaigns)
+
+    top_campaigns = []
+    for campaign in campaigns:
+        escrow = escrow_by_campaign.get(campaign.get("id"), {})
+        spend = to_float(escrow.get("amount") or escrow.get("held_amount")) or selected_bid_amount(campaign)
+        top_campaigns.append({
+            "id": campaign.get("id"),
+            "title": campaign.get("title", "Untitled Campaign"),
+            "applications": len(campaign.get("bids", [])),
+            "spend": spend,
+            "status": campaign.get("status")
+        })
+    top_campaigns.sort(key=lambda item: (item["applications"], item["spend"]), reverse=True)
+
+    creator_ids = [campaign.get("selected_creator") for campaign in selected_active_campaigns if campaign.get("selected_creator")]
+    creators = await db.users.find({"id": {"$in": creator_ids}}, {"_id": 0, "id": 1, "nickname": 1}).to_list(10000) if creator_ids else []
+    creator_by_id = {creator.get("id"): creator for creator in creators}
+
+    active_deals = []
+    for campaign in selected_active_campaigns:
+        campaign_id = campaign.get("id")
+        escrow = escrow_by_campaign.get(campaign_id, {})
+        work = work_by_campaign.get(campaign_id)
+        shipment = shipment_by_campaign.get(campaign_id)
+        creator = creator_by_id.get(campaign.get("selected_creator"), {})
+        stage = dashboard_stage(campaign, work, shipment)
+        active_deals.append({
+            "campaign_id": campaign_id,
+            "campaign_title": campaign.get("title", "Untitled Campaign"),
+            "creator_id": campaign.get("selected_creator"),
+            "creator_nickname": creator.get("nickname"),
+            **stage,
+            "due_date": campaign.get("deadline") or campaign.get("due_date"),
+            "escrow_amount": to_float(escrow.get("amount") or escrow.get("held_amount")) or selected_bid_amount(campaign)
+        })
+
+    pending_review_work = [work for work in work_submissions if work.get("status") == WorkStatus.SUBMITTED]
+    shipment_needed = [
+        campaign for campaign in selected_active_campaigns
+        if campaign.get("requires_shipment") and campaign.get("id") not in shipment_by_campaign
+    ]
+    shipment_confirmations = [
+        shipment for shipment in shipments
+        if shipment.get("campaign_id") in selected_active_ids
+        and (shipment.get("status") or shipment.get("courier_status")) == "delivered"
+        and not shipment.get("received_at")
+    ]
+    unread_creator_messages = await db.messages.count_documents({
+        "recipient_id": business_id,
+        "sender_id": {"$in": creator_ids},
+        "read": False
+    }) if creator_ids else 0
+    unread_creator_messages += await db.deal_messages.count_documents({
+        "campaign_id": {"$in": campaign_ids},
+        "sender_id": {"$ne": business_id},
+        "read_by": {"$ne": business_id}
+    }) if campaign_ids else 0
+
+    pending_actions = [
+        {
+            "type": "review_submitted_reel",
+            "label": "Review Submitted Reel",
+            "count": len(pending_review_work),
+            "target_url": f"/work-review/{pending_review_work[0]['id']}" if pending_review_work else None
+        },
+        {
+            "type": "upload_shipment",
+            "label": "Upload Shipment",
+            "count": len(shipment_needed),
+            "target_url": f"/campaigns/{shipment_needed[0]['id']}" if shipment_needed else None
+        },
+        {
+            "type": "delivery_confirmation",
+            "label": "Delivery Confirmation",
+            "count": len(shipment_confirmations),
+            "target_url": f"/shipment/{shipment_confirmations[0]['campaign_id']}" if shipment_confirmations else None
+        },
+        {
+            "type": "unread_creator_messages",
+            "label": "Unread Creator Messages",
+            "count": unread_creator_messages,
+            "target_url": "/messages" if unread_creator_messages else None
+        }
+    ]
+
+    total_used = 0.0
+    total_budget = 0.0
+    spend_by_category = {}
+    for campaign in campaigns:
+        category = campaign_category(campaign)
+        escrow = escrow_by_campaign.get(campaign.get("id"), {})
+        used = to_float(escrow.get("amount") or escrow.get("held_amount")) or selected_bid_amount(campaign)
+        total_used += used
+        total_budget += campaign_budget_total(campaign)
+        spend_by_category[category] = spend_by_category.get(category, 0.0) + used
+    budget_categories = [
+        {
+            "label": category,
+            "used": used,
+            "percent": round((used / total_used) * 100, 2) if total_used else 0
+        }
+        for category, used in sorted(spend_by_category.items(), key=lambda item: item[1], reverse=True)
+    ]
+
+    return {
+        "metrics": {
+            "active_deals": len(active_campaigns),
+            "active_deals_change_this_week": len(active_this_week) - len(active_previous_week),
+            "in_escrow": in_escrow,
+            "delivered_this_month": delivered_this_month,
+            "delivered_monthly_change_percent": percent_change(delivered_this_month, delivered_previous_month),
+            "wallet_balance": to_float(current_user.get("balance")),
+            "approval_rate": approval_rate,
+            "avg_rating": avg_rating
+        },
+        "campaign_performance": campaign_performance,
+        "creator_funnel": {
+            "viewed_brief": viewed_brief,
+            "applied": applications_total,
+            "accepted": accepted_total,
+            "live": live_total
+        },
+        "top_campaigns": top_campaigns[:5],
+        "active_deals": active_deals,
+        "pending_actions": pending_actions,
+        "budget_usage": {
+            "used": total_used,
+            "total": total_budget,
+            "categories": budget_categories
+        }
+    }
 
 # Profile Routes
 @api_router.put("/profile/creator")
