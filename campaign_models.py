@@ -122,9 +122,16 @@ class CampaignCreateExtended(BaseModel):
     per_video_budget: Optional[float] = None
     total_budget: Optional[float] = None
     currency: str = "INR"
-    
+
     # Status
     status: Optional[str] = None
+
+    # Brand & Image Info (denormalized from business profile)
+    brand_name: Optional[str] = None
+    brand_logo_url: Optional[str] = None
+    brand_cover_image_url: Optional[str] = None
+    business_verified: Optional[bool] = None
+    product_image_url: Optional[str] = None
 
 
 class CampaignDraftCreate(BaseModel):
@@ -135,7 +142,7 @@ class CampaignDraftCreate(BaseModel):
     budget_min: Optional[float] = None
     budget_max: Optional[float] = None
     brief_text: Optional[str] = None
-    
+
     # New fields
     product_name: Optional[str] = None
     product_category: Optional[str] = None
@@ -144,29 +151,36 @@ class CampaignDraftCreate(BaseModel):
     product_images: List[str] = []
     shipment_required: Optional[bool] = None
     shipment_notes: Optional[str] = None
-    
+
     brief_type: Optional[str] = None
     campaign_hook: Optional[str] = None
     key_message: Optional[str] = None
     what_not_to_do: Optional[str] = None
     tone_reference: Optional[str] = None
     tone_tags: List[str] = []
-    
+
     video_format: Optional[str] = None
     aspect_ratio: Optional[str] = None
     duration_seconds: Optional[int] = None
     additional_deliverables: List[str] = []
     free_revisions: Optional[int] = None
-    
+
     creator_level: Optional[str] = None
     content_quality_tier: Optional[str] = None
     gender_preference: Optional[str] = None
     city_filter: Optional[str] = None
     creator_niche_tags: List[str] = []
-    
+
     per_video_budget: Optional[float] = None
     total_budget: Optional[float] = None
     currency: str = "INR"
+
+    # Brand & Image Info
+    brand_name: Optional[str] = None
+    brand_logo_url: Optional[str] = None
+    brand_cover_image_url: Optional[str] = None
+    business_verified: Optional[bool] = None
+    product_image_url: Optional[str] = None
 
 
 class CampaignUpdate(BaseModel):
@@ -178,7 +192,7 @@ class CampaignUpdate(BaseModel):
     brief_text: Optional[str] = None
     deadline: Optional[str] = None
     due_date: Optional[str] = None
-    
+
     # New fields
     product_name: Optional[str] = None
     product_category: Optional[str] = None
@@ -187,30 +201,37 @@ class CampaignUpdate(BaseModel):
     product_images: Optional[List[str]] = None
     shipment_required: Optional[bool] = None
     shipment_notes: Optional[str] = None
-    
+
     brief_type: Optional[str] = None
     campaign_hook: Optional[str] = None
     key_message: Optional[str] = None
     what_not_to_do: Optional[str] = None
     tone_reference: Optional[str] = None
     tone_tags: Optional[List[str]] = None
-    
+
     video_format: Optional[str] = None
     aspect_ratio: Optional[str] = None
     duration_seconds: Optional[int] = None
     additional_deliverables: Optional[List[str]] = None
     free_revisions: Optional[int] = None
-    
+
     creator_level: Optional[str] = None
     content_quality_tier: Optional[str] = None
     gender_preference: Optional[str] = None
     city_filter: Optional[str] = None
     creator_niche_tags: Optional[List[str]] = None
-    
+
     per_video_budget: Optional[float] = None
     total_budget: Optional[float] = None
     currency: Optional[str] = None
-    
+
+    # Brand & Image Info
+    brand_name: Optional[str] = None
+    brand_logo_url: Optional[str] = None
+    brand_cover_image_url: Optional[str] = None
+    business_verified: Optional[bool] = None
+    product_image_url: Optional[str] = None
+
     # Legacy fields
     requires_shipment: Optional[bool] = None
     shipment_option: Optional[str] = None

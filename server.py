@@ -197,6 +197,7 @@ class CreatorProfileUpdate(BaseModel):
     terms_agreed: bool
 
 class BusinessProfileUpdate(BaseModel):
+    business_name: Optional[str] = None
     logo: Optional[str] = None
     banner: Optional[str] = None
     business_description: str
@@ -1716,7 +1717,7 @@ async def update_portfolio(portfolio: List[str], current_user: dict = Depends(ge
 async def update_business_profile(data: BusinessProfileUpdate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.BUSINESS:
         raise HTTPException(status_code=403, detail="Only businesses can update business profile")
-    
+
     profile_data = data.dict()
     await db.users.update_one(
         {"id": current_user['id']},
@@ -1727,7 +1728,21 @@ async def update_business_profile(data: BusinessProfileUpdate, current_user: dic
             "updated_at": datetime.now(timezone.utc).isoformat()
         }}
     )
-    
+
+    # Cascade brand info updates to all existing campaigns for this business
+    brand_name = profile_data.get('business_name') or current_user.get('nickname', '')
+    brand_logo_url = profile_data.get('logo') or ''
+    brand_cover_image_url = profile_data.get('banner') or ''
+    await db.campaigns.update_many(
+        {"business_id": current_user['id']},
+        {"$set": {
+            "brand_name": brand_name,
+            "brand_logo_url": brand_logo_url,
+            "brand_cover_image_url": brand_cover_image_url,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+
     return {"message": "Profile submitted for review"}
 
 # Profile Management Routes
@@ -1940,12 +1955,23 @@ async def create_draft(data: CampaignDraftCreate, current_user: dict = Depends(g
     
     # Prepare campaign for storage with draft status
     campaign_doc = prepare_campaign_for_storage(campaign_data, status='draft')
-    
+
+    # Pull brand info from authenticated business user's profile
+    user_profile = current_user.get('profile', {})
+    brand_name = user_profile.get('business_name') or current_user.get('nickname', '')
+    brand_logo_url = user_profile.get('logo') or ''
+    brand_cover_image_url = user_profile.get('banner') or ''
+    business_verified = current_user.get('approval_status') == ApprovalStatus.APPROVED
+
     # Add metadata
     campaign_doc.update({
         "id": campaign_id,
         "business_id": current_user['id'],
         "business_nickname": current_user.get('nickname', ''),
+        "brand_name": brand_name,
+        "brand_logo_url": brand_logo_url,
+        "brand_cover_image_url": brand_cover_image_url,
+        "business_verified": business_verified,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
@@ -2040,6 +2066,61 @@ async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(g
         "message": "Campaign submitted for approval"
     }
 
+@api_router.post("/campaigns/{campaign_id}/upload-image")
+async def upload_campaign_image(
+    campaign_id: str,
+    image_type: str,
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """Upload campaign images: logo, cover, or product_image. PNG/JPG/WEBP, max 10MB."""
+    # Ownership check
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get('business_id') != current_user['id']:
+        raise HTTPException(status_code=403, detail="You can only upload to your own campaigns")
+
+    # Validate image_type
+    field_map = {
+        "logo": "brand_logo_url",
+        "cover": "brand_cover_image_url",
+        "product_image": "product_image_url"
+    }
+    if image_type not in field_map:
+        raise HTTPException(status_code=400, detail="image_type must be one of: logo, cover, product_image")
+
+    # Validate file type
+    allowed = {'image/jpeg', 'image/jpg', 'image/png', 'image/webp'}
+    if file.content_type not in allowed:
+        raise HTTPException(status_code=400, detail="Only PNG, JPG, WEBP images allowed")
+
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image must be under 10MB")
+
+    # Save file
+    upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads")))
+    img_dir = upload_dir / "campaigns" / image_type
+    img_dir.mkdir(parents=True, exist_ok=True)
+    file_ext = Path(file.filename).suffix or '.jpg'
+    filename = f"{uuid.uuid4()}{file_ext}"
+    with open(img_dir / filename, 'wb') as f:
+        f.write(content)
+
+    file_url = f"/uploads/campaigns/{image_type}/{filename}"
+    db_field = field_map[image_type]
+
+    # Update campaign
+    await db.campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {db_field: file_url, "updated_at": now_iso()}}
+    )
+
+    # Return normalized full campaign
+    updated = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    return normalize_campaign_response(updated)
+
 @api_router.post("/campaigns")
 async def create_campaign(data: CampaignCreateExtended, current_user: dict = Depends(get_current_user)):
     """Create campaign - supports both legacy and extended fields"""
@@ -2070,16 +2151,27 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
     
     # Prepare campaign for storage
     campaign_doc = prepare_campaign_for_storage(campaign_data, status=final_status)
-    
+
+    # Pull brand info from authenticated business user's profile
+    user_profile = current_user.get('profile', {})
+    brand_name = user_profile.get('business_name') or current_user.get('nickname', '')
+    brand_logo_url = user_profile.get('logo') or ''
+    brand_cover_image_url = user_profile.get('banner') or ''
+    business_verified = current_user.get('approval_status') == ApprovalStatus.APPROVED
+
     # Add metadata
     campaign_doc.update({
         "id": campaign_id,
         "business_id": current_user['id'],
         "business_nickname": current_user.get('nickname', ''),
+        "brand_name": brand_name,
+        "brand_logo_url": brand_logo_url,
+        "brand_cover_image_url": brand_cover_image_url,
+        "business_verified": business_verified,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
-    
+
     if final_status == CampaignStatus.PENDING_APPROVAL:
         campaign_doc['submitted_at'] = datetime.now(timezone.utc).isoformat()
     

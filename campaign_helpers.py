@@ -3,6 +3,16 @@ Campaign Helper Functions for validation and backward compatibility
 """
 from typing import Dict, Any, List, Optional
 from fastapi import HTTPException
+import urllib.parse
+
+
+def is_valid_url(url: str) -> bool:
+    """Validate that a URL has proper HTTP/HTTPS scheme and netloc."""
+    try:
+        result = urllib.parse.urlparse(url)
+        return result.scheme in ('http', 'https') and bool(result.netloc)
+    except Exception:
+        return False
 
 
 def validate_campaign_for_submission(campaign_data: Dict[str, Any]) -> None:
@@ -98,7 +108,21 @@ def map_legacy_to_new_fields(campaign_data: Dict[str, Any]) -> Dict[str, Any]:
     # Ensure title exists (required for legacy compatibility)
     if not campaign_data.get('title'):
         campaign_data['title'] = campaign_data.get('product_name') or 'Untitled Campaign'
-    
+
+    # Map brand_name fallback: brand_name → business_nickname
+    if not campaign_data.get('brand_name') and campaign_data.get('business_nickname'):
+        campaign_data['brand_name'] = campaign_data['business_nickname']
+
+    # Map product_image_url from product_images list
+    if not campaign_data.get('product_image_url') and campaign_data.get('product_images'):
+        images = campaign_data['product_images']
+        if images:
+            campaign_data['product_image_url'] = images[0]
+
+    # Map cover_image fallback: cover → product_image
+    if not campaign_data.get('brand_cover_image_url') and campaign_data.get('product_image_url'):
+        campaign_data['brand_cover_image_url'] = campaign_data['product_image_url']
+
     return campaign_data
 
 
@@ -108,7 +132,7 @@ def normalize_campaign_response(campaign: Dict[str, Any]) -> Dict[str, Any]:
     """
     # Apply legacy mapping
     campaign = map_legacy_to_new_fields(campaign)
-    
+
     # Ensure default values for lists
     campaign.setdefault('product_images', [])
     campaign.setdefault('tone_tags', [])
@@ -116,10 +140,22 @@ def normalize_campaign_response(campaign: Dict[str, Any]) -> Dict[str, Any]:
     campaign.setdefault('creator_niche_tags', [])
     campaign.setdefault('objectives', [])
     campaign.setdefault('brief_attachments', [])
-    
+
     # Ensure currency default
     campaign.setdefault('currency', 'INR')
-    
+
+    # Add response-facing aliases for brand/image fields
+    campaign['brand_logo'] = campaign.get('brand_logo_url') or ''
+    campaign['cover_image'] = campaign.get('brand_cover_image_url') or campaign.get('product_image_url') or ''
+    campaign['product_image'] = campaign.get('product_image_url') or ''
+    campaign['brand_handle'] = f"@{campaign['business_nickname']}" if campaign.get('business_nickname') else ''
+    campaign.setdefault('business_verified', False)
+    campaign.setdefault('brand_name', campaign.get('business_nickname', ''))
+
+    # Ensure brief_text fallback
+    if not campaign.get('brief_text'):
+        campaign['brief_text'] = 'No brief description provided.'
+
     return campaign
 
 
