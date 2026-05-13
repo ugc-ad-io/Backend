@@ -15,6 +15,15 @@ class CampaignStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class IndustryType(str, Enum):
+    SKINCARE = "skincare"
+    FASHION = "fashion"
+    SERVICES_BASED = "servicesBased"
+    HEALTHCARE = "healthcare"
+    ELECTRONICS = "electronics"
+    FOOD_BEVERAGE = "foodBeverage"
+
+
 # Step 1: Product Info
 class ProductInfo(BaseModel):
     product_name: Optional[str] = None
@@ -133,6 +142,9 @@ class CampaignCreateExtended(BaseModel):
     business_verified: Optional[bool] = None
     product_image_url: Optional[str] = None
 
+    # Industry classification
+    industry_type: Optional[IndustryType] = None
+
 
 class CampaignDraftCreate(BaseModel):
     """Model for creating draft campaigns - allows partial data"""
@@ -181,6 +193,9 @@ class CampaignDraftCreate(BaseModel):
     brand_cover_image_url: Optional[str] = None
     business_verified: Optional[bool] = None
     product_image_url: Optional[str] = None
+
+    # Industry classification
+    industry_type: Optional[IndustryType] = None
 
 
 class CampaignUpdate(BaseModel):
@@ -231,6 +246,9 @@ class CampaignUpdate(BaseModel):
     brand_cover_image_url: Optional[str] = None
     business_verified: Optional[bool] = None
     product_image_url: Optional[str] = None
+
+    # Industry classification
+    industry_type: Optional[IndustryType] = None
 
     # Legacy fields
     requires_shipment: Optional[bool] = None

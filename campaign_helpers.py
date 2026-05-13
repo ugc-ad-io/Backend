@@ -156,6 +156,9 @@ def normalize_campaign_response(campaign: Dict[str, Any]) -> Dict[str, Any]:
     if not campaign.get('brief_text'):
         campaign['brief_text'] = 'No brief description provided.'
 
+    # Default industry_type to null if not set
+    campaign.setdefault('industry_type', None)
+
     return campaign
 
 
