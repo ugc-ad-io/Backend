@@ -206,6 +206,21 @@ class BusinessProfileUpdate(BaseModel):
     product_type: str
     industry_category: str
 
+class PayoutRangeCreate(BaseModel):
+    key: str
+    label: str
+    min_amount: float
+    max_amount: float
+    sort_order: Optional[int] = None
+
+class PayoutRangeUpdate(BaseModel):
+    key: Optional[str] = None
+    label: Optional[str] = None
+    min_amount: Optional[float] = None
+    max_amount: Optional[float] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
 # Legacy CampaignCreate kept for backward compatibility
 class CampaignCreate(BaseModel):
     title: str
@@ -3369,6 +3384,19 @@ async def get_withdrawal_history(current_user: dict = Depends(get_current_user))
     withdrawals = await db.withdrawals.find({"user_id": current_user['id']}, {"_id": 0}).to_list(1000)
     return withdrawals
 
+@api_router.get("/payout-ranges")
+async def get_payout_ranges(current_user: dict = Depends(get_current_user)):
+    """Get available payout ranges for filtering campaigns."""
+    ranges = await db.payout_ranges.find(
+        {"is_active": True}, {"_id": 0}
+    ).sort("sort_order", 1).to_list(100)
+    return {
+        "ranges": [
+            {"key": r["key"], "label": r["label"], "min": r["min_amount"], "max": r["max_amount"]}
+            for r in ranges
+        ]
+    }
+
 # Admin Routes
 @api_router.get("/admin/pending-profiles")
 async def get_pending_profiles(current_user: dict = Depends(get_current_user)):
@@ -4667,6 +4695,68 @@ async def update_staff_permissions(data: PermissionUpdate, current_user: dict = 
     
     return {"message": "Permissions updated successfully"}
 
+# Payout Ranges Management
+@api_router.get("/admin/payout-ranges")
+async def admin_get_payout_ranges(current_user: dict = Depends(get_current_user)):
+    """Get all payout ranges (including inactive) for admin management."""
+    if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    ranges = await db.payout_ranges.find({}, {"_id": 0}).sort("sort_order", 1).to_list(100)
+    return {"ranges": ranges}
+
+@api_router.post("/admin/payout-ranges")
+async def admin_create_payout_range(data: PayoutRangeCreate, current_user: dict = Depends(get_current_user)):
+    """Create a new payout range."""
+    if current_user['role'] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if data.min_amount >= data.max_amount:
+        raise HTTPException(status_code=400, detail="min_amount must be less than max_amount")
+    existing = await db.payout_ranges.find_one({"key": data.key})
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Range with key '{data.key}' already exists")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "is_active": True,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        **data.dict()
+    }
+    if doc.get("sort_order") is None:
+        count = await db.payout_ranges.count_documents({})
+        doc["sort_order"] = count
+    await db.payout_ranges.insert_one(doc)
+    return doc
+
+@api_router.put("/admin/payout-ranges/{range_id}")
+async def admin_update_payout_range(range_id: str, data: PayoutRangeUpdate, current_user: dict = Depends(get_current_user)):
+    """Update a payout range."""
+    if current_user['role'] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    existing = await db.payout_ranges.find_one({"id": range_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Payout range not found")
+    update = data.dict(exclude_unset=True)
+    if not update:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    min_val = update.get("min_amount", existing["min_amount"])
+    max_val = update.get("max_amount", existing["max_amount"])
+    if min_val >= max_val:
+        raise HTTPException(status_code=400, detail="min_amount must be less than max_amount")
+    update["updated_at"] = now_iso()
+    await db.payout_ranges.update_one({"id": range_id}, {"$set": update})
+    updated = await db.payout_ranges.find_one({"id": range_id}, {"_id": 0})
+    return updated
+
+@api_router.delete("/admin/payout-ranges/{range_id}")
+async def admin_delete_payout_range(range_id: str, current_user: dict = Depends(get_current_user)):
+    """Delete a payout range."""
+    if current_user['role'] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    result = await db.payout_ranges.delete_one({"id": range_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Payout range not found")
+    return {"message": "Payout range deleted"}
+
 # Analytics Dashboard
 @api_router.get("/admin/analytics")
 async def get_analytics(current_user: dict = Depends(get_current_user)):
@@ -4807,6 +4897,25 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+@app.on_event("startup")
+async def seed_payout_ranges():
+    """Seed default payout ranges if collection is empty."""
+    count = await db.payout_ranges.count_documents({})
+    if count == 0:
+        defaults = [
+            {"key": "1k",      "label": "Rs. 1k",         "min_amount": 0,     "max_amount": 1000,  "sort_order": 0},
+            {"key": "1k-2.5k", "label": "Rs. 1k - 2.5k",  "min_amount": 1001,  "max_amount": 2500,  "sort_order": 1},
+            {"key": "2.5k-5k", "label": "Rs. 2.5k - 5k",  "min_amount": 2501,  "max_amount": 5000,  "sort_order": 2},
+            {"key": "5k-10k",  "label": "Rs. 5k - 10k",   "min_amount": 5001,  "max_amount": 10000, "sort_order": 3},
+            {"key": "10k-20k", "label": "Rs. 10k - 20k",  "min_amount": 10001, "max_amount": 20000, "sort_order": 4},
+        ]
+        now = datetime.now(timezone.utc).isoformat()
+        docs = [
+            {"id": str(uuid.uuid4()), "is_active": True, "created_at": now, "updated_at": now, **d}
+            for d in defaults
+        ]
+        await db.payout_ranges.insert_many(docs)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
