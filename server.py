@@ -29,6 +29,17 @@ from botocore.exceptions import ClientError as BotoClientError
 from twilio.rest import Client as TwilioClient
 from twilio.base.exceptions import TwilioRestException
 
+# Import extended campaign models and helpers
+from campaign_models import CampaignCreateExtended, CampaignDraftCreate, CampaignUpdate
+from campaign_helpers import (
+    validate_campaign_for_submission,
+    normalize_campaign_response,
+    prepare_campaign_for_storage,
+    can_edit_campaign,
+    get_campaign_completion_percentage,
+    map_legacy_to_new_fields
+)
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -194,6 +205,7 @@ class BusinessProfileUpdate(BaseModel):
     product_type: str
     industry_category: str
 
+# Legacy CampaignCreate kept for backward compatibility
 class CampaignCreate(BaseModel):
     title: str
     objectives: List[str]
@@ -1913,9 +1925,10 @@ async def get_profile(user_id: str, current_user: dict = Depends(get_current_use
     
     return user
 
-# Campaign Routes
-@api_router.post("/campaigns")
-async def create_campaign(data: CampaignCreate, current_user: dict = Depends(get_current_user)):
+# Campaign Routes - Extended for 5-step flow
+@api_router.post("/campaigns/draft")
+async def create_draft(data: CampaignDraftCreate, current_user: dict = Depends(get_current_user)):
+    """Create a draft campaign with partial data"""
     if current_user['role'] != UserRole.BUSINESS:
         raise HTTPException(status_code=403, detail="Only businesses can create campaigns")
     
@@ -1923,26 +1936,174 @@ async def create_campaign(data: CampaignCreate, current_user: dict = Depends(get
         raise HTTPException(status_code=403, detail="Your profile must be approved first")
     
     campaign_id = str(uuid.uuid4())
-    campaign_doc = {
+    campaign_data = data.dict(exclude_unset=True)
+    
+    # Prepare campaign for storage with draft status
+    campaign_doc = prepare_campaign_for_storage(campaign_data, status='draft')
+    
+    # Add metadata
+    campaign_doc.update({
         "id": campaign_id,
         "business_id": current_user['id'],
-        "business_nickname": current_user['nickname'],
-        **data.dict(),
-        "status": CampaignStatus.PENDING_APPROVAL,
+        "business_nickname": current_user.get('nickname', ''),
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "bids": [],
-        "selected_creator": None
-    }
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
     
     await db.campaigns.insert_one(campaign_doc)
-    return {"campaign_id": campaign_id, "message": "Campaign submitted for approval"}
+    
+    # Calculate completion percentage
+    completion = get_campaign_completion_percentage(campaign_doc)
+    
+    return {
+        "campaign_id": campaign_id,
+        "status": "draft",
+        "completion_percentage": completion,
+        "message": "Draft campaign created successfully"
+    }
+
+@api_router.patch("/campaigns/{campaign_id}")
+async def update_campaign_route(campaign_id: str, data: CampaignUpdate, current_user: dict = Depends(get_current_user)):
+    """Update an existing draft campaign"""
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    
+    # Check ownership
+    if campaign.get('business_id') != current_user['id']:
+        raise HTTPException(status_code=403, detail="You can only edit your own campaigns")
+    
+    # Check if campaign can be edited
+    if not can_edit_campaign(campaign):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot edit campaign with status: {campaign.get('status')}"
+        )
+    
+    # Prepare update data
+    update_data = data.dict(exclude_unset=True)
+    if update_data:
+        # Apply backward compatibility mapping
+        update_data = map_legacy_to_new_fields(update_data)
+        update_data['updated_at'] = datetime.now(timezone.utc).isoformat()
+        
+        await db.campaigns.update_one(
+            {"id": campaign_id},
+            {"$set": update_data}
+        )
+    
+    # Get updated campaign
+    updated_campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    completion = get_campaign_completion_percentage(updated_campaign)
+    
+    return {
+        "campaign_id": campaign_id,
+        "status": updated_campaign.get('status'),
+        "completion_percentage": completion,
+        "message": "Campaign updated successfully"
+    }
+
+@api_router.post("/campaigns/{campaign_id}/submit")
+async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(get_current_user)):
+    """Submit a draft campaign for approval"""
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    
+    # Check ownership
+    if campaign.get('business_id') != current_user['id']:
+        raise HTTPException(status_code=403, detail="You can only submit your own campaigns")
+    
+    # Check if campaign is in draft or rejected status
+    if campaign.get('status') not in ['draft', 'rejected']:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot submit campaign with status: {campaign.get('status')}"
+        )
+    
+    # Validate all required fields
+    validate_campaign_for_submission(campaign)
+    
+    # Update status to pending_approval
+    await db.campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {
+            "status": CampaignStatus.PENDING_APPROVAL,
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+    
+    return {
+        "campaign_id": campaign_id,
+        "status": "pending_approval",
+        "message": "Campaign submitted for approval"
+    }
+
+@api_router.post("/campaigns")
+async def create_campaign(data: CampaignCreateExtended, current_user: dict = Depends(get_current_user)):
+    """Create campaign - supports both legacy and extended fields"""
+    if current_user['role'] != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only businesses can create campaigns")
+    
+    if current_user.get('approval_status') != ApprovalStatus.APPROVED:
+        raise HTTPException(status_code=403, detail="Your profile must be approved first")
+    
+    campaign_id = str(uuid.uuid4())
+    campaign_data = data.dict(exclude_unset=True)
+    
+    # Determine status: if explicitly set to draft, use draft; otherwise pending_approval
+    status = campaign_data.pop('status', None)
+    if status == 'draft':
+        final_status = CampaignStatus.DRAFT
+    else:
+        final_status = CampaignStatus.PENDING_APPROVAL
+        # Validate if submitting directly
+        try:
+            validate_campaign_for_submission(campaign_data)
+        except HTTPException:
+            # If validation fails and no explicit draft status, still allow as draft
+            if status is None:
+                final_status = CampaignStatus.DRAFT
+            else:
+                raise
+    
+    # Prepare campaign for storage
+    campaign_doc = prepare_campaign_for_storage(campaign_data, status=final_status)
+    
+    # Add metadata
+    campaign_doc.update({
+        "id": campaign_id,
+        "business_id": current_user['id'],
+        "business_nickname": current_user.get('nickname', ''),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    
+    if final_status == CampaignStatus.PENDING_APPROVAL:
+        campaign_doc['submitted_at'] = datetime.now(timezone.utc).isoformat()
+    
+    await db.campaigns.insert_one(campaign_doc)
+    
+    message = "Campaign submitted for approval" if final_status == CampaignStatus.PENDING_APPROVAL else "Draft campaign created"
+    
+    return {
+        "campaign_id": campaign_id,
+        "status": final_status,
+        "message": message
+    }
 
 @api_router.get("/campaigns")
-async def get_campaigns(status: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+async def get_campaigns(
+    status: Optional[str] = None,
+    include_drafts: bool = False,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get campaigns with extended fields support"""
     query = {}
     
     if current_user['role'] == UserRole.CREATOR:
-        # Creators should see both active campaigns (for browsing) and in_progress campaigns where they are selected
+        # Creators should see active campaigns and their own in_progress campaigns
         query = {
             "$or": [
                 {"status": CampaignStatus.ACTIVE},
@@ -1951,17 +2112,42 @@ async def get_campaigns(status: Optional[str] = None, current_user: dict = Depen
         }
     elif current_user['role'] == UserRole.BUSINESS:
         query['business_id'] = current_user['id']
+        # Optionally filter by status
+        if status:
+            query['status'] = status
+        elif not include_drafts:
+            # By default, exclude drafts unless explicitly requested
+            query['status'] = {"$ne": CampaignStatus.DRAFT}
     elif status:
         query['status'] = status
     
     campaigns = await db.campaigns.find(query, {"_id": 0}).to_list(1000)
-    return campaigns
+    
+    # Normalize all campaigns
+    normalized_campaigns = []
+    for campaign in campaigns:
+        normalized = normalize_campaign_response(campaign)
+        # Add completion percentage for drafts
+        if normalized.get('status') == CampaignStatus.DRAFT:
+            normalized['completion_percentage'] = get_campaign_completion_percentage(normalized)
+        normalized_campaigns.append(normalized)
+    
+    return normalized_campaigns
 
 @api_router.get("/campaigns/{campaign_id}")
 async def get_campaign(campaign_id: str, current_user: dict = Depends(get_current_user)):
+    """Get campaign with extended fields support"""
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
+    
+    # Normalize response to include both old and new fields
+    campaign = normalize_campaign_response(campaign)
+    
+    # Add completion percentage if draft
+    if campaign.get('status') == CampaignStatus.DRAFT:
+        campaign['completion_percentage'] = get_campaign_completion_percentage(campaign)
+    
     return campaign
 
 @api_router.post("/campaigns/{campaign_id}/bid")
@@ -3487,6 +3673,50 @@ async def upload_file(file: UploadFile = File(...), current_user: dict = Depends
         }
         await db.uploaded_files.insert_one(metadata)
         return {key: value for key, value in metadata.items() if key != "_id"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
+
+@api_router.post("/uploads")
+async def upload_campaign_file(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    """Upload product/reference media for campaigns. Returns public file URL."""
+    allowed_types = {
+        'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
+        'video/mp4', 'video/quicktime', 'video/webm',
+        'application/pdf'
+    }
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail=f"File type {file.content_type} not allowed")
+
+    content = await file.read()
+    if len(content) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File size exceeds 50MB limit")
+
+    upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads")))
+    campaigns_upload_dir = upload_dir / "campaigns"
+    campaigns_upload_dir.mkdir(parents=True, exist_ok=True)
+
+    file_ext = Path(file.filename).suffix
+    unique_filename = f"{uuid.uuid4()}{file_ext}"
+    file_path = campaigns_upload_dir / unique_filename
+
+    try:
+        with open(file_path, 'wb') as f:
+            f.write(content)
+        file_url = f"/uploads/campaigns/{unique_filename}"
+        file_doc = {
+            "id": str(uuid.uuid4()),
+            "file_url": file_url,
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "size": len(content),
+            "kind": "image" if file.content_type.startswith("image/") else "video" if file.content_type.startswith("video/") else "pdf",
+            "uploaded_by": current_user['id'],
+            "created_at": now_iso()
+        }
+        await db.uploaded_files.insert_one(file_doc)
+        return {"file_url": file_url, "filename": file.filename, "content_type": file.content_type, "size": len(content)}
     except HTTPException:
         raise
     except Exception as e:
