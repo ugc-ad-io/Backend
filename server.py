@@ -359,6 +359,51 @@ class BroadcastNotification(BaseModel):
     target_user_ids: Optional[List[str]] = None  # Specific user IDs
     link: Optional[str] = None
 
+class BusinessSettingsProfileUpdate(BaseModel):
+    brand_name: str
+    contact_person: str
+    work_email: EmailStr
+    phone_number: Optional[str] = ""
+    website_url: Optional[str] = ""
+    logo_url: Optional[str] = ""
+
+class BusinessSettingsCompanyUpdate(BaseModel):
+    business_type: str
+    gst_number: Optional[str] = ""
+    business_category: str
+    country: str
+    billing_address: str
+    city: str
+    state: str
+    kyb_status: Optional[str] = None
+
+class BusinessTeamInvite(BaseModel):
+    email: EmailStr
+    role: str
+    name: Optional[str] = None
+
+class BusinessTeamMemberUpdate(BaseModel):
+    name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    role: Optional[str] = None
+    status: Optional[str] = None
+
+class BusinessNotificationPreferences(BaseModel):
+    new_creator_applications: bool
+    deal_status_updates: bool
+    payment_escrow_alerts: bool
+    direct_messages: bool
+    weekly_workspace_reports: bool
+
+class BusinessBillingUpgrade(BaseModel):
+    plan_name: str
+
+class BusinessPaymentMethodCreate(BaseModel):
+    type: str
+    label: str
+    last4: Optional[str] = None
+    is_default: bool = False
+
 class DealReceiptSubmit(BaseModel):
     received_at: Optional[str] = None
     unboxing_video_url: str
@@ -461,6 +506,11 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+async def get_current_business_user(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only business users can access these settings")
+    return current_user
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -887,6 +937,59 @@ def to_float(value: Any) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+def require_non_empty(data: Dict[str, Any], fields: List[str]):
+    missing = [field for field in fields if data.get(field) in [None, ""]]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required fields: {', '.join(missing)}")
+
+def validate_choice(value: Optional[str], allowed: List[str], field_name: str):
+    if value is not None and value not in allowed:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be one of: {', '.join(allowed)}")
+
+def business_profile_defaults(user: dict, settings: Optional[dict] = None) -> dict:
+    settings = settings or {}
+    profile = user.get("profile") or {}
+    return {
+        "brand_name": settings.get("brand_name") or profile.get("business_name") or user.get("business_name") or user.get("nickname") or "",
+        "contact_person": settings.get("contact_person") or user.get("contact_person") or user.get("nickname") or "",
+        "work_email": settings.get("work_email") or user.get("email") or "",
+        "phone_number": settings.get("phone_number") or user.get("phone_number") or "",
+        "website_url": settings.get("website_url") or profile.get("website") or user.get("website") or user.get("business_website") or "",
+        "logo_url": settings.get("logo_url") or profile.get("logo") or user.get("logo_url") or ""
+    }
+
+def business_company_defaults(user: dict, settings: Optional[dict] = None) -> dict:
+    settings = settings or {}
+    profile = user.get("profile") or {}
+    approval_status = user.get("approval_status")
+    kyb_status = "pending"
+    if approval_status == ApprovalStatus.APPROVED:
+        kyb_status = "verified"
+    elif approval_status == ApprovalStatus.REJECTED:
+        kyb_status = "rejected"
+    return {
+        "business_type": settings.get("business_type") or profile.get("product_type") or "",
+        "gst_number": settings.get("gst_number") or user.get("gst_number") or "",
+        "business_category": settings.get("business_category") or profile.get("industry_category") or "",
+        "country": settings.get("country") or "India",
+        "billing_address": settings.get("billing_address") or "",
+        "city": settings.get("city") or "",
+        "state": settings.get("state") or "",
+        "kyb_status": settings.get("kyb_status") or kyb_status
+    }
+
+def business_notification_defaults(settings: Optional[dict] = None) -> dict:
+    defaults = {
+        "new_creator_applications": True,
+        "deal_status_updates": True,
+        "payment_escrow_alerts": True,
+        "direct_messages": True,
+        "weekly_workspace_reports": True
+    }
+    if settings:
+        defaults.update({key: settings[key] for key in defaults.keys() if key in settings})
+    return defaults
 
 def month_start(dt: datetime) -> datetime:
     return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
@@ -1691,6 +1794,336 @@ async def get_business_dashboard(current_user: dict = Depends(get_current_user))
             "total": total_budget,
             "categories": budget_categories
         }
+    }
+
+# Business Settings Routes
+@api_router.get("/business/settings/profile")
+async def get_business_settings_profile(current_user: dict = Depends(get_current_business_user)):
+    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    return business_profile_defaults(current_user, (settings or {}).get("profile"))
+
+@api_router.put("/business/settings/profile")
+async def update_business_settings_profile(
+    data: BusinessSettingsProfileUpdate,
+    current_user: dict = Depends(get_current_business_user)
+):
+    profile_data = data.dict()
+    require_non_empty(profile_data, ["brand_name", "contact_person", "work_email"])
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.business_settings.update_one(
+        {"business_id": current_user["id"]},
+        {
+            "$set": {"business_id": current_user["id"], "profile": profile_data, "updated_at": now},
+            "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
+        },
+        upsert=True
+    )
+    await db.users.update_one(
+        {"id": current_user["id"]},
+        {"$set": {
+            "profile.business_name": profile_data["brand_name"],
+            "profile.logo": profile_data.get("logo_url", ""),
+            "profile.website": profile_data.get("website_url", ""),
+            "contact_person": profile_data["contact_person"],
+            "phone_number": profile_data.get("phone_number", ""),
+            "updated_at": now
+        }}
+    )
+    await db.campaigns.update_many(
+        {"business_id": current_user["id"]},
+        {"$set": {
+            "brand_name": profile_data["brand_name"],
+            "brand_logo_url": profile_data.get("logo_url", ""),
+            "updated_at": now
+        }}
+    )
+    return profile_data
+
+@api_router.post("/business/settings/logo")
+async def upload_business_settings_logo(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_business_user)
+):
+    allowed_types = ["image/jpeg", "image/png", "image/jpg", "image/webp"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Only image files are allowed for logos")
+
+    upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))) / "business_logos"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    file_ext = Path(file.filename or "").suffix or ".png"
+    unique_filename = f"logo_{current_user['id']}_{uuid.uuid4().hex}{file_ext}"
+    file_path = upload_dir / unique_filename
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    logo_url = f"/uploads/business_logos/{unique_filename}"
+    now = datetime.now(timezone.utc).isoformat()
+    existing = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    profile_data = business_profile_defaults(current_user, (existing or {}).get("profile"))
+    profile_data["logo_url"] = logo_url
+    await db.business_settings.update_one(
+        {"business_id": current_user["id"]},
+        {
+            "$set": {"business_id": current_user["id"], "profile": profile_data, "updated_at": now},
+            "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
+        },
+        upsert=True
+    )
+    await db.users.update_one({"id": current_user["id"]}, {"$set": {"profile.logo": logo_url, "updated_at": now}})
+    await db.campaigns.update_many({"business_id": current_user["id"]}, {"$set": {"brand_logo_url": logo_url, "updated_at": now}})
+    return {"logo_url": logo_url}
+
+@api_router.delete("/business/settings/logo")
+async def delete_business_settings_logo(current_user: dict = Depends(get_current_business_user)):
+    now = datetime.now(timezone.utc).isoformat()
+    existing = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    profile_data = business_profile_defaults(current_user, (existing or {}).get("profile"))
+    profile_data["logo_url"] = ""
+    await db.business_settings.update_one(
+        {"business_id": current_user["id"]},
+        {
+            "$set": {"business_id": current_user["id"], "profile": profile_data, "updated_at": now},
+            "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
+        },
+        upsert=True
+    )
+    await db.users.update_one({"id": current_user["id"]}, {"$set": {"profile.logo": "", "updated_at": now}})
+    await db.campaigns.update_many({"business_id": current_user["id"]}, {"$set": {"brand_logo_url": "", "updated_at": now}})
+    return {"logo_url": ""}
+
+@api_router.get("/business/settings/company")
+async def get_business_settings_company(current_user: dict = Depends(get_current_business_user)):
+    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    return business_company_defaults(current_user, (settings or {}).get("company"))
+
+@api_router.put("/business/settings/company")
+async def update_business_settings_company(
+    data: BusinessSettingsCompanyUpdate,
+    current_user: dict = Depends(get_current_business_user)
+):
+    company_data = data.dict()
+    require_non_empty(company_data, ["business_type", "business_category", "country", "billing_address", "city", "state"])
+    validate_choice(company_data.get("kyb_status"), ["pending", "verified", "rejected"], "kyb_status")
+    if not company_data.get("kyb_status"):
+        company_data["kyb_status"] = business_company_defaults(current_user).get("kyb_status", "pending")
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.business_settings.update_one(
+        {"business_id": current_user["id"]},
+        {
+            "$set": {"business_id": current_user["id"], "company": company_data, "updated_at": now},
+            "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
+        },
+        upsert=True
+    )
+    await db.users.update_one(
+        {"id": current_user["id"]},
+        {"$set": {
+            "profile.product_type": company_data["business_type"],
+            "profile.industry_category": company_data["business_category"],
+            "gst_number": company_data.get("gst_number", ""),
+            "updated_at": now
+        }}
+    )
+    return company_data
+
+@api_router.get("/business/settings/team")
+async def get_business_settings_team(current_user: dict = Depends(get_current_business_user)):
+    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    team_settings = (settings or {}).get("team") or {}
+    members = [{
+        "id": current_user["id"],
+        "name": current_user.get("nickname") or current_user.get("email", ""),
+        "email": current_user.get("email", ""),
+        "avatar_url": current_user.get("profile_photo") or current_user.get("avatar_url") or "",
+        "role": "admin",
+        "status": "active"
+    }]
+    invited_members = await db.business_team_members.find({"business_id": current_user["id"]}, {"_id": 0}).sort("created_at", 1).to_list(1000)
+    for member in invited_members:
+        members.append({
+            "id": member.get("id"),
+            "name": member.get("name") or member.get("email", ""),
+            "email": member.get("email", ""),
+            "avatar_url": member.get("avatar_url", ""),
+            "role": member.get("role", "viewer"),
+            "status": member.get("status", "invited")
+        })
+    return {
+        "members": members,
+        "seat_limit": team_settings.get("seat_limit", 5),
+        "seats_used": len([member for member in members if member.get("status") in ["active", "invited"]])
+    }
+
+@api_router.post("/business/settings/team/invite")
+async def invite_business_settings_team_member(
+    data: BusinessTeamInvite,
+    current_user: dict = Depends(get_current_business_user)
+):
+    validate_choice(data.role, ["admin", "editor", "viewer"], "role")
+    existing = await db.business_team_members.find_one({"business_id": current_user["id"], "email": data.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Team member already exists")
+
+    now = datetime.now(timezone.utc).isoformat()
+    member_doc = {
+        "id": str(uuid.uuid4()),
+        "business_id": current_user["id"],
+        "name": data.name or str(data.email).split("@")[0],
+        "email": data.email,
+        "avatar_url": "",
+        "role": data.role,
+        "status": "invited",
+        "created_at": now,
+        "updated_at": now
+    }
+    await db.business_team_members.insert_one(member_doc)
+    return {key: member_doc[key] for key in ["id", "name", "email", "avatar_url", "role", "status"]}
+
+@api_router.patch("/business/settings/team/{member_id}")
+async def update_business_settings_team_member(
+    member_id: str,
+    data: BusinessTeamMemberUpdate,
+    current_user: dict = Depends(get_current_business_user)
+):
+    update_data = {key: value for key, value in data.dict().items() if value is not None}
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields provided")
+    validate_choice(update_data.get("role"), ["admin", "editor", "viewer"], "role")
+    validate_choice(update_data.get("status"), ["active", "invited", "disabled"], "status")
+    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    result = await db.business_team_members.update_one(
+        {"id": member_id, "business_id": current_user["id"]},
+        {"$set": update_data}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    member = await db.business_team_members.find_one({"id": member_id, "business_id": current_user["id"]}, {"_id": 0})
+    return {
+        "id": member.get("id"),
+        "name": member.get("name") or member.get("email", ""),
+        "email": member.get("email", ""),
+        "avatar_url": member.get("avatar_url", ""),
+        "role": member.get("role", "viewer"),
+        "status": member.get("status", "invited")
+    }
+
+@api_router.delete("/business/settings/team/{member_id}")
+async def delete_business_settings_team_member(member_id: str, current_user: dict = Depends(get_current_business_user)):
+    result = await db.business_team_members.delete_one({"id": member_id, "business_id": current_user["id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Team member not found")
+    return {"message": "Team member removed"}
+
+@api_router.get("/business/settings/billing")
+async def get_business_settings_billing(current_user: dict = Depends(get_current_business_user)):
+    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    billing = (settings or {}).get("billing") or {}
+    transactions = await db.payment_transactions.find({"user_id": current_user["id"]}, {"_id": 0}).sort("created_at", -1).limit(20).to_list(20)
+    campaigns = await db.campaigns.find({"business_id": current_user["id"]}, {"_id": 0}).to_list(10000)
+    current_month_start = month_start(datetime.now(timezone.utc))
+    next_month_start = add_months(current_month_start, 1)
+    monthly_budget_used = sum(
+        campaign_budget_total(campaign)
+        for campaign in campaigns
+        if is_between_iso(campaign.get("created_at"), current_month_start, next_month_start)
+    )
+    return {
+        "plan_name": billing.get("plan_name", "Pro"),
+        "commission_rate": billing.get("commission_rate", 10),
+        "next_billing_date": billing.get("next_billing_date"),
+        "monthly_budget_used": monthly_budget_used,
+        "monthly_budget_limit": billing.get("monthly_budget_limit", 0),
+        "billing_history": billing.get("billing_history", transactions),
+        "payment_methods": billing.get("payment_methods", [])
+    }
+
+@api_router.post("/business/settings/billing/upgrade")
+async def upgrade_business_settings_billing(data: BusinessBillingUpgrade, current_user: dict = Depends(get_current_business_user)):
+    require_non_empty(data.dict(), ["plan_name"])
+    now = datetime.now(timezone.utc).isoformat()
+    await db.business_settings.update_one(
+        {"business_id": current_user["id"]},
+        {
+            "$set": {"business_id": current_user["id"], "billing.plan_name": data.plan_name, "updated_at": now},
+            "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
+        },
+        upsert=True
+    )
+    return {"plan_name": data.plan_name}
+
+@api_router.post("/business/settings/payment-methods")
+async def create_business_settings_payment_method(data: BusinessPaymentMethodCreate, current_user: dict = Depends(get_current_business_user)):
+    payload = data.dict()
+    require_non_empty(payload, ["type", "label"])
+    now = datetime.now(timezone.utc).isoformat()
+    method = {"id": str(uuid.uuid4()), **payload, "created_at": now}
+    await db.business_settings.update_one(
+        {"business_id": current_user["id"]},
+        {
+            "$set": {"business_id": current_user["id"], "updated_at": now},
+            "$push": {"billing.payment_methods": method},
+            "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
+        },
+        upsert=True
+    )
+    return method
+
+@api_router.get("/business/settings/notifications")
+async def get_business_settings_notifications(current_user: dict = Depends(get_current_business_user)):
+    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    return business_notification_defaults((settings or {}).get("notifications"))
+
+@api_router.put("/business/settings/notifications")
+async def update_business_settings_notifications(
+    data: BusinessNotificationPreferences,
+    current_user: dict = Depends(get_current_business_user)
+):
+    notification_data = data.dict()
+    now = datetime.now(timezone.utc).isoformat()
+    await db.business_settings.update_one(
+        {"business_id": current_user["id"]},
+        {
+            "$set": {"business_id": current_user["id"], "notifications": notification_data, "updated_at": now},
+            "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
+        },
+        upsert=True
+    )
+    return notification_data
+
+@api_router.get("/business/settings/security")
+async def get_business_settings_security(current_user: dict = Depends(get_current_business_user)):
+    return {
+        "two_factor_enabled": current_user.get("two_factor_enabled", False),
+        "password_last_changed_at": current_user.get("updated_at")
+    }
+
+@api_router.get("/business/settings/sessions")
+async def get_business_settings_sessions(current_user: dict = Depends(get_current_business_user)):
+    sessions = await db.user_sessions.find({"user_id": current_user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return {"sessions": sessions}
+
+@api_router.delete("/business/settings/sessions/{session_id}")
+async def delete_business_settings_session(session_id: str, current_user: dict = Depends(get_current_business_user)):
+    result = await db.user_sessions.delete_one({"id": session_id, "user_id": current_user["id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"message": "Session removed"}
+
+@api_router.get("/business/settings/summary")
+async def get_business_settings_summary(current_user: dict = Depends(get_current_business_user)):
+    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    billing = (settings or {}).get("billing") or {}
+    team_count = 1 + await db.business_team_members.count_documents({
+        "business_id": current_user["id"],
+        "status": {"$in": ["active", "invited"]}
+    })
+    return {
+        "active_plan": billing.get("plan_name", "Pro"),
+        "wallet_balance": current_user.get("balance", 0),
+        "team_count": team_count
     }
 
 # Profile Routes
