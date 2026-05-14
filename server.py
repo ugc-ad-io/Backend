@@ -2581,21 +2581,22 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
     campaign_id = str(uuid.uuid4())
     campaign_data = data.dict(exclude_unset=True)
     
-    # Determine status: if explicitly set to draft, use draft; otherwise pending_approval
+    # Determine status: explicit drafts allow partial data. Publish requests must pass
+    # validation and should never be silently converted to drafts.
     status = campaign_data.pop('status', None)
     if status == 'draft':
-        final_status = CampaignStatus.DRAFT
+        final_status = CampaignStatus.DRAFT.value
+    elif status == 'pending_approval':
+        validate_campaign_for_submission(campaign_data)
+        final_status = CampaignStatus.PENDING_APPROVAL.value
     else:
-        final_status = CampaignStatus.PENDING_APPROVAL
-        # Validate if submitting directly
+        final_status = CampaignStatus.PENDING_APPROVAL.value
         try:
             validate_campaign_for_submission(campaign_data)
         except HTTPException:
-            # If validation fails and no explicit draft status, still allow as draft
-            if status is None:
-                final_status = CampaignStatus.DRAFT
-            else:
+            if status is not None:
                 raise
+            final_status = CampaignStatus.DRAFT.value
     
     # Prepare campaign for storage
     campaign_doc = prepare_campaign_for_storage(campaign_data, status=final_status)
@@ -2620,12 +2621,12 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
 
-    if final_status == CampaignStatus.PENDING_APPROVAL:
+    if final_status == CampaignStatus.PENDING_APPROVAL.value:
         campaign_doc['submitted_at'] = datetime.now(timezone.utc).isoformat()
     
     await db.campaigns.insert_one(campaign_doc)
     
-    message = "Campaign submitted for approval" if final_status == CampaignStatus.PENDING_APPROVAL else "Draft campaign created"
+    message = "Campaign submitted for approval" if final_status == CampaignStatus.PENDING_APPROVAL.value else "Draft campaign created"
     
     return {
         "campaign_id": campaign_id,
@@ -3877,6 +3878,16 @@ async def get_pending_campaigns(current_user: dict = Depends(get_current_user)):
 async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
+
+    campaign = await db.campaigns.find_one({"id": data.item_id}, {"_id": 0, "status": 1})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    if campaign.get("status") != CampaignStatus.PENDING_APPROVAL:
+        raise HTTPException(
+            status_code=400,
+            detail="Only pending approval campaigns can be approved or rejected"
+        )
     
     status = CampaignStatus.ACTIVE if data.action == "approve" else CampaignStatus.REJECTED
     

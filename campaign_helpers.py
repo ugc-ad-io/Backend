@@ -15,47 +15,55 @@ def is_valid_url(url: str) -> bool:
         return False
 
 
+def _has_value(value: Any) -> bool:
+    """Treat blank strings and empty collections as missing."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict, tuple, set)):
+        return bool(value)
+    return True
+
+
 def validate_campaign_for_submission(campaign_data: Dict[str, Any]) -> None:
     """
     Validate that a campaign has all required fields for submission.
     Raises HTTPException if validation fails.
     """
-    errors = []
-    
-    # Product Info validation
-    if not campaign_data.get('product_name'):
-        errors.append("Product name is required")
-    if not campaign_data.get('product_category'):
-        errors.append("Product category is required")
-    if not campaign_data.get('product_description'):
-        errors.append("Product description is required")
-    
-    # Content Requirements validation
-    if not campaign_data.get('campaign_hook'):
-        errors.append("Campaign hook is required")
-    if not campaign_data.get('key_message'):
-        errors.append("Key message is required")
-    
-    # Deliverables validation
-    if not campaign_data.get('video_format'):
-        errors.append("Video format is required")
-    if not campaign_data.get('aspect_ratio'):
-        errors.append("Aspect ratio is required")
-    if not campaign_data.get('duration_seconds'):
-        errors.append("Video duration is required")
-    
-    # Creator Requirements validation
-    if not campaign_data.get('creator_level'):
-        errors.append("Creator level is required")
-    
-    # Budget validation
-    if not campaign_data.get('per_video_budget'):
-        errors.append("Per video budget is required")
-    
-    if errors:
+    required_fields = {
+        'title': 'Title is required',
+        'product_name': 'Product name is required',
+        'product_category': 'Product category is required',
+        'product_description': 'Product description is required',
+        'campaign_hook': 'Campaign hook is required',
+        'key_message': 'Key message is required',
+        'video_format': 'Video format is required',
+        'aspect_ratio': 'Aspect ratio is required',
+        'duration_seconds': 'Video duration is required',
+        'creator_level': 'Creator level is required',
+        'brief_text': 'Brief text is required',
+    }
+
+    field_errors = {
+        field: message
+        for field, message in required_fields.items()
+        if not _has_value(campaign_data.get(field))
+    }
+
+    if not (
+        _has_value(campaign_data.get('per_video_budget'))
+        or _has_value(campaign_data.get('budget_max'))
+    ):
+        field_errors['per_video_budget'] = 'Per video budget or budget max is required'
+
+    if field_errors:
         raise HTTPException(
             status_code=400,
-            detail=f"Campaign validation failed: {'; '.join(errors)}"
+            detail={
+                "message": "Campaign validation failed",
+                "fields": field_errors,
+            }
         )
 
 
