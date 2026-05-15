@@ -447,6 +447,15 @@ class ChatActionCardRespond(BaseModel):
     action: str
     note: Optional[str] = None
 
+class CreatorDirectoryInviteCreate(BaseModel):
+    campaign_id: Optional[str] = None
+    campaign_name: str
+    deliverable_summary: str
+    budget: str
+    timeline: str
+    usage_rights: str
+    message: Optional[str] = ""
+
 class DealIssueSubmit(BaseModel):
     message: Optional[str] = None
     attachment_urls: List[str] = []
@@ -510,6 +519,13 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 async def get_current_business_user(current_user: dict = Depends(get_current_user)):
     if current_user.get("role") != UserRole.BUSINESS:
         raise HTTPException(status_code=403, detail="Only business users can access these settings")
+    return current_user
+
+async def get_approved_business_user(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only business users can access this resource")
+    if current_user.get("approval_status") != ApprovalStatus.APPROVED:
+        raise HTTPException(status_code=403, detail="Business profile must be approved")
     return current_user
 
 def now_iso() -> str:
@@ -1513,6 +1529,8 @@ async def signup(data: SignupRequest):
         "role": data.role,
         "nickname": nickname,
         "profile_completed": False,
+        "curated_brand_visible": False,
+        "creator_directory_visible": False,
         "approval_status": ApprovalStatus.PENDING if data.role in [UserRole.CREATOR, UserRole.BUSINESS] else ApprovalStatus.APPROVED,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "balance": 0.0
@@ -1567,6 +1585,272 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
 @api_router.get("/auth/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
     return {k: v for k, v in current_user.items() if k != 'password'}
+
+def normalize_handle(value: Optional[str]) -> str:
+    handle = (value or "").strip()
+    if not handle:
+        return ""
+    return handle if handle.startswith("@") else f"@{handle}"
+
+def compact_list(*values: Any) -> List[str]:
+    items = []
+    for value in values:
+        if isinstance(value, list):
+            items.extend(value)
+        elif isinstance(value, str) and value:
+            items.extend([part.strip() for part in value.split(",")])
+    return [item for item in items if item]
+
+def first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value not in [None, "", []]:
+            return value
+    return None
+
+def matches_text_filter(needle: Optional[str], *haystacks: Any) -> bool:
+    if not needle:
+        return True
+    lowered = needle.lower().strip()
+    for haystack in haystacks:
+        values = haystack if isinstance(haystack, list) else [haystack]
+        for value in values:
+            if not isinstance(value, str) or not value:
+                continue
+            normalized = value.lower().strip()
+            if lowered == normalized or lowered in normalized:
+                return True
+            for part in [item.strip().lower() for item in value.split(",") if item.strip()]:
+                if lowered == part or lowered in part:
+                    return True
+    return False
+
+def creator_is_directory_visible(creator: dict) -> bool:
+    return (
+        creator.get("role") == UserRole.CREATOR and
+        creator.get("approval_status") == ApprovalStatus.APPROVED and
+        creator.get("profile_completed") is True and
+        (creator.get("curated_brand_visible") is True or creator.get("creator_directory_visible") is True)
+    )
+
+async def get_visible_directory_creator(creator_id: str) -> Optional[dict]:
+    return await db.users.find_one({
+        "id": creator_id,
+        "role": UserRole.CREATOR,
+        "approval_status": ApprovalStatus.APPROVED,
+        "profile_completed": True,
+        "$or": [
+            {"curated_brand_visible": True},
+            {"creator_directory_visible": True},
+        ],
+    }, {"_id": 0})
+
+async def creator_deliverables_completed(creator: dict) -> int:
+    stored = creator.get("deliverables_completed")
+    if stored is not None:
+        try:
+            return int(stored)
+        except (TypeError, ValueError):
+            pass
+    return await db.campaigns.count_documents({
+        "selected_creator": creator.get("id"),
+        "status": CampaignStatus.COMPLETED,
+    })
+
+def creator_directory_public_view(creator: dict, deliverables_completed: int) -> dict:
+    profile = creator.get("profile") or {}
+    portfolio = first_non_empty(creator.get("portfolio"), profile.get("portfolio")) or []
+    portfolio_preview = portfolio[0] if isinstance(portfolio, list) and portfolio else portfolio
+    primary_category = first_non_empty(
+        creator.get("primary_category"),
+        creator.get("category"),
+        profile.get("primary_category"),
+        profile.get("category"),
+        (creator.get("tags") or [None])[0] if isinstance(creator.get("tags"), list) else None,
+        (profile.get("tags") or [None])[0] if isinstance(profile.get("tags"), list) else None,
+    )
+    return {
+        "id": creator.get("id"),
+        "handle": normalize_handle(creator.get("nickname")),
+        "profile_photo": first_non_empty(creator.get("profile_photo"), creator.get("profile_picture"), profile.get("profile_photo"), profile.get("profile_picture")),
+        "primary_category": primary_category or "",
+        "languages": compact_list(creator.get("languages"), profile.get("languages"), creator.get("content_languages"), profile.get("content_languages")),
+        "city_tier": first_non_empty(creator.get("city_tier"), creator.get("location_region"), profile.get("city_tier"), profile.get("location_region")) or "",
+        "deliverables_completed": deliverables_completed,
+        "portfolio_preview": portfolio_preview or "",
+        "content_style": first_non_empty(creator.get("content_style"), profile.get("content_style")) or "",
+        "budget_range": first_non_empty(creator.get("budget_range"), profile.get("budget_range")) or "",
+    }
+
+def creator_matches_directory_filters(creator: dict, category: Optional[str], language: Optional[str], region: Optional[str], style: Optional[str], budget: Optional[str]) -> bool:
+    profile = creator.get("profile") or {}
+    return (
+        matches_text_filter(category, creator.get("primary_category"), creator.get("category"), creator.get("tags"), profile.get("primary_category"), profile.get("category"), profile.get("tags")) and
+        matches_text_filter(language, creator.get("languages"), profile.get("languages"), creator.get("content_languages"), profile.get("content_languages")) and
+        matches_text_filter(region, creator.get("city_tier"), creator.get("location_region"), profile.get("city_tier"), profile.get("location_region")) and
+        matches_text_filter(style, creator.get("content_style"), profile.get("content_style")) and
+        matches_text_filter(budget, creator.get("budget_range"), profile.get("budget_range"))
+    )
+
+def brand_match_terms(brand: dict) -> List[str]:
+    profile = brand.get("profile") or {}
+    return compact_list(
+        brand.get("industry_category"),
+        brand.get("business_category"),
+        brand.get("product_type"),
+        profile.get("industry_category"),
+        profile.get("business_category"),
+        profile.get("product_type"),
+    )
+
+def creator_best_match_score(creator: dict, brand: dict) -> int:
+    terms = [term.lower() for term in brand_match_terms(brand)]
+    if not terms:
+        return 0
+    profile = creator.get("profile") or {}
+    creator_terms = [term.lower() for term in compact_list(
+        creator.get("primary_category"),
+        creator.get("category"),
+        creator.get("tags"),
+        profile.get("primary_category"),
+        profile.get("category"),
+        profile.get("tags"),
+    )]
+    return 1 if any(term in creator_terms for term in terms) else 0
+
+@api_router.get("/business/creator-directory")
+async def get_creator_directory(
+    category: Optional[str] = None,
+    language: Optional[str] = None,
+    region: Optional[str] = None,
+    style: Optional[str] = None,
+    budget: Optional[str] = None,
+    sort: Optional[str] = "best_match",
+    current_user: dict = Depends(get_approved_business_user),
+):
+    if current_user.get("role") != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only business users can access this resource")
+    if current_user.get("approval_status") != ApprovalStatus.APPROVED:
+        raise HTTPException(status_code=403, detail="Business profile must be approved")
+    if sort not in ["recent", "active", "best_match", None]:
+        raise HTTPException(status_code=400, detail="Invalid sort option")
+
+    creators = await db.users.find({
+        "role": UserRole.CREATOR,
+        "approval_status": ApprovalStatus.APPROVED,
+        "profile_completed": True,
+        "$or": [
+            {"curated_brand_visible": True},
+            {"creator_directory_visible": True},
+        ],
+    }, {"_id": 0}).to_list(10000)
+
+    rows = []
+    for creator in creators:
+        if not creator_matches_directory_filters(creator, category, language, region, style, budget):
+            continue
+        deliverables = await creator_deliverables_completed(creator)
+        rows.append({
+            "creator": creator,
+            "public": creator_directory_public_view(creator, deliverables),
+            "deliverables": deliverables,
+            "activity": first_non_empty(creator.get("recent_activity_score"), creator.get("activity_score"), (creator.get("profile") or {}).get("recent_activity_score")),
+            "best_match": creator_best_match_score(creator, current_user),
+        })
+
+    if sort == "recent":
+        rows.sort(key=lambda row: row["creator"].get("created_at") or "", reverse=True)
+    elif sort == "active":
+        rows.sort(key=lambda row: (to_float(row.get("activity")) or row["deliverables"], row["deliverables"]), reverse=True)
+    else:
+        rows.sort(key=lambda row: (row["best_match"], row["deliverables"]), reverse=True)
+
+    return {"creators": [row["public"] for row in rows]}
+
+@api_router.post("/business/creator-directory/{creator_id}/invite")
+async def invite_creator_from_directory(
+    creator_id: str,
+    data: CreatorDirectoryInviteCreate,
+    current_user: dict = Depends(get_approved_business_user),
+):
+    if current_user.get("role") != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only business users can access this resource")
+    if current_user.get("approval_status") != ApprovalStatus.APPROVED:
+        raise HTTPException(status_code=403, detail="Business profile must be approved")
+    creator = await get_visible_directory_creator(creator_id)
+    if not creator:
+        raise HTTPException(status_code=404, detail="Creator is not available in the brand directory")
+
+    if data.campaign_id:
+        campaign = await db.campaigns.find_one({"id": data.campaign_id, "business_id": current_user["id"]}, {"_id": 0})
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
+    duplicate_query = {
+        "business_id": current_user["id"],
+        "creator_id": creator_id,
+        "status": {"$in": ["open", "pending", "sent"]},
+    }
+    if data.campaign_id:
+        duplicate_query["campaign_id"] = data.campaign_id
+    else:
+        duplicate_query["campaign_name"] = data.campaign_name
+    if await db.private_invitations.find_one(duplicate_query, {"_id": 0}):
+        raise HTTPException(status_code=409, detail="An open invitation already exists for this creator and campaign")
+
+    created_at = now_iso()
+    invitation = {
+        "id": str(uuid.uuid4()),
+        "business_id": current_user["id"],
+        "business_nickname": current_user.get("nickname"),
+        "creator_id": creator_id,
+        "creator_nickname": creator.get("nickname"),
+        "campaign_id": data.campaign_id,
+        "campaign_name": data.campaign_name,
+        "deliverable_summary": data.deliverable_summary,
+        "budget": data.budget,
+        "timeline": data.timeline,
+        "usage_rights": data.usage_rights,
+        "message": data.message or "",
+        "status": "open",
+        "source": "creator_directory",
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+    await db.private_invitations.insert_one(invitation)
+
+    action_card = {
+        "id": str(uuid.uuid4()),
+        "thread_key": thread_key_for(current_user["id"], creator_id),
+        "participants": sorted([current_user["id"], creator_id]),
+        "sender_id": current_user["id"],
+        "sender_nickname": current_user.get("nickname"),
+        "recipient_id": creator_id,
+        "deal_id": data.campaign_id,
+        "type": "private_invitation",
+        "fields": {
+            "invitation_id": invitation["id"],
+            "campaign_id": data.campaign_id,
+            "campaign_name": data.campaign_name,
+            "deliverable_summary": data.deliverable_summary,
+            "budget": data.budget,
+            "timeline": data.timeline,
+            "usage_rights": data.usage_rights,
+            "message": data.message or "",
+            "response_deadline": (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(),
+        },
+        "status": "open",
+        "created_at": created_at,
+        "available_actions": get_action_card_available_actions("private_invitation"),
+        "read_by": [current_user["id"]],
+        "immutable": True,
+    }
+    await db.chat_action_cards.insert_one(action_card)
+
+    return {
+        "message": "Invitation sent",
+        "invitation": {key: value for key, value in invitation.items() if key != "_id"},
+        "action_card": {key: value for key, value in action_card.items() if key != "_id"},
+    }
 
 @api_router.get("/business/dashboard")
 async def get_business_dashboard(current_user: dict = Depends(get_current_user)):
