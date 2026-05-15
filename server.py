@@ -404,6 +404,10 @@ class BusinessPaymentMethodCreate(BaseModel):
     last4: Optional[str] = None
     is_default: bool = False
 
+class BusinessWalletRechargeCreate(BaseModel):
+    amount: float
+    gateway: str = "razorpay"
+
 class DealReceiptSubmit(BaseModel):
     received_at: Optional[str] = None
     unboxing_video_url: str
@@ -549,6 +553,12 @@ def hours_until(value: Optional[str]) -> Optional[int]:
 
 CONTACT_INFO_BLOCK_DETAIL = "Your message appears to contain contact information. This cannot be shared on UGCAD.IO to protect both parties."
 MIN_BRAND_CHAT_BALANCE = 5000
+WALLET_MIN_RECHARGE = 5000
+WALLET_BONUS_TIERS = [
+    {"amount": 10000, "bonus_percent": 3, "label": "₹10K"},
+    {"amount": 25000, "bonus_percent": 7, "label": "₹25K"},
+    {"amount": 50000, "bonus_percent": 10, "label": "₹50K"},
+]
 CHAT_PAUSE_SECONDS = 60 * 60
 ACTION_CARDS_ONLY_DAYS = 14
 ROLLING_STRIKE_DAYS = 30
@@ -1069,6 +1079,153 @@ def percent_change(current: int, previous: int) -> float:
     if previous == 0:
         return 100.0 if current > 0 else 0.0
     return round(((current - previous) / previous) * 100, 2)
+
+def wallet_bonus_percent(amount: float) -> int:
+    percent = 0
+    for tier in WALLET_BONUS_TIERS:
+        if amount >= tier["amount"]:
+            percent = tier["bonus_percent"]
+    return percent
+
+def wallet_bonus_amount(amount: float) -> float:
+    return round(amount * wallet_bonus_percent(amount) / 100, 2)
+
+def wallet_bonus_progress(amount: float) -> dict:
+    current_tier = None
+    next_tier = None
+    for tier in WALLET_BONUS_TIERS:
+        if amount >= tier["amount"]:
+            current_tier = tier
+        elif next_tier is None:
+            next_tier = tier
+
+    if current_tier is None:
+        base_amount = 0
+        current_tier = {"amount": 0, "bonus_percent": 0}
+    else:
+        base_amount = current_tier["amount"]
+
+    if next_tier:
+        span = next_tier["amount"] - base_amount
+        amount_to_next = max(next_tier["amount"] - amount, 0)
+        progress = round(((amount - base_amount) / span) * 100, 2) if span else 100
+    else:
+        amount_to_next = 0
+        progress = 100
+
+    return {
+        "current_tier_percent": current_tier["bonus_percent"],
+        "next_tier_percent": next_tier["bonus_percent"] if next_tier else current_tier["bonus_percent"],
+        "current_tier_amount": current_tier["amount"],
+        "next_tier_amount": next_tier["amount"] if next_tier else current_tier["amount"],
+        "amount_to_next_tier": amount_to_next,
+        "progress_percent": min(max(progress, 0), 100),
+    }
+
+def normalize_wallet_transaction(source: dict, default_type: str = "Wallet Recharge", default_direction: str = "credit") -> dict:
+    tx_type = source.get("type") or source.get("purpose") or default_type
+    status = source.get("status") or "success"
+    amount = to_float(source.get("amount") or source.get("held_amount") or source.get("fee_amount"))
+    direction = source.get("direction") or default_direction
+
+    if tx_type in ["wallet_recharge", "payment", "recharge"]:
+        tx_type = "Wallet Recharge"
+        direction = "credit"
+    elif tx_type in ["bonus_credit", "bonus"]:
+        tx_type = "Bonus Credit"
+        direction = "credit"
+    elif tx_type in ["escrow", "escrow_lock", "held", "hold"]:
+        tx_type = "Escrow Lock"
+        direction = "debit"
+    elif tx_type in ["platform_fee", "listing_fee", "fee"]:
+        tx_type = "Platform Fee"
+        direction = "debit"
+    elif tx_type in ["refund", "wallet_refund"]:
+        tx_type = "Refund"
+        direction = "credit"
+
+    return {
+        "id": source.get("id") or source.get("gateway_order_id") or str(uuid.uuid4()),
+        "date": source.get("created_at") or source.get("completed_at") or source.get("updated_at") or now_iso(),
+        "type": tx_type,
+        "reference": source.get("reference") or source.get("gateway_payment_id") or source.get("gateway_order_id") or source.get("campaign_id"),
+        "amount": amount,
+        "direction": direction,
+        "status": status,
+    }
+
+async def credit_wallet_for_successful_transaction(transaction: dict, gateway_payment_id: Optional[str] = None) -> dict:
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    now = now_iso()
+    set_fields = {
+        "status": "success",
+        "completed_at": now,
+    }
+    if gateway_payment_id:
+        set_fields["gateway_payment_id"] = gateway_payment_id
+
+    if transaction.get("purpose") != "wallet_recharge":
+        await db.payment_transactions.update_one(
+            {"id": transaction["id"]},
+            {"$set": set_fields}
+        )
+        updated = await db.payment_transactions.find_one({"id": transaction["id"]}, {"_id": 0})
+        wallet_user = await db.users.find_one({"id": transaction.get("user_id")}, {"_id": 0, "balance": 1})
+        return {"transaction": updated, "wallet_balance": to_float((wallet_user or {}).get("balance"))}
+
+    update_result = await db.payment_transactions.update_one(
+        {"id": transaction["id"], "wallet_credited": {"$ne": True}},
+        {"$set": {
+            **set_fields,
+            "wallet_credited": True,
+            "credited_at": now,
+        }}
+    )
+
+    if update_result.modified_count:
+        amount = to_float(transaction.get("amount"))
+        bonus_amount = to_float(transaction.get("bonus_amount"))
+        credited_amount = to_float(transaction.get("credited_amount")) or amount + bonus_amount
+        await db.users.update_one(
+            {"id": transaction["user_id"]},
+            {"$inc": {"balance": credited_amount}}
+        )
+        reference = gateway_payment_id or transaction.get("gateway_payment_id") or transaction.get("gateway_order_id")
+        ledger_rows = [{
+            "id": str(uuid.uuid4()),
+            "user_id": transaction["user_id"],
+            "transaction_id": transaction["id"],
+            "type": "Wallet Recharge",
+            "amount": amount,
+            "direction": "credit",
+            "status": "success",
+            "reference": reference,
+            "created_at": now,
+        }]
+        if bonus_amount > 0:
+            ledger_rows.append({
+                "id": str(uuid.uuid4()),
+                "user_id": transaction["user_id"],
+                "transaction_id": transaction["id"],
+                "type": "Bonus Credit",
+                "amount": bonus_amount,
+                "direction": "credit",
+                "status": "success",
+                "reference": reference,
+                "created_at": now,
+            })
+        await db.wallet_ledger.insert_many(ledger_rows)
+    elif gateway_payment_id:
+        await db.payment_transactions.update_one(
+            {"id": transaction["id"]},
+            {"$set": {"gateway_payment_id": gateway_payment_id}}
+        )
+
+    updated = await db.payment_transactions.find_one({"id": transaction["id"]}, {"_id": 0})
+    wallet_user = await db.users.find_one({"id": transaction.get("user_id")}, {"_id": 0, "balance": 1})
+    return {"transaction": updated, "wallet_balance": to_float((wallet_user or {}).get("balance"))}
 
 def make_deal_id(campaign: dict) -> str:
     if campaign.get('deal_id'):
@@ -1851,6 +2008,127 @@ async def invite_creator_from_directory(
         "invitation": {key: value for key, value in invitation.items() if key != "_id"},
         "action_card": {key: value for key, value in action_card.items() if key != "_id"},
     }
+
+@api_router.get("/business/wallet")
+async def get_business_wallet(current_user: dict = Depends(get_approved_business_user)):
+    if current_user.get("role") != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only business users can access this resource")
+    if current_user.get("approval_status") != ApprovalStatus.APPROVED:
+        raise HTTPException(status_code=403, detail="Business profile must be approved")
+
+    balance = to_float(current_user.get("balance"))
+    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    plan_name = (
+        ((settings or {}).get("billing") or {}).get("plan_name") or
+        current_user.get("plan_name") or
+        "Brand Starter"
+    )
+
+    ledger_rows = await db.wallet_ledger.find({"user_id": current_user["id"]}, {"_id": 0}).to_list(1000)
+    ledger_transaction_ids = {row.get("transaction_id") for row in ledger_rows if row.get("transaction_id")}
+    transactions = [normalize_wallet_transaction(row) for row in ledger_rows]
+
+    payment_rows = await db.payment_transactions.find({"user_id": current_user["id"]}, {"_id": 0}).to_list(1000)
+    for row in payment_rows:
+        if row.get("id") in ledger_transaction_ids:
+            continue
+        tx_type = "Wallet Recharge" if row.get("purpose") == "wallet_recharge" else row.get("purpose") or "Payment"
+        transactions.append(normalize_wallet_transaction(row, tx_type, "credit"))
+
+    brand_campaigns = await db.campaigns.find({"business_id": current_user["id"]}, {"_id": 0, "id": 1}).to_list(10000)
+    campaign_ids = [campaign.get("id") for campaign in brand_campaigns if campaign.get("id")]
+    if campaign_ids:
+        escrow_rows = await db.escrow.find({"campaign_id": {"$in": campaign_ids}}, {"_id": 0}).to_list(10000)
+        for row in escrow_rows:
+            transactions.append(normalize_wallet_transaction({**row, "type": "Escrow Lock"}, "Escrow Lock", "debit"))
+
+    transactions.sort(key=lambda item: item.get("date") or "", reverse=True)
+
+    return {
+        "available_balance": balance,
+        "minimum_chat_balance": MIN_BRAND_CHAT_BALANCE,
+        "chat_unlocked": balance >= MIN_BRAND_CHAT_BALANCE,
+        "plan_name": plan_name,
+        "recharge_bonus": wallet_bonus_progress(balance),
+        "bonus_tiers": WALLET_BONUS_TIERS,
+        "transactions": transactions,
+    }
+
+@api_router.post("/business/wallet/recharge")
+async def recharge_business_wallet(
+    data: BusinessWalletRechargeCreate,
+    current_user: dict = Depends(get_approved_business_user),
+):
+    if current_user.get("role") != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only business users can access this resource")
+    if current_user.get("approval_status") != ApprovalStatus.APPROVED:
+        raise HTTPException(status_code=403, detail="Business profile must be approved")
+    if data.amount < WALLET_MIN_RECHARGE:
+        raise HTTPException(status_code=400, detail="Minimum wallet recharge amount is INR 5,000")
+
+    gateway = await get_active_gateway(data.gateway)
+    if gateway["gateway_name"] not in ["razorpay", "cashfree"]:
+        raise HTTPException(status_code=400, detail="Unsupported gateway")
+
+    currency = "INR"
+    bonus_amount = wallet_bonus_amount(data.amount)
+    credited_amount = data.amount + bonus_amount
+    created_at = now_iso()
+
+    if gateway["gateway_name"] == "razorpay":
+        try:
+            client = razorpay.Client(auth=(gateway["key_id"], gateway["key_secret"]))
+            gateway_order = client.order.create(data={
+                "amount": int(data.amount * 100),
+                "currency": currency,
+                "notes": {"purpose": "wallet_recharge", "user_id": current_user["id"]},
+            })
+        except Exception as razorpay_error:
+            if "Authentication failed" in str(razorpay_error) or "test" in gateway["key_id"].lower():
+                gateway_order = {
+                    "id": f"order_wallet_test_{str(uuid.uuid4())[:8]}",
+                    "amount": int(data.amount * 100),
+                    "currency": currency,
+                    "status": "created",
+                }
+            else:
+                raise razorpay_error
+        order_id = gateway_order["id"]
+    else:
+        order_id = f"cf_wallet_{str(uuid.uuid4())[:8]}"
+
+    transaction_doc = {
+        "id": str(uuid.uuid4()),
+        "gateway": gateway["gateway_name"],
+        "gateway_order_id": order_id,
+        "amount": data.amount,
+        "bonus_amount": bonus_amount,
+        "credited_amount": credited_amount,
+        "currency": currency,
+        "purpose": "wallet_recharge",
+        "status": "created",
+        "user_id": current_user["id"],
+        "customer_id": current_user["id"],
+        "customer_email": current_user.get("email"),
+        "customer_phone": current_user.get("phone") or "",
+        "customer_name": current_user.get("nickname") or "",
+        "created_at": created_at,
+        "wallet_credited": False,
+    }
+    await db.payment_transactions.insert_one(transaction_doc)
+
+    response = {
+        "success": True,
+        "gateway": gateway["gateway_name"],
+        "order_id": order_id,
+        "amount": data.amount,
+        "bonus_amount": bonus_amount,
+        "credited_amount": credited_amount,
+        "currency": currency,
+    }
+    if gateway["gateway_name"] == "razorpay":
+        response["key_id"] = gateway["key_id"]
+    return response
 
 @api_router.get("/business/dashboard")
 async def get_business_dashboard(current_user: dict = Depends(get_current_user)):
@@ -4134,14 +4412,22 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(get
         raise HTTPException(status_code=403, detail="Admin access required")
     
     status = ApprovalStatus.APPROVED if data.action == "approve" else ApprovalStatus.REJECTED
+    user = await db.users.find_one({"id": data.item_id}, {"_id": 0, "role": 1})
+    if not user:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    update_data = {
+        "approval_status": status,
+        "approval_reason": data.reason,
+        "approved_at": datetime.now(timezone.utc).isoformat()
+    }
+    if user.get("role") == UserRole.CREATOR:
+        is_approved = status == ApprovalStatus.APPROVED
+        update_data["creator_directory_visible"] = is_approved
+        update_data["curated_brand_visible"] = is_approved
     
     await db.users.update_one(
         {"id": data.item_id},
-        {"$set": {
-            "approval_status": status,
-            "approval_reason": data.reason,
-            "approved_at": datetime.now(timezone.utc).isoformat()
-        }}
+        {"$set": update_data}
     )
     
     return {"message": f"Profile {data.action}d"}
@@ -4842,6 +5128,8 @@ async def verify_payment(
         transaction = await db.payment_transactions.find_one({"gateway_order_id": gateway_order_id})
         if not transaction:
             raise HTTPException(status_code=404, detail="Transaction not found")
+        if transaction.get("user_id") != current_user.get("id") and current_user.get("role") not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
+            raise HTTPException(status_code=403, detail="Not authorized for this transaction")
         
         # Get gateway config
         gateway = await db.payment_gateways.find_one({"gateway_name": transaction['gateway']})
@@ -4862,21 +5150,18 @@ async def verify_payment(
                 
                 client.utility.verify_payment_signature(params_dict)
                 
-                # Update transaction status
                 await db.payment_transactions.update_one(
-                    {"gateway_order_id": gateway_order_id},
-                    {"$set": {
-                        "status": "success",
-                        "gateway_payment_id": gateway_payment_id,
-                        "gateway_signature": gateway_signature,
-                        "completed_at": datetime.now(timezone.utc).isoformat()
-                    }}
+                    {"id": transaction["id"]},
+                    {"$set": {"gateway_signature": gateway_signature}}
                 )
+                credit_result = await credit_wallet_for_successful_transaction(transaction, gateway_payment_id)
                 
                 return {
                     "success": True,
                     "message": "Payment verified successfully",
-                    "transaction_id": transaction['id']
+                    "transaction_id": transaction['id'],
+                    "transaction": credit_result["transaction"],
+                    "wallet_balance": credit_result["wallet_balance"],
                 }
             except Exception as verify_error:
                 # Handle test credentials or verification errors
@@ -4894,19 +5179,14 @@ async def verify_payment(
         
         else:
             # Cashfree verification would go here
-            await db.payment_transactions.update_one(
-                {"gateway_order_id": gateway_order_id},
-                {"$set": {
-                    "status": "success",
-                    "gateway_payment_id": gateway_payment_id,
-                    "completed_at": datetime.now(timezone.utc).isoformat()
-                }}
-            )
+            credit_result = await credit_wallet_for_successful_transaction(transaction, gateway_payment_id)
             
             return {
                 "success": True,
                 "message": "Payment verified successfully",
-                "transaction_id": transaction['id']
+                "transaction_id": transaction['id'],
+                "transaction": credit_result["transaction"],
+                "wallet_balance": credit_result["wallet_balance"],
             }
     
     except HTTPException:
@@ -4950,17 +5230,13 @@ async def razorpay_webhook(request: dict):
             payment = payload.get("payment", {}).get("entity", {})
             order_id = payment.get("order_id")
             payment_id = payment.get("id")
-            
-            # Update transaction
-            await db.payment_transactions.update_one(
-                {"gateway_order_id": order_id},
-                {"$set": {
-                    "status": "success",
-                    "gateway_payment_id": payment_id,
-                    "webhook_received": True,
-                    "completed_at": datetime.now(timezone.utc).isoformat()
-                }}
-            )
+            transaction = await db.payment_transactions.find_one({"gateway_order_id": order_id})
+            if transaction:
+                await credit_wallet_for_successful_transaction(transaction, payment_id)
+                await db.payment_transactions.update_one(
+                    {"id": transaction["id"]},
+                    {"$set": {"webhook_received": True}}
+                )
         
         elif event == "payment.failed":
             payment = payload.get("payment", {}).get("entity", {})
@@ -4995,16 +5271,13 @@ async def cashfree_webhook(request: dict):
             
             order_id = order.get("order_id")
             payment_id = payment.get("cf_payment_id")
-            
-            await db.payment_transactions.update_one(
-                {"gateway_order_id": order_id},
-                {"$set": {
-                    "status": "success",
-                    "gateway_payment_id": payment_id,
-                    "webhook_received": True,
-                    "completed_at": datetime.now(timezone.utc).isoformat()
-                }}
-            )
+            transaction = await db.payment_transactions.find_one({"gateway_order_id": order_id})
+            if transaction:
+                await credit_wallet_for_successful_transaction(transaction, payment_id)
+                await db.payment_transactions.update_one(
+                    {"id": transaction["id"]},
+                    {"$set": {"webhook_received": True}}
+                )
         
         elif event_type == "PAYMENT_FAILED_WEBHOOK":
             order = data.get("order", {})
