@@ -43,6 +43,9 @@ from campaign_helpers import (
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
+# Import applications router (after load_dotenv)
+from applications import applications_router
+
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
@@ -5878,6 +5881,7 @@ async def get_creator_financial_details(creator_id: str, current_user: dict = De
         "upi_id": user.get('upi_id', None)
     }
 
+app.include_router(applications_router)
 app.include_router(api_router)
 
 # Mount static files for uploads
