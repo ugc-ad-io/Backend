@@ -43,8 +43,9 @@ from campaign_helpers import (
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# Import applications router (after load_dotenv)
+# Import routers (after load_dotenv)
 from applications import applications_router
+from categories import categories_router, seed_categories
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -5881,6 +5882,7 @@ async def get_creator_financial_details(creator_id: str, current_user: dict = De
         "upi_id": user.get('upi_id', None)
     }
 
+app.include_router(categories_router)
 app.include_router(applications_router)
 app.include_router(api_router)
 
@@ -5904,8 +5906,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 @app.on_event("startup")
-async def seed_payout_ranges():
-    """Seed default payout ranges if collection is empty."""
+async def startup_initialization():
+    """Initialize default data collections."""
+    # Seed payout ranges
     count = await db.payout_ranges.count_documents({})
     if count == 0:
         defaults = [
@@ -5921,6 +5924,9 @@ async def seed_payout_ranges():
             for d in defaults
         ]
         await db.payout_ranges.insert_many(docs)
+
+    # Seed categories
+    await seed_categories()
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
