@@ -46,6 +46,7 @@ load_dotenv(ROOT_DIR / '.env')
 # Import routers (after load_dotenv)
 from applications import applications_router
 from categories import categories_router, seed_categories
+from gigs import gigs_router
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -5884,6 +5885,7 @@ async def get_creator_financial_details(creator_id: str, current_user: dict = De
 
 app.include_router(categories_router)
 app.include_router(applications_router)
+app.include_router(gigs_router)
 app.include_router(api_router)
 
 # Mount static files for uploads
