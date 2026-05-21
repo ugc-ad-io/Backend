@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../App';
 import axios from 'axios';
@@ -17,18 +17,39 @@ export default function ChatPage() {
   const [otherUser, setOtherUser] = useState(null);
   const [loading, setLoading] = useState(true);
   const [warnings, setWarnings] = useState({ warning_count: 0, banned: false });
+  const messagesEndRef = useRef(null);
+  const messagesContainerRef = useRef(null);
+  const isUserScrolledUp = useRef(false);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  const handleScroll = () => {
+    if (!messagesContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = messagesContainerRef.current;
+    const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
+    isUserScrolledUp.current = !isAtBottom;
+  };
 
   useEffect(() => {
     if (userId) {
       fetchChatHistory();
       fetchOtherUser();
       fetchWarnings();
-      
+
       // Poll for new messages every 3 seconds
       const interval = setInterval(fetchChatHistory, 3000);
       return () => clearInterval(interval);
     }
   }, [userId]);
+
+  // Auto-scroll to bottom only when user is at bottom or new message is sent
+  useEffect(() => {
+    if (!isUserScrolledUp.current) {
+      setTimeout(scrollToBottom, 100);
+    }
+  }, [messages]);
 
   const fetchWarnings = async () => {
     try {
@@ -52,6 +73,7 @@ export default function ChatPage() {
     try {
       const response = await axios.get(`${API}/chat/${userId}`);
       setMessages(response.data);
+      isUserScrolledUp.current = false;
     } catch (error) {
       console.error('Failed to load messages');
     } finally {
@@ -68,20 +90,22 @@ export default function ChatPage() {
         recipient_id: userId,
         message: newMessage
       });
-      
+
       if (response.data.filtered) {
         toast.error(`⚠️ Your message contained prohibited content and was filtered. Warning ${response.data.warning_count}/3`);
         fetchWarnings();
       }
-      
+
       if (response.data.warning_issued && response.data.warning_count >= 3) {
         toast.error('Account banned for repeated violations!');
         setTimeout(() => navigate('/'), 2000);
         return;
       }
-      
+
       setNewMessage('');
+      isUserScrolledUp.current = false;
       fetchChatHistory();
+      setTimeout(scrollToBottom, 100);
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Failed to send message');
     }
@@ -114,7 +138,7 @@ export default function ChatPage() {
           </div>
         </div>
 
-        <div className="chat-messages" data-testid="chat-messages">
+        <div className="chat-messages" data-testid="chat-messages" ref={messagesContainerRef} onScroll={handleScroll}>
           {loading ? (
             <div className="loading">Loading messages...</div>
           ) : messages.length === 0 ? (
@@ -125,7 +149,7 @@ export default function ChatPage() {
             messages.map((msg, idx) => {
               const isOwn = msg.sender_id === user.id;
               const isSystemMessage = msg.system_message || msg.sender_id === 'system';
-              
+
               if (isSystemMessage) {
                 return (
                   <div key={msg.id || idx} className="system-message" data-testid={`system-message-${idx}`}>
@@ -139,7 +163,7 @@ export default function ChatPage() {
                   </div>
                 );
               }
-              
+
               return (
                 <div
                   key={msg.id || idx}
@@ -161,6 +185,7 @@ export default function ChatPage() {
               );
             })
           )}
+          <div ref={messagesEndRef} />
         </div>
 
         <form className="chat-input-form" onSubmit={handleSendMessage}>

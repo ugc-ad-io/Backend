@@ -55,8 +55,8 @@ export default function BusinessProfileSetup() {
       // Update user context
       const updatedUser = { ...user, profile_completed: true, approval_status: 'pending' };
       setUser(updatedUser);
-      
-      navigate('/dashboard/business');
+
+      navigate('/brand-home');
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Failed to update profile');
     } finally {

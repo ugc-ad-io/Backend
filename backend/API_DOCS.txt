@@ -1,0 +1,331 @@
+===============================================
+UGCad BACKEND API DOCUMENTATION
+===============================================
+
+BASE URL: http://localhost:5000/api
+
+===============================================
+AUTHENTICATION
+===============================================
+
+All protected endpoints require a JWT token in the Authorization header:
+
+Authorization: Bearer <token>
+
+The token should contain:
+- id: User ID
+- role: User role (admin for admin endpoints)
+
+===============================================
+GIG ENDPOINTS
+===============================================
+
+1. CREATE GIG
+   Endpoint: POST /gigs
+   Authentication: REQUIRED
+
+   Request Body:
+   {
+     "title": "Create Instagram Reels",
+     "description": "Create engaging Instagram reels for our fashion brand. Must include product shots.",
+     "category": "SOCIAL_MEDIA",
+     "budget": 500,
+     "deadline": "2026-06-20T23:59:59Z",
+     "attachments": ["https://example.com/image.jpg"],
+     "requirements": "Must include product shots and trending music",
+     "target_audience": "Women 18-35",
+     "skills_required": ["Video Editing", "Creative Content"]
+   }
+
+   Response: 201 Created
+   {
+     "success": true,
+     "message": "Gig created successfully",
+     "data": {
+       "_id": "507f1f77bcf86cd799439011",
+       "title": "Create Instagram Reels",
+       "status": "PENDING",
+       "creator_id": "507f1f77bcf86cd799439012",
+       ...
+     }
+   }
+
+   Validation Rules:
+   - title: 5-100 characters (required)
+   - description: 20-5000 characters (required)
+   - category: Valid category value (required)
+   - budget: > 0 (required)
+   - deadline: Must be future date (required)
+   - attachments: Array of valid URLs
+   - requirements: Max 2000 characters
+   - target_audience: Max 500 characters
+   - skills_required: Array of strings
+
+---
+
+2. LIST ALL GIGS
+   Endpoint: GET /gigs
+   Authentication: NOT REQUIRED
+
+   Query Parameters:
+   - status: PENDING, APPROVED, REJECTED, IN_PROGRESS, COMPLETED, CANCELLED
+   - category: Valid category value
+   - page: Page number (default: 1)
+   - limit: Results per page (default: 10, max: 100)
+   - sortBy: Field to sort by (default: createdAt)
+   - search: Search in title and description
+
+   Example: GET /gigs?status=APPROVED&category=SOCIAL_MEDIA&page=1&limit=10
+
+   Response: 200 OK
+   {
+     "success": true,
+     "data": [
+       {
+         "_id": "507f1f77bcf86cd799439011",
+         "title": "Create Instagram Reels",
+         "status": "APPROVED",
+         ...
+       }
+     ],
+     "pagination": {
+       "page": 1,
+       "limit": 10,
+       "total": 50,
+       "pages": 5
+     }
+   }
+
+---
+
+3. GET SINGLE GIG
+   Endpoint: GET /gigs/:id
+   Authentication: NOT REQUIRED
+
+   URL Parameters:
+   - id: Gig ID
+
+   Example: GET /gigs/507f1f77bcf86cd799439011
+
+   Response: 200 OK
+   {
+     "success": true,
+     "data": {
+       "_id": "507f1f77bcf86cd799439011",
+       "title": "Create Instagram Reels",
+       "creator_id": {
+         "_id": "507f1f77bcf86cd799439012",
+         "name": "John Doe",
+         "email": "john@example.com"
+       },
+       ...
+     }
+   }
+
+   Error: 404 Not Found
+   {
+     "success": false,
+     "message": "Gig not found"
+   }
+
+---
+
+4. UPDATE GIG STATUS (ADMIN ONLY)
+   Endpoint: PATCH /gigs/:id
+   Authentication: REQUIRED (Admin)
+
+   Request Body (for approval):
+   {
+     "status": "APPROVED"
+   }
+
+   Request Body (for rejection):
+   {
+     "status": "REJECTED",
+     "rejectionReason": "Budget exceeds our limits"
+   }
+
+   Response: 200 OK
+   {
+     "success": true,
+     "message": "Gig approved successfully",
+     "data": {
+       "_id": "507f1f77bcf86cd799439011",
+       "status": "APPROVED",
+       ...
+     }
+   }
+
+   Validation Rules:
+   - status: Must be APPROVED or REJECTED (required)
+   - rejectionReason: Required if status is REJECTED, max 1000 chars
+
+   Errors:
+   - 404: Gig not found
+   - 400: Gig status is not PENDING
+   - 403: Admin access required
+
+---
+
+5. GET GIGS BY CREATOR
+   Endpoint: GET /gigs/creator/:creatorId
+   Authentication: NOT REQUIRED
+
+   URL Parameters:
+   - creatorId: Creator's User ID
+
+   Query Parameters:
+   - page: Page number (default: 1)
+   - limit: Results per page (default: 10)
+   - status: Optional status filter
+
+   Example: GET /gigs/creator/507f1f77bcf86cd799439012?page=1&limit=10
+
+   Response: 200 OK
+   {
+     "success": true,
+     "data": [...],
+     "pagination": {
+       "page": 1,
+       "limit": 10,
+       "total": 15,
+       "pages": 2
+     }
+   }
+
+===============================================
+GIG CATEGORIES
+===============================================
+
+- SOCIAL_MEDIA: Social media content creation
+- PRODUCT_REVIEW: Product review videos/posts
+- UNBOXING: Unboxing videos
+- TUTORIAL: Tutorial or how-to content
+- SPONSORSHIP: Sponsored content
+- BRAND_AMBASSADOR: Brand ambassador work
+- CONTENT_CREATION: General content creation
+- PHOTOGRAPHY: Photography work
+- VIDEOGRAPHY: Videography/video production
+- OTHER: Other types of gigs
+
+===============================================
+GIG STATUS VALUES
+===============================================
+
+- PENDING: Awaiting admin approval
+- APPROVED: Approved by admin, ready for creators
+- REJECTED: Rejected by admin
+- IN_PROGRESS: Creator is actively working
+- COMPLETED: Gig completed successfully
+- CANCELLED: Gig was cancelled
+
+===============================================
+ERROR RESPONSES
+===============================================
+
+All error responses follow this format:
+
+{
+  "success": false,
+  "message": "Error description",
+  "errors": ["Field error 1", "Field error 2"]  // Optional
+}
+
+HTTP Status Codes:
+
+400 Bad Request
+- Validation failed
+- Invalid data format
+- Missing required fields
+
+401 Unauthorized
+- Missing authentication token
+- Invalid or expired token
+
+403 Forbidden
+- Admin access required
+- Insufficient permissions
+
+404 Not Found
+- Resource doesn't exist
+
+409 Conflict
+- Duplicate resource
+- Constraint violation
+
+500 Internal Server Error
+- Server error
+- Unexpected error
+
+===============================================
+DATABASE SCHEMA - GIGS
+===============================================
+
+Field              | Type      | Required | Description
+------------------|-----------|----------|------------------
+_id               | ObjectId  | Auto     | MongoDB ID
+title             | String    | Yes      | Gig title (5-100 chars)
+description       | String    | Yes      | Description (20-5000 chars)
+category          | String    | Yes      | Category enum
+budget            | Number    | Yes      | Budget amount
+deadline          | Date      | Yes      | Submission deadline
+status            | String    | No       | Current status
+creator_id        | ObjectId  | Yes      | Reference to User
+attachments       | Array     | No       | URLs to attachments
+requirements      | String    | No       | Additional requirements
+target_audience   | String    | No       | Target audience
+skills_required   | Array     | No       | Required skills
+applications_count| Number    | No       | Number of applications
+selected_creator_id| ObjectId | No       | Selected creator
+rejectionReason   | String    | No       | Rejection reason
+createdAt         | Date      | Auto     | Creation timestamp
+updatedAt         | Date      | Auto     | Update timestamp
+
+Indexes:
+- creator_id (for fast creator lookups)
+- status (for filtering by status)
+- createdAt (for sorting by date)
+
+===============================================
+EXAMPLE REQUESTS
+===============================================
+
+1. Create a Gig:
+curl -X POST http://localhost:5000/api/gigs \
+  -H "Authorization: Bearer your_token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Create Instagram Reels",
+    "description": "Create engaging Instagram reels for our fashion brand",
+    "category": "SOCIAL_MEDIA",
+    "budget": 500,
+    "deadline": "2026-06-20T23:59:59Z"
+  }'
+
+2. List All Gigs:
+curl http://localhost:5000/api/gigs?status=APPROVED&page=1&limit=10
+
+3. Get Single Gig:
+curl http://localhost:5000/api/gigs/507f1f77bcf86cd799439011
+
+4. Update Gig Status:
+curl -X PATCH http://localhost:5000/api/gigs/507f1f77bcf86cd799439011 \
+  -H "Authorization: Bearer admin_token" \
+  -H "Content-Type: application/json" \
+  -d '{"status": "APPROVED"}'
+
+5. Get Creator's Gigs:
+curl http://localhost:5000/api/gigs/creator/507f1f77bcf86cd799439012?page=1&limit=10
+
+===============================================
+NOTES
+===============================================
+
+- All timestamps are in UTC (ISO 8601 format)
+- Pagination is 1-based (page starts at 1)
+- Maximum 100 results per page
+- Search is case-insensitive
+- Sorting is descending by default
+- Validation happens on both client and server
+- Admin endpoints require admin role in JWT token
+===============================================

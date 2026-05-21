@@ -231,22 +231,54 @@ export default function Landing() {
             </motion.div>
           </div>
 
-          {/* Right: image */}
+          {/* Right: video with image overlay */}
           <motion.div
             className="lp-hero__image-wrap"
             initial={{ opacity: 0, x: 40 }}
             animate={{ opacity: 1, x: 0 }}
             transition={{ duration: 0.9, delay: 0.3, ease: [0.25, 0.46, 0.45, 0.94] }}
           >
-            <motion.img
-              src="https://images.unsplash.com/photo-1624717369095-ebacc7d68a40?crop=entropy&cs=srgb&fm=jpg&q=85"
+            <video
+              src="/9384669-uhd_2160_3840_24fps.mp4"
               alt="Content creator filming"
-              className="lp-hero__img"
-              animate={{ y: [0, -12, 0] }}
-              transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
+              className="lp-hero__video"
+              autoPlay
+              muted
+              loop
+              playsInline
+            />
+            <img
+              src="/Instagram.jpg"
+              alt="Instagram content"
+              className="lp-hero__overlay-img"
             />
             <div className="lp-hero__img-glow" aria-hidden="true" />
           </motion.div>
+        </div>
+      </section>
+
+      {/* ── Brands Scroll ───────────────────────────────────────────────────── */}
+      <section className="lp-brands">
+        <div className="lp-brands__scroll">
+          <div className="lp-brands__track">
+            <div className="lp-brand-item">Amazon</div>
+            <div className="lp-brand-item">Apple</div>
+            <div className="lp-brand-item">Google</div>
+            <div className="lp-brand-item">Netflix</div>
+            <div className="lp-brand-item">Spotify</div>
+            <div className="lp-brand-item">Tesla</div>
+            <div className="lp-brand-item">Meta</div>
+            <div className="lp-brand-item">Microsoft</div>
+            {/* Duplicate for continuous scroll */}
+            <div className="lp-brand-item">Amazon</div>
+            <div className="lp-brand-item">Apple</div>
+            <div className="lp-brand-item">Google</div>
+            <div className="lp-brand-item">Netflix</div>
+            <div className="lp-brand-item">Spotify</div>
+            <div className="lp-brand-item">Tesla</div>
+            <div className="lp-brand-item">Meta</div>
+            <div className="lp-brand-item">Microsoft</div>
+          </div>
         </div>
       </section>
 
@@ -600,15 +632,31 @@ export default function Landing() {
         /* Image */
         .lp-hero__image-wrap {
           position: relative;
+          display: inline-block;
+          width: 100%;
+          max-width: 500px;
         }
 
-        .lp-hero__img {
-          width: 100%;
-          border-radius: 24px;
+        .lp-hero__video {
+          width: 49%;
+          height: auto;
+          border-radius: 16px;
+          box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
           object-fit: cover;
-          max-height: 520px;
           display: block;
+          float: left;
+        }
+
+        .lp-hero__overlay-img {
+          width: 49%;
+          height: auto;
+          max-height: 350px;
+          border-radius: 24px;
           box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+          object-fit: cover;
+          display: block;
+          float: right;
+          margin: 0;
         }
 
         .lp-hero__img-glow {
@@ -623,6 +671,49 @@ export default function Landing() {
           border-radius: 50%;
           z-index: -1;
           pointer-events: none;
+        }
+
+        /* ── Brands Scroll ────────────────────────────────────────────────── */
+        .lp-brands {
+          background: #0a0a0a;
+          padding: 60px 0;
+          overflow: hidden;
+        }
+
+        .lp-brands__scroll {
+          width: 100%;
+          overflow: hidden;
+        }
+
+        .lp-brands__track {
+          display: flex;
+          gap: 60px;
+          animation: scrollBrands 30s linear infinite;
+          width: max-content;
+          padding: 0 8%;
+        }
+
+        .lp-brand-item {
+          font-size: 1.5rem;
+          font-weight: 700;
+          color: #F8FAFC;
+          white-space: nowrap;
+          letter-spacing: 0.02em;
+          opacity: 0.6;
+          transition: opacity 0.3s ease;
+        }
+
+        .lp-brand-item:hover {
+          opacity: 1;
+        }
+
+        @keyframes scrollBrands {
+          0% {
+            transform: translateX(0);
+          }
+          100% {
+            transform: translateX(-50%);
+          }
         }
 
         /* ── Features ─────────────────────────────────────────────────────── */

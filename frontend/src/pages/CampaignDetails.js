@@ -566,8 +566,10 @@ export default function CampaignDetails() {
       <style jsx>{`
         .campaign-details-page {
           min-height: 100vh;
-          background: linear-gradient(135deg, #f8f9ff 0%, #e8ecff 100%);
-          padding: 40px 8%;
+          background: linear-gradient(135deg, #f5f7fa 0%, #e8ecf1 100%);
+          padding: 40px 5%;
+          display: flex;
+          flex-direction: column;
         }
 
         .loading-page,
@@ -581,6 +583,7 @@ export default function CampaignDetails() {
         }
 
         .page-header {
+          width: 100%;
           max-width: 1400px;
           margin: 0 auto 24px;
         }
@@ -603,9 +606,11 @@ export default function CampaignDetails() {
           border-color: #667eea;
           color: #667eea;
           transform: translateX(-4px);
+          box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2);
         }
 
         .campaign-container {
+          width: 100%;
           max-width: 1400px;
           margin: 0 auto;
           display: grid;
@@ -623,7 +628,8 @@ export default function CampaignDetails() {
           background: white;
           padding: 32px;
           border-radius: 24px;
-          box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+          box-shadow: 0 2px 8px rgba(102, 126, 234, 0.12);
+          border: 1px solid rgba(102, 126, 234, 0.1);
         }
 
         .bids-divider {
@@ -636,7 +642,8 @@ export default function CampaignDetails() {
           background: white;
           padding: 32px;
           border-radius: 24px;
-          box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+          box-shadow: 0 2px 8px rgba(102, 126, 234, 0.12);
+          border: 1px solid rgba(102, 126, 234, 0.1);
         }
 
         .campaign-title-section {
@@ -690,6 +697,8 @@ export default function CampaignDetails() {
           color: #4a5568;
           line-height: 1.8;
           white-space: pre-wrap;
+          font-size: 1rem !important;
+          font-weight: 600 !important;
         }
 
         .objectives-grid {
@@ -700,29 +709,35 @@ export default function CampaignDetails() {
 
         .objective-item {
           padding: 12px 16px;
-          background: #f8f9ff;
+          background: linear-gradient(135deg, rgba(102, 126, 234, 0.08) 0%, rgba(118, 75, 162, 0.05) 100%);
           border-radius: 12px;
-          border: 2px solid #e2e8f0;
+          border: 2px solid rgba(102, 126, 234, 0.15);
           color: #4a5568;
           font-weight: 500;
+          transition: all 0.3s ease;
+        }
+
+        .objective-item:hover {
+          border-color: #667eea;
+          background: linear-gradient(135deg, rgba(102, 126, 234, 0.12) 0%, rgba(118, 75, 162, 0.08) 100%);
         }
 
         .shipment-notice {
           padding: 20px;
-          background: #fff3cd;
+          background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.06) 100%);
           border-radius: 12px;
-          border: 2px solid #ffc107;
+          border: 2px solid rgba(102, 126, 234, 0.25);
         }
 
         .shipment-notice strong {
           display: block;
           margin-bottom: 8px;
-          color: #856404;
+          color: #5568d3;
           font-size: 1.05rem;
         }
 
         .shipment-notice p {
-          color: #856404;
+          color: #4a5568;
           margin: 0;
         }
 
@@ -811,13 +826,13 @@ export default function CampaignDetails() {
         }
 
         .bids-list-compact::-webkit-scrollbar-thumb {
-          background: linear-gradient(180deg, #667eea 0%, #764ba2 100%);
+          background: #7387FF;
           border-radius: 5px;
           border: 2px solid #f1f5f9;
         }
 
         .bids-list-compact::-webkit-scrollbar-thumb:hover {
-          background: linear-gradient(180deg, #5568d3 0%, #6a3f8f 100%);
+          background: #7387FF;
         }
 
         /* Firefox scrollbar */
@@ -941,7 +956,7 @@ export default function CampaignDetails() {
 
         .btn-select-small {
           padding: 8px 16px;
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          background: #7387FF;
           color: white;
           border: none;
           border-radius: 8px;
@@ -992,7 +1007,7 @@ export default function CampaignDetails() {
         }
 
         .creator-bid-banner {
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          background: #7387FF;
           color: white;
           padding: 24px;
           border-radius: 16px;
@@ -1032,12 +1047,12 @@ export default function CampaignDetails() {
         }
 
         .bid-submitted-banner {
-          background: #d4edda;
-          color: #155724;
+          background: linear-gradient(135deg, rgba(102, 126, 234, 0.15) 0%, rgba(118, 75, 162, 0.12) 100%);
+          border: 2px solid rgba(102, 126, 234, 0.3);
+          color: #2d3748;
           padding: 24px;
           border-radius: 16px;
           margin-bottom: 24px;
-          border: 2px solid #c3e6cb;
         }
 
         .bid-submitted-content {
@@ -1055,8 +1070,15 @@ export default function CampaignDetails() {
         .bid-submitted-header h3 {
           font-size: 1.25rem;
           font-weight: 700;
-          color: #155724;
+          background: #7387FF;
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          background-clip: text;
           margin: 0;
+        }
+
+        .bid-submitted-header svg {
+          color: #667eea;
         }
 
         .bid-submitted-details {
@@ -1066,6 +1088,7 @@ export default function CampaignDetails() {
           background: white;
           padding: 16px;
           border-radius: 12px;
+          border: 1px solid #e2e8f0;
         }
 
         .detail-row {
@@ -1076,38 +1099,45 @@ export default function CampaignDetails() {
 
         .detail-label {
           font-weight: 600;
-          color: #155724;
+          color: #4a5568;
           font-size: 0.95rem;
         }
 
         .detail-value {
           font-weight: 700;
-          color: #155724;
+          background: #7387FF;
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          background-clip: text;
           font-size: 1rem;
         }
 
         .status-badge {
-          background: #fff3cd;
-          color: #856404;
-          padding: 4px 12px;
-          border-radius: 8px;
-          font-weight: 600;
-          font-size: 0.875rem;
+          background: #7387FF !important;
+          color: white !important;
+          padding: 8px 16px !important;
+          border-radius: 8px !important;
+          font-weight: 600 !important;
+          font-size: 0.875rem !important;
+          display: inline-block !important;
+          box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
         }
 
         .bid-submitted-proposal {
           background: white;
           padding: 16px;
           border-radius: 12px;
+          border: 1px solid #e2e8f0;
         }
 
         .bid-submitted-proposal .detail-label {
           display: block;
           margin-bottom: 8px;
+          color: #4a5568;
         }
 
         .proposal-text {
-          color: #155724;
+          color: #2d3748;
           line-height: 1.6;
           margin: 0;
           font-size: 0.95rem;
@@ -1125,6 +1155,7 @@ export default function CampaignDetails() {
           justify-content: center;
           z-index: 1000;
           padding: 20px;
+          overflow-y: auto;
         }
 
         .modal-content {
@@ -1134,7 +1165,9 @@ export default function CampaignDetails() {
           max-width: 500px;
           max-height: 90vh;
           overflow-y: auto;
-          box-shadow: 0 20px 40px rgba(0, 0, 0, 0.15);
+          box-shadow: 0 10px 40px rgba(102, 126, 234, 0.2);
+          border: 1px solid rgba(102, 126, 234, 0.1);
+          margin: auto;
         }
 
         .modal-header {
@@ -1176,6 +1209,7 @@ export default function CampaignDetails() {
         .creator-modal {
           max-width: 800px;
           max-height: 90vh;
+          margin: auto;
         }
 
         .creator-details {
@@ -1215,12 +1249,13 @@ export default function CampaignDetails() {
         }
 
         .tag {
-          background: #edf2f7;
-          color: #4a5568;
-          padding: 4px 12px;
+          background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.06) 100%);
+          color: #5568d3;
+          padding: 6px 12px;
           border-radius: 20px;
           font-size: 0.875rem;
           font-weight: 500;
+          border: 1px solid rgba(102, 126, 234, 0.2);
         }
 
         .creator-stats {
@@ -1234,9 +1269,10 @@ export default function CampaignDetails() {
           flex-direction: column;
           align-items: center;
           padding: 12px 20px;
-          background: #f8f9ff;
+          background: linear-gradient(135deg, rgba(102, 126, 234, 0.08) 0%, rgba(118, 75, 162, 0.05) 100%);
           border-radius: 12px;
           min-width: 150px;
+          border: 1px solid rgba(102, 126, 234, 0.15);
         }
 
         .stat-label {
@@ -1248,7 +1284,10 @@ export default function CampaignDetails() {
         .stat-value {
           font-size: 1.5rem;
           font-weight: 700;
-          color: #667eea;
+          background: #7387FF;
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          background-clip: text;
         }
 
         .section {
@@ -1279,6 +1318,14 @@ export default function CampaignDetails() {
           border-radius: 12px;
           overflow: hidden;
           background: #f8f9ff;
+          border: 2px solid rgba(102, 126, 234, 0.1);
+          transition: all 0.3s ease;
+        }
+
+        .portfolio-item-modal:hover {
+          border-color: rgba(102, 126, 234, 0.3);
+          transform: translateY(-4px);
+          box-shadow: 0 4px 12px rgba(102, 126, 234, 0.15);
         }
 
         .portfolio-item-modal img,
@@ -1301,8 +1348,9 @@ export default function CampaignDetails() {
           justify-content: space-between;
           align-items: center;
           padding: 12px 16px;
-          background: #f8f9ff;
+          background: linear-gradient(135deg, rgba(102, 126, 234, 0.08) 0%, rgba(118, 75, 162, 0.04) 100%);
           border-radius: 8px;
+          border: 1px solid rgba(102, 126, 234, 0.1);
         }
 
         .order-title,
@@ -1324,8 +1372,10 @@ export default function CampaignDetails() {
         }
 
         .status-in_progress {
-          background: #fff3cd;
-          color: #856404;
+          background: linear-gradient(135deg, rgba(102, 126, 234, 0.2) 0%, rgba(118, 75, 162, 0.15) 100%);
+          color: #5568d3;
+          font-weight: 600;
+          border: 1px solid rgba(102, 126, 234, 0.3);
         }
 
         .collab-date {
@@ -1341,8 +1391,9 @@ export default function CampaignDetails() {
 
         .review-item-modal {
           padding: 16px;
-          background: #f8f9ff;
+          background: linear-gradient(135deg, rgba(102, 126, 234, 0.08) 0%, rgba(118, 75, 162, 0.04) 100%);
           border-radius: 12px;
+          border: 1px solid rgba(102, 126, 234, 0.1);
         }
 
         .review-header-modal {
@@ -1397,9 +1448,10 @@ export default function CampaignDetails() {
           display: flex;
           justify-content: space-between;
           padding: 12px 16px;
-          background: #f8f9ff;
+          background: linear-gradient(135deg, rgba(102, 126, 234, 0.08) 0%, rgba(118, 75, 162, 0.04) 100%);
           border-radius: 8px;
           font-weight: 600;
+          border: 1px solid rgba(102, 126, 234, 0.1);
         }
 
         .loading-content {
@@ -1464,6 +1516,7 @@ export default function CampaignDetails() {
         .form-group textarea:focus {
           outline: none;
           border-color: #667eea;
+          box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
         }
 
         .form-group small {
@@ -1496,7 +1549,7 @@ export default function CampaignDetails() {
         }
 
         .btn-primary {
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          background: #7387FF;
           color: white;
         }
 
@@ -1519,6 +1572,7 @@ export default function CampaignDetails() {
         @media (max-width: 1024px) {
           .campaign-container {
             grid-template-columns: 1fr;
+            max-width: 100%;
           }
 
           .campaign-sidebar {
@@ -1528,7 +1582,11 @@ export default function CampaignDetails() {
 
         @media (max-width: 640px) {
           .campaign-details-page {
-            padding: 20px 5%;
+            padding: 20px 4%;
+          }
+
+          .campaign-container {
+            max-width: 100%;
           }
 
           .campaign-info-card,
