@@ -1,4 +1,5 @@
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -4816,6 +4817,48 @@ async def upload_file(file: UploadFile = File(...), current_user: dict = Depends
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
+
+@api_router.get("/image/{filename}")
+async def get_image(filename: str):
+    """Serve images from uploads directory with proper CORS headers"""
+    upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads")))
+    file_path = upload_dir / filename
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    if not file_path.is_file():
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # Prevent directory traversal attacks
+    if not str(file_path.resolve()).startswith(str(upload_dir.resolve())):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # Determine content type
+    suffix = file_path.suffix.lower()
+    content_types = {
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+        '.mp4': 'video/mp4',
+        '.webm': 'video/webm',
+        '.pdf': 'application/pdf'
+    }
+
+    content_type = content_types.get(suffix, 'application/octet-stream')
+
+    return FileResponse(
+        path=file_path,
+        media_type=content_type,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Cache-Control": "public, max-age=31536000"
+        }
+    )
 
 @api_router.post("/uploads")
 async def upload_campaign_file(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):

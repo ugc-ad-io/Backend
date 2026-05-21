@@ -250,7 +250,14 @@ export default function AdminGigManagement() {
                       const isImage = /\.(jpg|jpeg|png|gif|webp)$/i.test(attachment);
                       const isVideo = /\.(mp4|webm|mov)$/i.test(attachment);
                       const isPdf = /\.pdf$/i.test(attachment);
-                      const imageUrl = attachment.startsWith('http') ? attachment : `${BACKEND_URL}${attachment}`;
+
+                      let imageUrl = attachment;
+                      if (attachment.includes('/uploads/')) {
+                        const filename = attachment.split('/uploads/')[1];
+                        imageUrl = `${API}/image/${filename}`;
+                      } else if (!attachment.startsWith('http')) {
+                        imageUrl = `${API}/image/${attachment}`;
+                      }
 
                       return (
                         <div key={idx} className="agm-attachment-item">

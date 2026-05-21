@@ -1,0 +1,197 @@
+UGCAD BACKEND PROJECT STRUCTURE
+==============================
+
+backend/
+│
+├── config/
+│   └── database.js              # Database connection configuration
+│
+├── controllers/
+│   └── gigController.js         # Gig business logic (CRUD operations)
+│
+├── middleware/
+│   ├── auth.js                  # JWT authentication middleware
+│   └── errorHandler.js          # Global error handling middleware
+│
+├── models/
+│   └── Gig.js                   # MongoDB Gig schema and model
+│
+├── routes/
+│   └── gigRoutes.js             # Gig API route definitions
+│
+├── validation/
+│   └── gigValidation.js         # Joi validation schemas
+│
+├── constants/
+│   └── categories.js            # Gig categories and status enums
+│
+├── utils/
+│   └── helpers.js               # Utility helper functions
+│
+├── tests/
+│   └── gigs.test.js             # API tests for gigs endpoints
+│
+├── server.js                     # Main Express app entry point
+├── package.json                  # Dependencies and scripts
+├── .env.example                  # Environment variables template
+├── .gitignore                    # Git ignore file
+│
+├── API_DOCS.txt                 # Complete API documentation
+├── SETUP.txt                    # Setup instructions
+└── PROJECT_STRUCTURE.txt        # This file
+
+===============================================
+KEY FILES DESCRIPTION
+===============================================
+
+server.js
+---------
+Main entry point for the Express application.
+- Initializes Express app
+- Connects to MongoDB
+- Sets up middleware (CORS, JSON parsing)
+- Registers routes
+- Handles 404 errors
+- Starts the server on specified PORT
+
+models/Gig.js
+-------------
+MongoDB schema for Gigs collection.
+- Defines gig data structure with 17 fields
+- Includes validation rules
+- Creates database indexes
+- References User model for creator_id
+
+controllers/gigController.js
+-----------------------------
+Business logic for gig operations.
+- createGig: POST handler for creating new gigs
+- listGigs: GET handler with filtering and pagination
+- getGigById: GET handler for single gig
+- updateGigStatus: PATCH handler for admin status updates
+- getGigsByCreator: GET handler for creator's gigs
+
+routes/gigRoutes.js
+-------------------
+API route definitions.
+- POST /api/gigs - Create gig (auth required)
+- GET /api/gigs - List all gigs
+- GET /api/gigs/:id - Get single gig
+- GET /api/gigs/creator/:creatorId - Get creator's gigs
+- PATCH /api/gigs/:id - Update status (admin only)
+
+middleware/auth.js
+------------------
+Authentication and authorization middleware.
+- auth: Verifies JWT token
+- admin: Checks for admin role
+
+middleware/errorHandler.js
+---------------------------
+Centralized error handling.
+- Catches validation errors
+- Handles MongoDB errors
+- Returns standardized error responses
+
+validation/gigValidation.js
+----------------------------
+Joi validation schemas for request bodies and queries.
+- createGigSchema: Validates gig creation data
+- updateGigStatusSchema: Validates status updates
+- listGigsSchema: Validates query parameters
+
+constants/categories.js
+-----------------------
+Enumeration of gig categories and statuses.
+- GIGA_CATEGORIES: Available gig categories
+- GIG_STATUS: Possible gig statuses
+- CATEGORY_LABELS: Human-readable category names
+
+utils/helpers.js
+----------------
+Utility helper functions.
+- getDaysUntilDeadline: Calculate days until deadline
+- isDeadlineWithinDays: Check if deadline is soon
+- formatGigResponse: Add calculated fields to gig
+- buildGigFilter: Construct MongoDB query filter
+- getPagination: Calculate pagination parameters
+
+===============================================
+DEPENDENCIES
+===============================================
+
+Production:
+- express: Web framework
+- mongoose: MongoDB object modeling
+- cors: Cross-Origin Resource Sharing
+- dotenv: Environment variables
+- jsonwebtoken: JWT authentication
+- bcryptjs: Password hashing
+- joi: Data validation
+- express-async-errors: Async error handling
+
+Development:
+- nodemon: Auto-reload on file changes
+- jest: Testing framework
+
+===============================================
+ENVIRONMENT VARIABLES
+===============================================
+
+MONGODB_URI
+- MongoDB connection string
+- Format: mongodb://host:port/dbname
+- Example: mongodb://localhost:27017/ugcad
+
+PORT
+- Server port number
+- Default: 5000
+- Example: 5000
+
+NODE_ENV
+- Environment mode
+- Values: development, production, test
+- Default: development
+
+JWT_SECRET
+- Secret key for JWT signing
+- Should be strong and random
+- Keep secure in production
+
+===============================================
+SETUP WORKFLOW
+===============================================
+
+1. Install Node.js and MongoDB
+2. Clone repository
+3. Run: npm install
+4. Copy .env.example to .env
+5. Configure MongoDB URI in .env
+6. Run: npm run dev
+7. API available at http://localhost:5000
+
+===============================================
+DEVELOPMENT WORKFLOW
+===============================================
+
+1. Make changes to code
+2. Nodemon automatically restarts server
+3. Test endpoints with Postman/curl
+4. Check logs for errors
+5. Make database queries if needed
+6. Commit changes to git
+
+===============================================
+DEPLOYMENT NOTES
+===============================================
+
+- Set NODE_ENV=production
+- Use strong JWT_SECRET
+- Configure production MongoDB URI
+- Set proper CORS origins
+- Use environment-specific error handling
+- Enable logging and monitoring
+- Set up backup strategies
+- Use process manager (PM2, systemd)
+
+===============================================

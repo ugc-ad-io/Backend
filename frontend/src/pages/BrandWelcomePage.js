@@ -665,12 +665,21 @@ export default function BrandWelcomePage() {
                       <div key={gig.id} className="gig-card-welcome" onClick={() => navigate(`/browse-approved-gigs`)}>
                         {gig.attachments && gig.attachments.length > 0 && (
                           <div className="gig-media-preview">
-                            <img
-                              src={gig.attachments[0].startsWith('http') ? gig.attachments[0] : `${BACKEND_URL}${gig.attachments[0]}`}
-                              alt="Gig preview"
-                              className="gig-preview-image"
-                              onError={(e) => {e.target.src = 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22100%22 height=%22100%22%3E%3Crect fill=%22%23f0f0f0%22 width=%22100%22 height=%22100%22/%3E%3C/svg%3E';}}
-                            />
+                            {(() => {
+                              let imageUrl = gig.attachments[0];
+                              if (gig.attachments[0].includes('/uploads/')) {
+                                const filename = gig.attachments[0].split('/uploads/')[1];
+                                imageUrl = `${API}/image/${filename}`;
+                              }
+                              return (
+                                <img
+                                  src={imageUrl}
+                                  alt="Gig preview"
+                                  className="gig-preview-image"
+                                  onError={(e) => {e.target.src = 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22100%22 height=%22100%22%3E%3Crect fill=%22%23f0f0f0%22 width=%22100%22 height=%22100%22/%3E%3C/svg%3E';}}
+                                />
+                              );
+                            })()}
                             {gig.attachments.length > 1 && (
                               <div className="attachment-more">+{gig.attachments.length - 1}</div>
                             )}
