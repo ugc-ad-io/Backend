@@ -5888,11 +5888,6 @@ app.include_router(applications_router)
 app.include_router(gigs_router)
 app.include_router(api_router)
 
-# Mount static files for uploads
-upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads")))
-upload_dir.mkdir(exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=str(upload_dir)), name="uploads")
-
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -5900,6 +5895,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount static files for uploads
+upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads")))
+upload_dir.mkdir(exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(upload_dir)), name="uploads")
 
 logging.basicConfig(
     level=logging.INFO,
