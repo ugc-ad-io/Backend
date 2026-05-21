@@ -5931,6 +5931,22 @@ app.include_router(applications_router)
 app.include_router(gigs_router)
 app.include_router(api_router)
 
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class UploadsCORSMiddleware(BaseHTTPMiddleware):
+    """Add CORS headers to uploads directory responses"""
+    async def dispatch(self, request, call_next):
+        if request.url.path.startswith("/uploads"):
+            response = await call_next(request)
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "*"
+            response.headers["Cache-Control"] = "public, max-age=31536000"
+            return response
+        return await call_next(request)
+
+app.add_middleware(UploadsCORSMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
