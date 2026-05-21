@@ -25,6 +25,8 @@ security = HTTPBearer()
 
 JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key-change-in-production')
 JWT_ALGORITHM = 'HS256'
+BASE_URL = os.environ.get('BASE_URL', 'https://backend-chq9.onrender.com')
+API_IMAGE_ENDPOINT = f"{BASE_URL}/api/image"
 
 # ============================================================================
 # ENUMS
@@ -165,8 +167,18 @@ async def get_admin_user(user: dict = Depends(get_current_user)) -> dict:
 # HELPER FUNCTIONS
 # ============================================================================
 
-def normalize_gig_response(gig: dict, creator_info: dict = None) -> GigResponse:
+def normalize_gig_response(gig: dict, creator_info: dict = None, base_url: str = None) -> GigResponse:
     """Convert MongoDB gig to response format"""
+    # Reconstruct full URLs for attachments
+    base_url = base_url or "https://backend-chq9.onrender.com/api/image"
+    attachments = []
+    for attachment in (gig.get("attachments", []) or []):
+        if attachment.startswith('http'):
+            attachments.append(attachment)
+        else:
+            # Reconstruct full URL from filename
+            attachments.append(f"{base_url}/{attachment}")
+
     return GigResponse(
         id=gig.get("id"),
         title=gig.get("title"),
@@ -178,7 +190,7 @@ def normalize_gig_response(gig: dict, creator_info: dict = None) -> GigResponse:
         creator_id=gig.get("creator_id"),
         creator_name=creator_info.get("name") if creator_info else None,
         creator_email=creator_info.get("email") if creator_info else None,
-        attachments=gig.get("attachments", []),
+        attachments=attachments,
         requirements=gig.get("requirements"),
         target_audience=gig.get("target_audience"),
         skills_required=gig.get("skills_required", []),
@@ -212,6 +224,17 @@ async def create_gig(
     gig_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
+    # Extract filename from URLs if full URLs are provided
+    attachments = []
+    for url in (gig_data.attachments or []):
+        if url.startswith('http'):
+            # Extract filename from full URL
+            filename = url.split('/')[-1]
+            attachments.append(filename)
+        else:
+            # Already just filename
+            attachments.append(url)
+
     gig = {
         "id": gig_id,
         "title": gig_data.title,
@@ -221,7 +244,7 @@ async def create_gig(
         "deadline": gig_data.deadline.isoformat(),
         "status": GigStatus.PENDING_APPROVAL.value,
         "creator_id": current_user.get("id"),
-        "attachments": gig_data.attachments or [],
+        "attachments": attachments,
         "requirements": gig_data.requirements,
         "target_audience": gig_data.target_audience,
         "skills_required": gig_data.skills_required or [],
@@ -237,7 +260,7 @@ async def create_gig(
     return normalize_gig_response(gig, {
         "name": current_user.get("name"),
         "email": current_user.get("email")
-    })
+    }, API_IMAGE_ENDPOINT)
 
 @gigs_router.get("/", response_model=GigListResponse)
 async def list_gigs(
@@ -292,7 +315,7 @@ async def list_gigs(
     gig_responses = []
     for gig in gigs:
         creator = await db.users.find_one({"id": gig.get("creator_id")}, {"_id": 0, "name": 1, "email": 1})
-        gig_responses.append(normalize_gig_response(gig, creator or {}))
+        gig_responses.append(normalize_gig_response(gig, creator or {}, API_IMAGE_ENDPOINT))
 
     return GigListResponse(
         data=gig_responses,
@@ -323,7 +346,7 @@ async def get_gig(gig_id: str) -> GigResponse:
     # Get creator info
     creator = await db.users.find_one({"id": gig.get("creator_id")}, {"_id": 0, "name": 1, "email": 1})
 
-    return normalize_gig_response(gig, creator or {})
+    return normalize_gig_response(gig, creator or {}, API_IMAGE_ENDPOINT)
 
 @gigs_router.patch("/{gig_id}", status_code=200)
 async def update_gig_status(
@@ -377,7 +400,7 @@ async def update_gig_status(
         return {
             "success": True,
             "message": "Gig approved successfully",
-            "data": normalize_gig_response(updated_gig)
+            "data": normalize_gig_response(updated_gig, {}, API_IMAGE_ENDPOINT)
         }
 
     elif action == "reject":
@@ -396,7 +419,7 @@ async def update_gig_status(
         return {
             "success": True,
             "message": "Gig rejected successfully",
-            "data": normalize_gig_response(updated_gig)
+            "data": normalize_gig_response(updated_gig, {}, API_IMAGE_ENDPOINT)
         }
 
 @gigs_router.get("/creator/{creator_id}")
@@ -436,7 +459,7 @@ async def get_creator_gigs(
     # Get creator info
     creator = await db.users.find_one({"id": creator_id}, {"_id": 0, "name": 1, "email": 1})
 
-    gig_responses = [normalize_gig_response(gig, creator or {}) for gig in gigs]
+    gig_responses = [normalize_gig_response(gig, creator or {}, API_IMAGE_ENDPOINT) for gig in gigs]
 
     return GigListResponse(
         data=gig_responses,
