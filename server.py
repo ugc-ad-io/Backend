@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Query
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
@@ -2802,20 +2802,39 @@ async def upload_profile_photo(file: UploadFile = File(...), current_user: dict 
         raise HTTPException(status_code=500, detail=f"Failed to upload photo: {str(e)}")
 
 @api_router.put("/profile/update-info")
-async def update_profile_info(bio: Optional[str] = None, description: Optional[str] = None, current_user: dict = Depends(get_current_user)):
-    """Update basic profile information without affecting approval status"""
+async def update_profile_info(
+    bio: Optional[str] = None,
+    description: Optional[str] = None,
+    gender: Optional[str] = None,
+    language: Optional[List[str]] = Query(default=None),
+    country: Optional[str] = None,
+    age_range: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """Update basic profile information without affecting approval status.
+    `language` accepts multiple values, e.g. ?language=English&language=Hindi
+    """
     update_data = {"updated_at": datetime.now(timezone.utc).isoformat()}
-    
+
     if bio is not None:
         update_data["bio"] = bio
     if description is not None:
         update_data["description"] = description
-    
+    if gender is not None:
+        update_data["gender"] = gender
+    if language is not None:
+        # Filter out empty strings (form may send "" when nothing selected)
+        update_data["language"] = [l for l in language if l and l.strip()]
+    if country is not None:
+        update_data["country"] = country
+    if age_range is not None:
+        update_data["age_range"] = age_range
+
     await db.users.update_one(
         {"id": current_user['id']},
         {"$set": update_data}
     )
-    
+
     return {"message": "Profile updated successfully"}
 
 @api_router.post("/profile/change-password")
