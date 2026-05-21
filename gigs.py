@@ -165,8 +165,12 @@ async def get_admin_user(user: dict = Depends(get_current_user)) -> dict:
 # HELPER FUNCTIONS
 # ============================================================================
 
-def normalize_gig_response(gig: dict, creator_info: dict = None) -> GigResponse:
+def normalize_gig_response(gig: dict, creator_info: dict = None, base_url: str = None) -> GigResponse:
     """Convert MongoDB gig to response format"""
+    # Return attachments as-is (they should be full URLs from uploads)
+    # The frontend will use them directly without modification
+    attachments = gig.get("attachments", []) or []
+
     return GigResponse(
         id=gig.get("id"),
         title=gig.get("title"),
@@ -178,7 +182,7 @@ def normalize_gig_response(gig: dict, creator_info: dict = None) -> GigResponse:
         creator_id=gig.get("creator_id"),
         creator_name=creator_info.get("name") if creator_info else None,
         creator_email=creator_info.get("email") if creator_info else None,
-        attachments=gig.get("attachments", []),
+        attachments=attachments,
         requirements=gig.get("requirements"),
         target_audience=gig.get("target_audience"),
         skills_required=gig.get("skills_required", []),
@@ -212,6 +216,17 @@ async def create_gig(
     gig_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
+    # Extract filename from URLs if full URLs are provided
+    attachments = []
+    for url in (gig_data.attachments or []):
+        if url.startswith('http'):
+            # Extract filename from full URL
+            filename = url.split('/')[-1]
+            attachments.append(filename)
+        else:
+            # Already just filename
+            attachments.append(url)
+
     gig = {
         "id": gig_id,
         "title": gig_data.title,
@@ -221,7 +236,7 @@ async def create_gig(
         "deadline": gig_data.deadline.isoformat(),
         "status": GigStatus.PENDING_APPROVAL.value,
         "creator_id": current_user.get("id"),
-        "attachments": gig_data.attachments or [],
+        "attachments": attachments,
         "requirements": gig_data.requirements,
         "target_audience": gig_data.target_audience,
         "skills_required": gig_data.skills_required or [],
