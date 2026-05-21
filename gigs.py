@@ -216,16 +216,8 @@ async def create_gig(
     gig_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
-    # Extract filename from URLs if full URLs are provided
-    attachments = []
-    for url in (gig_data.attachments or []):
-        if url.startswith('http'):
-            # Extract filename from full URL
-            filename = url.split('/')[-1]
-            attachments.append(filename)
-        else:
-            # Already just filename
-            attachments.append(url)
+    # Store attachment URLs as-is (frontend expects full URLs)
+    attachments = gig_data.attachments or []
 
     gig = {
         "id": gig_id,
