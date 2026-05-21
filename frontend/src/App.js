@@ -1,21 +1,34 @@
 import { useState, useEffect, createContext, useContext } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import axios from 'axios';
-import '@/App.css';
+import './App.css';
 import Landing from './pages/Landing';
 import Auth from './pages/Auth';
 import CreatorProfileSetup from './pages/CreatorProfileSetup';
 import BusinessProfileSetup from './pages/BusinessProfileSetup';
 import CreatorDashboard from './pages/CreatorDashboard';
 import BusinessDashboard from './pages/BusinessDashboard';
+import BrandWelcomePage from './pages/BrandWelcomePage';
 import AdminDashboard from './pages/AdminDashboard';
 import ProfileSettings from './pages/ProfileSettings';
 import CampaignDetails from './pages/CampaignDetails';
+import MessagesPage from './pages/MessagesPage';
 import ChatPage from './pages/ChatPage';
 import WorkSubmission from './pages/WorkSubmission';
 import WorkReview from './pages/WorkReview';
-import WithdrawalPage from './pages/WithdrawalPage';
+import PayoutWithLayout from './pages/PayoutWithLayout';
 import ShipmentTracking from './pages/ShipmentTracking';
+import BrowseBriefs from './pages/BrowseBriefs';
+import MyDealsPage from './pages/MyDealsPage';
+import MyBidsPage from './pages/MyBidsPage';
+import MyActiveWorkPage from './pages/MyActiveWorkPage';
+import ReviewsPage from './pages/ReviewsPage';
+import PortfolioPage from './pages/PortfolioPage';
+import CreateGig from './pages/CreateGig';
+import AdminGigManagement from './pages/AdminGigManagement';
+import BrowseApprovedGigs from './pages/BrowseApprovedGigs';
+import ApplicationsPage from './pages/ApplicationsPage';
+import AdminLayout from './components/AdminLayout';
 import { Toaster } from 'sonner';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
@@ -122,10 +135,138 @@ function App() {
               }
             />
             <Route
+              path="/browse-briefs"
+              element={
+                <ProtectedRoute allowedRoles={['creator']}>
+                  <BrowseBriefs />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/my-deals"
+              element={
+                <ProtectedRoute allowedRoles={['creator']}>
+                  <MyDealsPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/my-bids"
+              element={
+                <ProtectedRoute allowedRoles={['creator']}>
+                  <MyBidsPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/my-active-work"
+              element={
+                <ProtectedRoute allowedRoles={['creator']}>
+                  <MyActiveWorkPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/reviews"
+              element={
+                <ProtectedRoute allowedRoles={['creator']}>
+                  <ReviewsPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/portfolio"
+              element={
+                <ProtectedRoute allowedRoles={['creator']}>
+                  <PortfolioPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/create-gig"
+              element={
+                <ProtectedRoute allowedRoles={['creator']}>
+                  <CreateGig />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/brand-home"
+              element={
+                <ProtectedRoute allowedRoles={['business']}>
+                  <BrandWelcomePage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
               path="/dashboard/business"
               element={
                 <ProtectedRoute allowedRoles={['business']}>
-                  <BusinessDashboard />
+                  <BusinessDashboard page="overview" />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/business/all-campaigns"
+              element={
+                <ProtectedRoute allowedRoles={['business']}>
+                  <BusinessDashboard page="all-campaigns" />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/business/post-brief"
+              element={
+                <ProtectedRoute allowedRoles={['business']}>
+                  <BusinessDashboard page="post-brief" />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/business/pending-bids"
+              element={
+                <ProtectedRoute allowedRoles={['business']}>
+                  <BusinessDashboard page="pending-bids" />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/business/browse-creator"
+              element={
+                <ProtectedRoute allowedRoles={['business']}>
+                  <BusinessDashboard page="browse-creator" />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/browse-approved-gigs"
+              element={
+                <ProtectedRoute allowedRoles={['business']}>
+                  <BrowseApprovedGigs />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/business/work-review"
+              element={
+                <ProtectedRoute allowedRoles={['business']}>
+                  <BusinessDashboard page="work-review" />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/business/shipments"
+              element={
+                <ProtectedRoute allowedRoles={['business']}>
+                  <BusinessDashboard page="shipments" />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/business/wallet"
+              element={
+                <ProtectedRoute allowedRoles={['business']}>
+                  <BusinessDashboard page="wallet" />
                 </ProtectedRoute>
               }
             />
@@ -138,10 +279,44 @@ function App() {
               }
             />
             <Route
+              path="/dashboard/admin/:adminPage"
+              element={
+                <ProtectedRoute allowedRoles={['admin', 'campaign_manager', 'support_staff']}>
+                  <AdminDashboard />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/admin/applications"
+              element={
+                <ProtectedRoute allowedRoles={['admin', 'campaign_manager', 'support_staff']}>
+                  <AdminLayout isApplicationsPage={true}>
+                    <ApplicationsPage />
+                  </AdminLayout>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/admin/gig-management"
+              element={
+                <ProtectedRoute allowedRoles={['admin', 'campaign_manager', 'support_staff']}>
+                  <AdminGigManagement />
+                </ProtectedRoute>
+              }
+            />
+            <Route
               path="/campaign/:id"
               element={
                 <ProtectedRoute>
                   <CampaignDetails />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/messages"
+              element={
+                <ProtectedRoute allowedRoles={['creator', 'business']}>
+                  <MessagesPage />
                 </ProtectedRoute>
               }
             />
@@ -162,7 +337,7 @@ function App() {
               }
             />
             <Route
-              path="/work/review"
+              path="/work-review/:id"
               element={
                 <ProtectedRoute allowedRoles={['business']}>
                   <WorkReview />
@@ -173,7 +348,7 @@ function App() {
               path="/withdrawal"
               element={
                 <ProtectedRoute allowedRoles={['creator']}>
-                  <WithdrawalPage />
+                  <PayoutWithLayout />
                 </ProtectedRoute>
               }
             />

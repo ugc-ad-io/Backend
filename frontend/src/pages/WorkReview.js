@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '../App';
 import axios from 'axios';
 import { toast } from 'sonner';
@@ -9,8 +9,7 @@ const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
 export default function WorkReview() {
-  const [searchParams] = useSearchParams();
-  const workId = searchParams.get('work');
+  const { id: workId } = useParams();
   const navigate = useNavigate();
   const { user } = useAuth();
   const [work, setWork] = useState(null);
@@ -22,22 +21,21 @@ export default function WorkReview() {
   const [revisionFeedback, setRevisionFeedback] = useState('');
 
   useEffect(() => {
-    // Mock work data - in real app, fetch from API
-    setWork({
-      id: workId,
-      campaign_id: 'camp123',
-      campaign_title: 'T-Shirt UGC Campaign',
-      creator_id: 'creator123',
-      creator_nickname: '@CreativeUser',
-      work_files: [
-        'https://storage.example.com/work/video1.mp4',
-        'https://storage.example.com/work/image1.jpg'
-      ],
-      description: 'Created engaging content showcasing the product features',
-      status: 'submitted',
-      submitted_at: new Date().toISOString()
-    });
-    setLoading(false);
+    const fetchWork = async () => {
+      try {
+        const response = await axios.get(`${API}/work/${workId}`);
+        setWork(response.data);
+      } catch (error) {
+        console.error('Failed to fetch work:', error);
+        toast.error('Failed to load work submission');
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    if (workId) {
+      fetchWork();
+    }
   }, [workId]);
 
   const handleApprove = async () => {
@@ -114,7 +112,7 @@ export default function WorkReview() {
                   {file.includes('video') ? '🎥' : '🖼️'}
                 </div>
                 <p className="file-name">{file.split('/').pop()}</p>
-                <a href={file} target="_blank" rel="noopener noreferrer" className="view-link">
+                <a href={file.startsWith('http') ? file : `${BACKEND_URL}${file}`} target="_blank" rel="noopener noreferrer" className="view-link">
                   View File
                 </a>
               </div>

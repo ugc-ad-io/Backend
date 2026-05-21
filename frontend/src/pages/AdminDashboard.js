@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '../App';
 import axios from 'axios';
 import { toast } from 'sonner';
-import { Users, Briefcase, LogOut, CheckCircle, XCircle, TrendingUp, MessageSquare, CreditCard, DollarSign, Bell, Mail, Phone, UserPlus, BarChart, Download } from 'lucide-react';
+import { Users, Briefcase, LogOut, CheckCircle, XCircle, TrendingUp, MessageSquare, CreditCard, DollarSign, Bell, Mail, Phone, UserPlus, BarChart, Download, FileText } from 'lucide-react';
+import AdminSidebar from '../components/AdminSidebar';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -11,10 +12,29 @@ const API = `${BACKEND_URL}/api`;
 export default function AdminDashboard() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
-  const [activeTab, setActiveTab] = useState('stats');
+  const { adminPage } = useParams();
+  const tabSlugToId = {
+    overview: 'stats',
+    profiles: 'profiles',
+    campaigns: 'campaigns',
+    withdrawals: 'withdrawals',
+    'all-campaigns': 'allcampaigns',
+    applications: 'applications',
+    users: 'users',
+    assignments: 'assignments',
+    chats: 'chats',
+    payments: 'payments',
+    notifications: 'notifications',
+    broadcast: 'broadcast',
+    staff: 'staff',
+    analytics: 'analytics'
+  };
+  const tabIdToSlug = Object.fromEntries(Object.entries(tabSlugToId).map(([slug, id]) => [id, slug]));
+  const [activeTab, setActiveTab] = useState(tabSlugToId[adminPage] || 'stats');
   const [stats, setStats] = useState(null);
   const [pendingProfiles, setPendingProfiles] = useState([]);
   const [pendingCampaigns, setPendingCampaigns] = useState([]);
+  const [pendingGigs, setPendingGigs] = useState([]);
   const [allUsers, setAllUsers] = useState([]);
   const [pendingWithdrawals, setPendingWithdrawals] = useState([]);
   const [allCampaigns, setAllCampaigns] = useState([]);
@@ -75,19 +95,62 @@ export default function AdminDashboard() {
     invite_mode: 'direct',
     permissions: []
   });
+  const [creatorApplications, setCreatorApplications] = useState([]);
+  const [brandApplications, setBrandApplications] = useState([]);
+  const [applicationViewType, setApplicationViewType] = useState('creator');
+  const [applicationFilters, setApplicationFilters] = useState({
+    state: '',
+    category: '',
+    startDate: '',
+    endDate: ''
+  });
+  const [selectedApplication, setSelectedApplication] = useState(null);
+  const [showApplicationDetail, setShowApplicationDetail] = useState(false);
+  const [applicationDetailLoading, setApplicationDetailLoading] = useState(false);
+  const [showMoreInfoModal, setShowMoreInfoModal] = useState(false);
+  const [moreInfoFormData, setMoreInfoFormData] = useState({
+    request_type: 'clarification',
+    message: '',
+    required_fields: [],
+    deadline_days: 3,
+    priority: 'medium'
+  });
+  const [rejectFormData, setRejectFormData] = useState({
+    reason_code: '',
+    reason_details: ''
+  });
 
   useEffect(() => {
     fetchStats();
     fetchPendingProfiles();
     fetchPendingCampaigns();
+    fetchPendingGigs();
     fetchPendingWithdrawals();
     fetchAllCampaigns();
     fetchCampaignAssignments();
+    fetchApplications();
     if (user?.role === 'admin') {
       fetchAllUsers();
       fetchAnalytics();
     }
   }, []);
+
+  useEffect(() => {
+    const nextTab = tabSlugToId[adminPage] || 'stats';
+    setActiveTab(nextTab);
+
+    if (nextTab === 'chats') fetchAllChats();
+    if (nextTab === 'payments') {
+      fetchPaymentGateways();
+      fetchPaymentTransactions();
+    }
+    if (nextTab === 'notifications') {
+      fetchNotificationGateways();
+      fetchNotificationLogs();
+    }
+    if (nextTab === 'staff') fetchStaff();
+    if (nextTab === 'analytics') fetchAnalytics();
+  }, [adminPage]);
 
   const fetchPendingWithdrawals = async () => {
     try {
@@ -113,6 +176,94 @@ export default function AdminDashboard() {
       setCampaignAssignments(response.data);
     } catch (error) {
       console.error('Failed to load campaign assignments');
+    }
+  };
+
+  const fetchApplications = async () => {
+    try {
+      const creatorRes = await axios.get(`${API}/admin/applications/creators`);
+      const brandRes = await axios.get(`${API}/admin/applications/brands`);
+      setCreatorApplications(creatorRes.data.data || creatorRes.data);
+      setBrandApplications(brandRes.data.data || brandRes.data);
+    } catch (error) {
+      console.error('Failed to load applications:', error);
+      toast.error('Failed to load applications');
+    }
+  };
+
+  const fetchApplicationDetail = async (applicationId, type) => {
+    try {
+      setApplicationDetailLoading(true);
+      const endpoint = type === 'creator'
+        ? `/admin/applications/creators/${applicationId}`
+        : `/admin/applications/brands/${applicationId}`;
+      const response = await axios.get(`${API}${endpoint}`);
+      setSelectedApplication({...response.data, type});
+    } catch (error) {
+      console.error('Failed to load application detail:', error);
+      toast.error('Failed to load application details');
+    } finally {
+      setApplicationDetailLoading(false);
+    }
+  };
+
+  const handleApproveApplication = async (applicationId, type) => {
+    try {
+      const endpoint = type === 'creator'
+        ? `/admin/applications/creators/${applicationId}/approve`
+        : `/admin/applications/brands/${applicationId}/approve`;
+      await axios.post(`${API}${endpoint}`, {
+        notes: 'Approved by admin'
+      });
+      toast.success('Application approved successfully');
+      setShowApplicationDetail(false);
+      fetchApplications();
+    } catch (error) {
+      console.error('Failed to approve application:', error);
+      toast.error(error.response?.data?.detail || 'Failed to approve application');
+    }
+  };
+
+  const handleRejectApplication = async (applicationId, type) => {
+    try {
+      if (!rejectFormData.reason_code) {
+        toast.error('Please select a rejection reason');
+        return;
+      }
+      const endpoint = type === 'creator'
+        ? `/admin/applications/creators/${applicationId}/reject`
+        : `/admin/applications/brands/${applicationId}/reject`;
+      await axios.post(`${API}${endpoint}`, {
+        reason_code: rejectFormData.reason_code,
+        reason_details: rejectFormData.reason_details
+      });
+      toast.success('Application rejected successfully');
+      setShowApplicationDetail(false);
+      setRejectFormData({reason_code: '', reason_details: ''});
+      fetchApplications();
+    } catch (error) {
+      console.error('Failed to reject application:', error);
+      toast.error(error.response?.data?.detail || 'Failed to reject application');
+    }
+  };
+
+  const handleRequestMoreInfo = async (applicationId, type) => {
+    try {
+      if (!moreInfoFormData.message) {
+        toast.error('Please enter a message');
+        return;
+      }
+      const endpoint = type === 'creator'
+        ? `/admin/applications/creators/${applicationId}/request-more-info`
+        : `/admin/applications/brands/${applicationId}/request-more-info`;
+      await axios.post(`${API}${endpoint}`, moreInfoFormData);
+      toast.success('More info request sent to applicant');
+      setShowMoreInfoModal(false);
+      setMoreInfoFormData({request_type: 'clarification', message: '', required_fields: [], deadline_days: 3, priority: 'medium'});
+      fetchApplicationDetail(applicationId, type);
+    } catch (error) {
+      console.error('Failed to send more info request:', error);
+      toast.error(error.response?.data?.detail || 'Failed to send request');
     }
   };
 
@@ -142,6 +293,16 @@ export default function AdminDashboard() {
       setPendingCampaigns(response.data);
     } catch (error) {
       toast.error('Failed to load pending campaigns');
+    }
+  };
+
+  const fetchPendingGigs = async () => {
+    try {
+      const response = await axios.get(`${API}/gigs?status=pending_approval`);
+      const gigs = response.data?.data || response.data || [];
+      setPendingGigs(gigs);
+    } catch (error) {
+      console.error('Failed to load pending gigs:', error);
     }
   };
 
@@ -603,8 +764,43 @@ export default function AdminDashboard() {
     navigate('/');
   };
 
+  const adminTabs = [
+    { id: 'stats', label: 'Admin Dashboard', icon: TrendingUp, testId: 'tab-stats', slug: 'overview' },
+    { id: 'applications', label: 'Applications', icon: FileText, testId: 'tab-applications', slug: 'applications' },
+    { id: 'profiles', label: `Profiles (${pendingProfiles.length})`, icon: Users, testId: 'tab-profiles', slug: 'profiles' },
+    { id: 'campaigns', label: `Campaigns (${pendingCampaigns.length})`, icon: Briefcase, testId: 'tab-campaigns', slug: 'campaigns' },
+    { id: 'gigs', label: `Gig Management (${pendingGigs.length})`, icon: Briefcase, testId: 'tab-gigs', slug: 'gigs' },
+    { id: 'withdrawals', label: `Withdrawals (${pendingWithdrawals.length})`, icon: Briefcase, testId: 'tab-withdrawals', slug: 'withdrawals' },
+    { id: 'allcampaigns', label: 'All Campaigns', icon: Briefcase, testId: 'tab-allcampaigns', slug: 'all-campaigns' },
+    ...(user?.role === 'admin' ? [
+      { id: 'users', label: 'All Users', icon: Users, testId: 'tab-users', slug: 'users' },
+      { id: 'assignments', label: 'Campaign Assignments', icon: Briefcase, testId: 'tab-assignments', slug: 'assignments' },
+      { id: 'chats', label: 'Chat Monitoring', icon: MessageSquare, testId: 'tab-chats', slug: 'chats', onOpen: fetchAllChats },
+      { id: 'payments', label: 'Payment Gateways', icon: CreditCard, testId: 'tab-payments', slug: 'payments', onOpen: () => { fetchPaymentGateways(); fetchPaymentTransactions(); } },
+      { id: 'notifications', label: 'Notifications', icon: Bell, testId: 'tab-notifications', slug: 'notifications', onOpen: () => { fetchNotificationGateways(); fetchNotificationLogs(); } },
+      { id: 'broadcast', label: 'Broadcast', icon: MessageSquare, testId: 'tab-broadcast', slug: 'broadcast' },
+      { id: 'staff', label: 'Staff Management', icon: UserPlus, testId: 'tab-staff', slug: 'staff', onOpen: fetchStaff },
+      { id: 'analytics', label: 'Analytics', icon: BarChart, testId: 'tab-analytics', slug: 'analytics', onOpen: fetchAnalytics }
+    ] : [])
+  ];
+
+  const handleAdminTabClick = (tab) => {
+    if (tab.id === 'applications') {
+      navigate('/dashboard/admin/applications');
+    } else if (tab.id === 'gigs') {
+      navigate('/dashboard/admin/gig-management');
+    } else {
+      setActiveTab(tab.id);
+      tab.onOpen?.();
+      navigate(`/dashboard/admin/${tab.slug || tabIdToSlug[tab.id] || 'overview'}`);
+    }
+  };
+
   return (
     <div className="admin-dashboard">
+      <AdminSidebar activeTab={activeTab} onTabClick={handleAdminTabClick} user={user} />
+
+      <main className="admin-main">
       <div className="dashboard-header">
         <div className="header-content">
           <div>
@@ -662,166 +858,63 @@ export default function AdminDashboard() {
             </div>
           </div>
         )}
-        
-        <div className="tabs">
-          <button
-            className={`tab ${activeTab === 'stats' ? 'active' : ''}`}
-            onClick={() => setActiveTab('stats')}
-            data-testid="tab-stats"
-          >
-            <TrendingUp size={20} /> Overview
-          </button>
-          <button
-            className={`tab ${activeTab === 'profiles' ? 'active' : ''}`}
-            onClick={() => setActiveTab('profiles')}
-            data-testid="tab-profiles"
-          >
-            <Users size={20} /> Profiles ({pendingProfiles.length})
-          </button>
-          <button
-            className={`tab ${activeTab === 'campaigns' ? 'active' : ''}`}
-            onClick={() => setActiveTab('campaigns')}
-            data-testid="tab-campaigns"
-          >
-            <Briefcase size={20} /> Campaigns ({pendingCampaigns.length})
-          </button>
-          <button
-            className={`tab ${activeTab === 'withdrawals' ? 'active' : ''}`}
-            onClick={() => setActiveTab('withdrawals')}
-            data-testid="tab-withdrawals"
-          >
-            <Briefcase size={20} /> Withdrawals ({pendingWithdrawals.length})
-          </button>
-          <button
-            className={`tab ${activeTab === 'allcampaigns' ? 'active' : ''}`}
-            onClick={() => setActiveTab('allcampaigns')}
-            data-testid="tab-allcampaigns"
-          >
-            <Briefcase size={20} /> All Campaigns
-          </button>
-          {user?.role === 'admin' && (
-            <>
-              <button
-                className={`tab ${activeTab === 'users' ? 'active' : ''}`}
-                onClick={() => setActiveTab('users')}
-                data-testid="tab-users"
-              >
-                <Users size={20} /> All Users
-              </button>
-              <button
-                className={`tab ${activeTab === 'assignments' ? 'active' : ''}`}
-                onClick={() => setActiveTab('assignments')}
-                data-testid="tab-assignments"
-              >
-                <Briefcase size={20} /> Campaign Assignments
-              </button>
-              <button
-                className={`tab ${activeTab === 'chats' ? 'active' : ''}`}
-                onClick={() => {
-                  setActiveTab('chats');
-                  fetchAllChats();
-                }}
-                data-testid="tab-chats"
-              >
-                <MessageSquare size={20} /> Chat Monitoring
-              </button>
-              <button
-                className={`tab ${activeTab === 'payments' ? 'active' : ''}`}
-                onClick={() => {
-                  setActiveTab('payments');
-                  fetchPaymentGateways();
-                  fetchPaymentTransactions();
-                }}
-                data-testid="tab-payments"
-              >
-                <CreditCard size={20} /> Payment Gateways
-              </button>
-              <button
-                className={`tab ${activeTab === 'notifications' ? 'active' : ''}`}
-                onClick={() => {
-                  setActiveTab('notifications');
-                  fetchNotificationGateways();
-                  fetchNotificationLogs();
-                }}
-                data-testid="tab-notifications"
-              >
-                <Bell size={20} /> Notifications
-              </button>
-              <button
-                className={`tab ${activeTab === 'broadcast' ? 'active' : ''}`}
-                onClick={() => setActiveTab('broadcast')}
-                data-testid="tab-broadcast"
-              >
-                <MessageSquare size={20} /> Broadcast
-              </button>
-              <button
-                className={`tab ${activeTab === 'staff' ? 'active' : ''}`}
-                onClick={() => {
-                  setActiveTab('staff');
-                  fetchStaff();
-                }}
-                data-testid="tab-staff"
-              >
-                <UserPlus size={20} /> Staff Management
-              </button>
-              <button
-                className={`tab ${activeTab === 'analytics' ? 'active' : ''}`}
-                onClick={() => {
-                  setActiveTab('analytics');
-                  fetchAnalytics();
-                }}
-                data-testid="tab-analytics"
-              >
-                <BarChart size={20} /> Analytics
-              </button>
-            </>
-          )}
-        </div>
-
         <div className="tab-content">
           {activeTab === 'stats' && stats && (
-            <div className="stats-section fade-in">
-              <h2>Platform Statistics</h2>
-              <div className="stats-grid">
-                <div className="stat-card">
-                  <div className="stat-icon">
-                    <Users size={32} />
-                  </div>
-                  <div>
-                    <p className="stat-label">Total Users</p>
-                    <p className="stat-value">{stats.total_users}</p>
-                  </div>
+            <div className="operator-dashboard fade-in">
+              <section className="operator-section priority">
+                <div className="operator-section-head">
+                  <h3>SLA-at-risk items</h3>
+                  <span>Top priority</span>
                 </div>
-                <div className="stat-card">
-                  <div className="stat-icon">
-                    <Users size={32} />
-                  </div>
-                  <div>
-                    <p className="stat-label">Pending Profiles</p>
-                    <p className="stat-value">{stats.pending_profiles}</p>
-                  </div>
+                <div className="operator-risk-list">
+                  <div><strong>{pendingWithdrawals.length}</strong><span>Disputes with &lt;4 hours to SLA breach</span></div>
+                  <div><strong>0</strong><span>Shipping label requests older than 4 hours</span></div>
+                  <div><strong>{pendingProfiles.length}</strong><span>Applications in review &gt;2 business days</span></div>
+                  <div><strong>{pendingCampaigns.length}</strong><span>Deals auto-transitioning within 24 hours</span></div>
                 </div>
-                <div className="stat-card">
-                  <div className="stat-icon">
-                    <Briefcase size={32} />
-                  </div>
-                  <div>
-                    <p className="stat-label">Pending Campaigns</p>
-                    <p className="stat-value">{stats.pending_campaigns}</p>
-                  </div>
+              </section>
+
+              <section className="operator-section">
+                <div className="operator-section-head">
+                  <h3>Activity today</h3>
+                  <span>Live queue</span>
                 </div>
-                <div className="stat-card">
-                  <div className="stat-icon">
-                    <Briefcase size={32} />
-                  </div>
-                  <div>
-                    <p className="stat-label">Active Campaigns</p>
-                    <p className="stat-value">{stats.active_campaigns}</p>
-                  </div>
+                <div className="operator-metric-grid">
+                  <div><span>New applications</span><strong>{stats.pending_profiles}</strong><small>Creators + brands</small></div>
+                  <div><span>New deals accepted</span><strong>{analytics?.active_campaigns || stats.active_campaigns}</strong><small>Today</small></div>
+                  <div><span>Deals completed</span><strong>{analytics?.completed_campaigns || 0}</strong><small>Today</small></div>
+                  <div><span>Active disputes</span><strong>{pendingWithdrawals.length}</strong><small>Needs review</small></div>
                 </div>
-              </div>
+              </section>
+
+              <section className="operator-section">
+                <div className="operator-section-head">
+                  <h3>Key metrics</h3>
+                  <span>Platform health</span>
+                </div>
+                <div className="operator-metric-grid">
+                  <div><span>Deals in progress</span><strong>{stats.active_campaigns}</strong><small>State distribution pending backend</small></div>
+                  <div><span>Total escrow held</span><strong>${Number(analytics?.total_escrow || 0).toLocaleString()}</strong><small>Across live deals</small></div>
+                  <div><span>Total wallet balance</span><strong>${allUsers.reduce((sum, item) => sum + Number(item.balance || 0), 0).toLocaleString()}</strong><small>Across brands</small></div>
+                  <div><span>Scheduled payouts</span><strong>{pendingWithdrawals.length}</strong><small>Next 7 days</small></div>
+                </div>
+              </section>
+
+              <section className="operator-section">
+                <div className="operator-section-head">
+                  <h3>Quick actions</h3>
+                  <span>Ops tools</span>
+                </div>
+                <div className="operator-actions">
+                  <button type="button" onClick={() => setActiveTab('allcampaigns')}><Briefcase size={18} /> Create manual shipping label</button>
+                  <button type="button" onClick={() => setActiveTab('users')}><DollarSign size={18} /> Adjust wallet balance</button>
+                  <button type="button" onClick={() => setActiveTab('broadcast')}><MessageSquare size={18} /> Send platform announcement</button>
+                </div>
+              </section>
             </div>
           )}
+
+          {/* Applications tab removed - opens as separate page */}
 
           {activeTab === 'profiles' && (
             <div className="profiles-section fade-in">
@@ -1816,6 +1909,7 @@ export default function AdminDashboard() {
           )}
         </div>
       </div>
+      </main>
 
       {showAssignModal && selectedCampaignForAssign && (
         <div className="modal-overlay" onClick={() => setShowAssignModal(false)}>
@@ -2388,20 +2482,146 @@ export default function AdminDashboard() {
       <style jsx>{`
         .admin-dashboard {
           min-height: 100vh;
+          display: flex;
           background: linear-gradient(135deg, #f8f9ff 0%, #e8ecff 100%);
+        }
+
+        .admin-sidebar {
+          width: 285px;
+          min-height: 100vh;
+          position: sticky;
+          top: 0;
+          align-self: flex-start;
+          display: flex;
+          flex-direction: column;
+          justify-content: space-between;
+          gap: 24px;
+          padding: 28px 24px;
+          background: #07074E;
+          color: white;
+          border-top-right-radius: 32px;
+          border-bottom-right-radius: 32px;
+          z-index: 2;
+        }
+
+        .admin-sidebar-brand,
+        .admin-sidebar-profile {
+          display: flex;
+          align-items: center;
+        }
+
+        .admin-sidebar-brand {
+          gap: 12px;
+          margin-bottom: 40px;
+          font-size: 20px;
+          font-weight: 700;
+        }
+
+        .admin-sidebar-mark,
+        .admin-avatar {
+          display: grid;
+          place-items: center;
+          flex: 0 0 auto;
+          background: #667eea;
+          color: white;
+          font-weight: 800;
+        }
+
+        .admin-sidebar-mark {
+          width: 32px;
+          height: 32px;
+          border-radius: 8px;
+        }
+
+        .admin-sidebar-nav {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+
+        .admin-nav-label {
+          padding: 0 16px 6px;
+          color: #b7b7e6;
+          font-size: 11px;
+          font-weight: 700;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+        }
+
+        .admin-nav-item {
+          width: 100%;
+          display: flex;
+          align-items: center;
+          gap: 14px;
+          padding: 12px 16px;
+          border: 0;
+          border-radius: 999px;
+          background: transparent;
+          color: rgba(255, 255, 255, 0.74);
+          cursor: pointer;
+          text-align: left;
+          transition: 180ms ease;
+        }
+
+        .admin-nav-item:hover {
+          color: white;
+          background: rgba(255, 255, 255, 0.1);
+        }
+
+        .admin-nav-item.active {
+          color: #07074E;
+          background: white;
+          font-weight: 700;
+        }
+
+        .admin-nav-item span {
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+
+        .admin-sidebar-profile {
+          gap: 14px;
+          padding-top: 24px;
+          border-top: 1px solid rgba(255, 255, 255, 0.12);
+        }
+
+        .admin-avatar {
+          width: 42px;
+          height: 42px;
+          border-radius: 50%;
+        }
+
+        .admin-sidebar-profile strong,
+        .admin-sidebar-profile span {
+          display: block;
+        }
+
+        .admin-sidebar-profile span {
+          margin-top: 2px;
+          color: #b7b7e6;
+          font-size: 12px;
+          font-weight: 600;
+          text-transform: capitalize;
+        }
+
+        .admin-main {
+          flex: 1;
+          min-width: 0;
         }
 
         .dashboard-header {
           background: white;
           border-bottom: 2px solid #e2e8f0;
-          padding: 24px 8%;
+          padding: 24px 40px;
         }
 
         .header-content {
           display: flex;
           justify-content: space-between;
           align-items: center;
-          max-width: 1400px;
+          max-width: 1480px;
           margin: 0 auto;
         }
 
@@ -2424,8 +2644,8 @@ export default function AdminDashboard() {
         }
 
         .dashboard-content {
-          padding: 40px 8%;
-          max-width: 1400px;
+          padding: 40px;
+          max-width: 1480px;
           margin: 0 auto;
         }
 
@@ -2571,6 +2791,227 @@ export default function AdminDashboard() {
           color: #1a202c;
         }
 
+        .operator-dashboard {
+          display: grid;
+          gap: 28px;
+          padding: 0;
+        }
+
+        .operator-hero,
+        .operator-section {
+          border: 1px solid #dde4f0;
+          border-radius: 16px;
+          background: white;
+          box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04);
+          transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .operator-section:hover {
+          box-shadow: 0 12px 28px rgba(102, 126, 234, 0.12);
+          border-color: #c7d2e8;
+          transform: translateY(-4px);
+        }
+
+        .operator-hero {
+          padding: 32px;
+        }
+
+        .operator-hero span,
+        .operator-section-head span {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          width: max-content;
+          padding: 8px 16px;
+          border-radius: 24px;
+          background: linear-gradient(135deg, #e8ecff 0%, #dfe4ff 100%);
+          color: #667eea;
+          font-size: 12px;
+          font-weight: 700;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+        }
+
+        .operator-hero h2 {
+          margin: 18px 0 12px;
+          color: #0f0f2e;
+          font-size: 32px;
+          font-weight: 800;
+          line-height: 1.2;
+        }
+
+        .operator-hero p {
+          max-width: 720px;
+          color: #6b7280;
+          font-size: 16px;
+          line-height: 1.6;
+          font-weight: 500;
+        }
+
+        .operator-section {
+          padding: 32px;
+        }
+
+        .operator-section.priority {
+          border: 2px solid #f59e0b;
+          background: linear-gradient(135deg, rgba(255, 247, 237, 0.8) 0%, rgba(254, 243, 199, 0.4) 50%, #ffffff 100%);
+          position: relative;
+          overflow: hidden;
+        }
+
+        .operator-section.priority::before {
+          content: '';
+          position: absolute;
+          top: -1px;
+          left: 0;
+          right: 0;
+          height: 4px;
+          background: linear-gradient(90deg, #f59e0b 0%, #fbbf24 100%);
+        }
+
+        .operator-section-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 16px;
+          margin-bottom: 28px;
+          padding-bottom: 16px;
+          border-bottom: 2px solid #ede9f6;
+        }
+
+        .operator-section-head h3 {
+          margin: 0;
+          color: #0f0f2e;
+          font-size: 22px;
+          font-weight: 800;
+          letter-spacing: -0.5px;
+        }
+
+        .operator-risk-list,
+        .operator-metric-grid {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 18px;
+        }
+
+        .operator-risk-list > div,
+        .operator-metric-grid > div {
+          padding: 24px;
+          border: 2px solid #f0f0f8;
+          border-radius: 12px;
+          background: linear-gradient(135deg, #fafbfc 0%, #f5f7fb 100%);
+          transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+          position: relative;
+          overflow: hidden;
+        }
+
+        .operator-risk-list > div::before,
+        .operator-metric-grid > div::before {
+          content: '';
+          position: absolute;
+          top: 0;
+          left: 0;
+          right: 0;
+          height: 3px;
+          background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+          opacity: 0;
+          transition: opacity 0.3s ease;
+        }
+
+        .operator-risk-list > div:hover,
+        .operator-metric-grid > div:hover {
+          border-color: #d1daf0;
+          background: linear-gradient(135deg, #f0f4fb 0%, #eff2f8 100%);
+          transform: translateY(-4px);
+          box-shadow: 0 8px 20px rgba(102, 126, 234, 0.15);
+        }
+
+        .operator-risk-list > div:hover::before,
+        .operator-metric-grid > div:hover::before {
+          opacity: 1;
+        }
+
+        .operator-risk-list strong,
+        .operator-metric-grid strong {
+          display: block;
+          color: #0f0f2e;
+          font-size: 36px;
+          line-height: 1;
+          margin-bottom: 14px;
+          font-weight: 800;
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          background-clip: text;
+        }
+
+        .operator-risk-list span,
+        .operator-metric-grid span {
+          color: #4a5568;
+          font-weight: 600;
+          line-height: 1.5;
+          font-size: 14px;
+          display: block;
+        }
+
+        .operator-metric-grid small {
+          display: block;
+          margin-top: 12px;
+          color: #9ca3af;
+          font-weight: 600;
+          font-size: 12px;
+        }
+
+        .operator-actions {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 20px;
+        }
+
+        .operator-actions button {
+          min-height: 64px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 12px;
+          border: 2px solid #d1daf0;
+          border-radius: 12px;
+          background: linear-gradient(135deg, #f5f7ff 0%, #eff2f8 100%);
+          color: #0f0f2e;
+          cursor: pointer;
+          font-weight: 700;
+          font-size: 15px;
+          transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+          position: relative;
+          overflow: hidden;
+        }
+
+        .operator-actions button::before {
+          content: '';
+          position: absolute;
+          top: 0;
+          left: -100%;
+          width: 100%;
+          height: 100%;
+          background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+          transition: left 0.5s ease;
+        }
+
+        .operator-actions button:hover {
+          border-color: #667eea;
+          background: linear-gradient(135deg, #eff2f8 0%, #e8ecff 100%);
+          box-shadow: 0 8px 24px rgba(102, 126, 234, 0.18);
+          transform: translateY(-3px);
+        }
+
+        .operator-actions button:hover::before {
+          left: 100%;
+        }
+
+        .operator-actions button:active {
+          transform: translateY(-1px);
+        }
+
         .loading,
         .empty-state {
           text-align: center;
@@ -2587,17 +3028,51 @@ export default function AdminDashboard() {
 
         .items-grid {
           display: grid;
-          grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
-          gap: 24px;
+          grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+          gap: 28px;
         }
 
         .profile-card,
         .campaign-card,
         .withdrawal-card {
-          background: #f8f9ff;
-          padding: 24px;
-          border-radius: 16px;
-          border: 2px solid #e2e8f0;
+          background: linear-gradient(135deg, #fafbfc 0%, #f5f7fb 100%);
+          padding: 28px;
+          border-radius: 14px;
+          border: 1.5px solid #dde4f0;
+          transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+          position: relative;
+          overflow: hidden;
+        }
+
+        .profile-card::before,
+        .campaign-card::before,
+        .withdrawal-card::before {
+          content: '';
+          position: absolute;
+          top: 0;
+          left: 0;
+          right: 0;
+          height: 4px;
+          background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+          transform: scaleX(0);
+          transform-origin: left;
+          transition: transform 0.4s ease;
+        }
+
+        .profile-card:hover,
+        .campaign-card:hover,
+        .withdrawal-card:hover {
+          border-color: #c7d2e8;
+          background: linear-gradient(135deg, #f0f4fb 0%, #eef2f8 100%);
+          box-shadow: 0 12px 32px rgba(102, 126, 234, 0.12);
+          transform: translateY(-6px);
+        }
+
+        .profile-card:hover::before,
+        .campaign-card:hover::before,
+        .withdrawal-card:hover::before {
+          transform: scaleX(1);
         }
 
         .profile-header,
@@ -2606,44 +3081,62 @@ export default function AdminDashboard() {
           display: flex;
           justify-content: space-between;
           align-items: start;
-          margin-bottom: 16px;
+          margin-bottom: 18px;
+          padding-bottom: 12px;
+          border-bottom: 2px solid #ede9f6;
         }
 
         .profile-header h3,
         .campaign-header h3,
         .withdrawal-header h3 {
-          font-size: 1.25rem;
-          font-weight: 600;
-          color: #1a202c;
-          margin-bottom: 8px;
+          font-size: 18px;
+          font-weight: 700;
+          color: #0f0f2e;
+          margin-bottom: 0;
+          letter-spacing: -0.3px;
         }
 
         .profile-details,
         .campaign-details,
         .withdrawal-details {
-          margin-bottom: 20px;
+          margin-bottom: 24px;
           color: #4a5568;
           line-height: 1.8;
+          font-size: 14px;
         }
 
         .profile-details p,
         .campaign-details p,
         .withdrawal-details p {
-          margin-bottom: 8px;
+          margin-bottom: 10px;
+          color: #4a5568;
+        }
+
+        .profile-details strong,
+        .campaign-details strong,
+        .withdrawal-details strong {
+          color: #0f0f2e;
+          font-weight: 700;
         }
 
         .rate-list,
         .objectives-list {
-          margin: 8px 0;
-          padding-left: 20px;
+          margin: 12px 0;
+          padding-left: 24px;
           color: #4a5568;
+        }
+
+        .rate-list li,
+        .objectives-list li {
+          margin-bottom: 6px;
         }
 
         .profile-actions,
         .campaign-actions,
         .withdrawal-actions {
           display: flex;
-          gap: 12px;
+          gap: 14px;
+          margin-top: 24px;
         }
 
         .btn-approve,
@@ -2652,33 +3145,42 @@ export default function AdminDashboard() {
           display: flex;
           align-items: center;
           justify-content: center;
-          gap: 8px;
-          padding: 12px;
-          border-radius: 12px;
-          border: none;
-          font-weight: 600;
+          gap: 10px;
+          padding: 14px 16px;
+          border-radius: 10px;
+          border: 2px solid;
+          font-weight: 700;
           cursor: pointer;
-          transition: all 0.3s ease;
+          transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+          font-size: 14px;
+          position: relative;
+          overflow: hidden;
         }
 
         .btn-approve {
-          background: #d4edda;
-          color: #155724;
+          background: linear-gradient(135deg, #d1f5e8 0%, #c1f0de 100%);
+          color: #065f46;
+          border-color: #a7e8d4;
         }
 
         .btn-approve:hover {
-          background: #c3e6cb;
-          transform: translateY(-2px);
+          background: linear-gradient(135deg, #bef3e6 0%, #a7e8d4 100%);
+          box-shadow: 0 6px 16px rgba(16, 185, 129, 0.2);
+          transform: translateY(-3px);
+          border-color: #6ee7b7;
         }
 
         .btn-reject {
-          background: #f8d7da;
-          color: #721c24;
+          background: linear-gradient(135deg, #fee2e2 0%, #fed7d7 100%);
+          color: #991b1b;
+          border-color: #fecaca;
         }
 
         .btn-reject:hover {
-          background: #f5c6cb;
-          transform: translateY(-2px);
+          background: linear-gradient(135deg, #fecaca 0%, #fca5a5 100%);
+          box-shadow: 0 6px 16px rgba(239, 68, 68, 0.2);
+          transform: translateY(-3px);
+          border-color: #f87171;
         }
 
         .action-buttons {
@@ -3980,7 +4482,1110 @@ export default function AdminDashboard() {
           gap: 16px;
         }
 
+        /* Applications Section Styles */
+        .applications-section {
+          padding: 32px;
+        }
+
+        .applications-header {
+          margin-bottom: 32px;
+        }
+
+        .applications-header h2 {
+          font-size: 28px;
+          font-weight: 800;
+          color: #0f0f2e;
+          margin: 0 0 24px 0;
+        }
+
+        .application-tabs {
+          display: flex;
+          gap: 16px;
+          border-bottom: 2px solid #dde4f0;
+          margin-bottom: 24px;
+        }
+
+        .app-tab-btn {
+          padding: 12px 20px;
+          border: none;
+          background: transparent;
+          color: #4a5568;
+          font-weight: 600;
+          font-size: 15px;
+          cursor: pointer;
+          border-bottom: 3px solid transparent;
+          transition: all 0.3s ease;
+          position: relative;
+          bottom: -2px;
+        }
+
+        .app-tab-btn.active {
+          color: #667eea;
+          border-bottom-color: #667eea;
+        }
+
+        .app-tab-btn:hover {
+          color: #667eea;
+        }
+
+        .applications-filters {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+          gap: 20px;
+          margin-bottom: 32px;
+          padding: 24px;
+          background: linear-gradient(135deg, #fafbfc 0%, #f5f7fb 100%);
+          border-radius: 12px;
+          border: 1px solid #dde4f0;
+        }
+
+        .filter-group {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+
+        .filter-group label {
+          font-weight: 700;
+          color: #0f0f2e;
+          font-size: 13px;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+
+        .filter-group select,
+        .filter-group input {
+          padding: 10px 12px;
+          border: 1.5px solid #dde4f0;
+          border-radius: 8px;
+          background: white;
+          color: #4a5568;
+          font-size: 14px;
+          font-weight: 500;
+          transition: all 0.3s ease;
+        }
+
+        .filter-group select:hover,
+        .filter-group input:hover {
+          border-color: #c7d2e8;
+        }
+
+        .filter-group select:focus,
+        .filter-group input:focus {
+          outline: none;
+          border-color: #667eea;
+          box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .applications-list {
+          background: white;
+          border-radius: 12px;
+          border: 1px solid #dde4f0;
+          overflow: hidden;
+          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+        }
+
+        .applications-table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+
+        .applications-table thead {
+          background: linear-gradient(135deg, #fafbfc 0%, #f5f7fb 100%);
+          border-bottom: 2px solid #dde4f0;
+        }
+
+        .applications-table th {
+          padding: 16px;
+          text-align: left;
+          font-weight: 700;
+          color: #0f0f2e;
+          font-size: 14px;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+
+        .applications-table td {
+          padding: 18px 16px;
+          border-bottom: 1px solid #ede9f6;
+          color: #4a5568;
+          font-size: 14px;
+        }
+
+        .applications-table tbody tr {
+          transition: all 0.3s ease;
+        }
+
+        .applications-table tbody tr:hover {
+          background-color: #fafbfc;
+        }
+
+        .applications-table tbody tr:last-child td {
+          border-bottom: none;
+        }
+
+        .date-range {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .date-range input {
+          flex: 1;
+        }
+
+        .date-range span {
+          color: #4a5568;
+          font-weight: 600;
+          font-size: 13px;
+        }
+
+        .app-handle {
+          font-weight: 700;
+          color: #0f0f2e;
+        }
+
+        .sla-remaining {
+          font-weight: 700;
+          color: #667eea;
+        }
+
+        .status-badge {
+          display: inline-block;
+          padding: 6px 12px;
+          border-radius: 20px;
+          font-size: 12px;
+          font-weight: 700;
+          text-transform: capitalize;
+        }
+
+        .status-pending {
+          background: #fef3c7;
+          color: #b45309;
+        }
+
+        .status-more_info {
+          background: #fce7f3;
+          color: #9f1239;
+        }
+
+        .status-approved {
+          background: #d1f5e8;
+          color: #065f46;
+        }
+
+        .status-rejected {
+          background: #fee2e2;
+          color: #991b1b;
+        }
+
+        .btn-view-detail {
+          padding: 8px 14px;
+          border: 1.5px solid #d1daf0;
+          border-radius: 8px;
+          background: linear-gradient(135deg, #f5f7ff 0%, #eff2f8 100%);
+          color: #667eea;
+          cursor: pointer;
+          font-weight: 700;
+          font-size: 12px;
+          transition: all 0.3s ease;
+        }
+
+        .btn-view-detail:hover {
+          border-color: #667eea;
+          box-shadow: 0 4px 12px rgba(102, 126, 234, 0.15);
+          transform: translateY(-2px);
+        }
+
+        .empty-table {
+          padding: 60px 20px;
+          text-align: center;
+          color: #9ca3af;
+          font-size: 16px;
+        }
+
+        .application-detail-view {
+          padding: 32px;
+        }
+
+        .btn-back {
+          padding: 10px 16px;
+          border: 1.5px solid #dde4f0;
+          border-radius: 8px;
+          background: white;
+          color: #667eea;
+          cursor: pointer;
+          font-weight: 700;
+          font-size: 14px;
+          transition: all 0.3s ease;
+          margin-bottom: 24px;
+        }
+
+        .btn-back:hover {
+          border-color: #667eea;
+          box-shadow: 0 4px 12px rgba(102, 126, 234, 0.1);
+          background: #f5f7ff;
+        }
+
+        .detail-content {
+          background: white;
+          border: 1px solid #dde4f0;
+          border-radius: 14px;
+          padding: 32px;
+          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+        }
+
+        .detail-content h2 {
+          margin: 0 0 8px 0;
+          color: #0f0f2e;
+          font-size: 28px;
+          font-weight: 800;
+        }
+
+        .detail-subtitle {
+          margin: 0 0 24px 0;
+          color: #9ca3af;
+          font-size: 14px;
+          font-weight: 600;
+        }
+
+        .detail-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: flex-start;
+          margin-bottom: 32px;
+          padding-bottom: 24px;
+          border-bottom: 2px solid #ede9f6;
+        }
+
+        .detail-title {
+          flex: 1;
+        }
+
+        .detail-title h2 {
+          margin: 0 0 8px 0;
+          color: #0f0f2e;
+          font-size: 28px;
+          font-weight: 800;
+        }
+
+        .detail-title p {
+          margin: 0 0 12px 0;
+          color: #4a5568;
+          font-size: 14px;
+        }
+
+        .flag-badge {
+          display: inline-block;
+          margin-right: 8px;
+          padding: 6px 12px;
+          background: #fef3c7;
+          color: #b45309;
+          border-radius: 20px;
+          font-size: 12px;
+          font-weight: 700;
+        }
+
+        .detail-meta {
+          display: flex;
+          gap: 32px;
+          margin-top: 16px;
+        }
+
+        .meta-item {
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+        }
+
+        .meta-item .label {
+          font-size: 12px;
+          color: #9ca3af;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+
+        .meta-item .value {
+          font-size: 15px;
+          color: #0f0f2e;
+          font-weight: 700;
+        }
+
+        .detail-grid {
+          display: grid;
+          gap: 32px;
+          margin-bottom: 32px;
+        }
+
+        .detail-section {
+          background: linear-gradient(135deg, #fafbfc 0%, #f5f7fb 100%);
+          border: 1px solid #dde4f0;
+          border-radius: 12px;
+          padding: 24px;
+        }
+
+        .detail-section h3 {
+          margin: 0 0 20px 0;
+          color: #0f0f2e;
+          font-size: 18px;
+          font-weight: 800;
+          border-bottom: 2px solid #ede9f6;
+          padding-bottom: 12px;
+        }
+
+        .detail-section.full-width {
+          grid-column: 1 / -1;
+        }
+
+        .info-grid {
+          display: grid;
+          grid-template-columns: repeat(2, 1fr);
+          gap: 20px;
+        }
+
+        .info-item {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+
+        .info-item.full-width {
+          grid-column: 1 / -1;
+        }
+
+        .info-item label {
+          font-size: 12px;
+          color: #9ca3af;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+
+        .info-item p {
+          margin: 0;
+          color: #4a5568;
+          font-size: 14px;
+          font-weight: 600;
+        }
+
+        .rate-card-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+          gap: 16px;
+        }
+
+        .rate-item {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 8px;
+          padding: 16px;
+          background: white;
+          border: 1.5px solid #dde4f0;
+          border-radius: 10px;
+        }
+
+        .rate-label {
+          font-size: 12px;
+          color: #9ca3af;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+
+        .rate-value {
+          font-size: 18px;
+          color: #667eea;
+          font-weight: 800;
+        }
+
+        .portfolio-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+          gap: 20px;
+        }
+
+        .video-card {
+          border-radius: 10px;
+          overflow: hidden;
+          border: 1.5px solid #dde4f0;
+          transition: all 0.3s ease;
+        }
+
+        .video-card:hover {
+          border-color: #667eea;
+          box-shadow: 0 6px 16px rgba(102, 126, 234, 0.15);
+          transform: translateY(-4px);
+        }
+
+        .video-thumbnail {
+          position: relative;
+          width: 100%;
+          padding-bottom: 56.25%;
+          background: #000;
+          overflow: hidden;
+        }
+
+        .video-thumbnail img {
+          position: absolute;
+          top: 0;
+          left: 0;
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+        }
+
+        .play-button {
+          position: absolute;
+          top: 50%;
+          left: 50%;
+          transform: translate(-50%, -50%);
+          width: 48px;
+          height: 48px;
+          background: rgba(102, 126, 234, 0.9);
+          border-radius: 50%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 20px;
+          color: white;
+          text-decoration: none;
+          transition: all 0.3s ease;
+        }
+
+        .play-button:hover {
+          background: #667eea;
+          transform: translate(-50%, -50%) scale(1.1);
+        }
+
+        .video-title {
+          padding: 12px;
+          margin: 0;
+          color: #0f0f2e;
+          font-size: 13px;
+          font-weight: 700;
+          background: white;
+        }
+
+        .video-duration {
+          padding: 0 12px 12px;
+          margin: 0;
+          color: #9ca3af;
+          font-size: 12px;
+          background: white;
+        }
+
+        .kyc-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+          gap: 16px;
+        }
+
+        .kyc-card {
+          background: white;
+          border: 1.5px solid #dde4f0;
+          border-radius: 10px;
+          padding: 16px;
+        }
+
+        .kyc-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 12px;
+          padding-bottom: 12px;
+          border-bottom: 2px solid #ede9f6;
+        }
+
+        .kyc-header h4 {
+          margin: 0;
+          font-size: 13px;
+          color: #0f0f2e;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+
+        .verify-badge {
+          font-size: 11px;
+          font-weight: 700;
+          padding: 4px 10px;
+          border-radius: 12px;
+        }
+
+        .verify-badge.verified {
+          background: #d1f5e8;
+          color: #065f46;
+        }
+
+        .verify-badge.pending {
+          background: #fef3c7;
+          color: #b45309;
+        }
+
+        .doc-link {
+          display: block;
+          color: #667eea;
+          font-weight: 700;
+          font-size: 13px;
+          text-decoration: none;
+          margin-bottom: 8px;
+          transition: color 0.3s ease;
+        }
+
+        .doc-link:hover {
+          color: #764ba2;
+        }
+
+        .doc-info {
+          margin: 8px 0;
+          font-size: 12px;
+          color: #4a5568;
+        }
+
+        .doc-info strong {
+          color: #0f0f2e;
+        }
+
+        .social-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+          gap: 16px;
+        }
+
+        .social-card {
+          background: white;
+          border: 1.5px solid #dde4f0;
+          border-radius: 10px;
+          padding: 16px;
+          transition: all 0.3s ease;
+        }
+
+        .social-card:hover {
+          border-color: #667eea;
+          box-shadow: 0 4px 12px rgba(102, 126, 234, 0.1);
+        }
+
+        .social-card h4 {
+          margin: 0 0 8px 0;
+          font-size: 13px;
+          color: #0f0f2e;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+
+        .social-card a,
+        .social-card p {
+          margin: 0 0 8px 0;
+          font-size: 13px;
+          color: #667eea;
+          text-decoration: none;
+          font-weight: 600;
+          word-break: break-all;
+        }
+
+        .social-card a:hover {
+          text-decoration: underline;
+        }
+
+        .social-card p {
+          color: #4a5568;
+        }
+
+        .followers {
+          font-size: 12px;
+          color: #9ca3af;
+          font-weight: 600;
+        }
+
+        .verified-badge {
+          display: inline-block;
+          background: #d1f5e8;
+          color: #065f46;
+          padding: 4px 8px;
+          border-radius: 12px;
+          font-size: 11px;
+          font-weight: 700;
+          margin-top: 8px;
+        }
+
+        .gst-info {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+          gap: 16px;
+        }
+
+        .gst-item {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+
+        .gst-item label {
+          font-size: 12px;
+          color: #9ca3af;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+
+        .gst-item p {
+          margin: 0;
+          color: #4a5568;
+          font-size: 14px;
+          font-weight: 600;
+        }
+
+        .gst-badge {
+          display: inline-block;
+          padding: 6px 12px;
+          border-radius: 20px;
+          font-size: 12px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+
+        .gst-badge.verified {
+          background: #d1f5e8;
+          color: #065f46;
+        }
+
+        .gst-badge.pending {
+          background: #fef3c7;
+          color: #b45309;
+        }
+
+        .gst-badge.failed {
+          background: #fee2e2;
+          color: #991b1b;
+        }
+
+        .website-preview {
+          padding: 16px;
+          background: white;
+          border: 1.5px solid #dde4f0;
+          border-radius: 10px;
+        }
+
+        .website-preview a {
+          color: #667eea;
+          font-weight: 700;
+          text-decoration: none;
+          transition: color 0.3s ease;
+        }
+
+        .website-preview a:hover {
+          color: #764ba2;
+        }
+
+        .decision-section {
+          background: linear-gradient(135deg, #f5f7ff 0%, #eff2f8 100%);
+          border: 2px solid #d1daf0;
+          border-radius: 12px;
+          padding: 24px;
+          margin-top: 32px;
+        }
+
+        .decision-section h3 {
+          margin: 0 0 20px 0;
+          color: #0f0f2e;
+          font-size: 18px;
+          font-weight: 800;
+        }
+
+        .decision-buttons {
+          display: flex;
+          gap: 16px;
+          margin-bottom: 20px;
+        }
+
+        .btn-decision {
+          flex: 1;
+          padding: 14px 20px;
+          border: 2px solid;
+          border-radius: 10px;
+          font-weight: 700;
+          font-size: 14px;
+          cursor: pointer;
+          transition: all 0.3s ease;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+        }
+
+        .btn-decision:disabled {
+          opacity: 0.5;
+          cursor: not-allowed;
+        }
+
+        .btn-approve {
+          background: linear-gradient(135deg, #d1f5e8 0%, #c1f0de 100%);
+          color: #065f46;
+          border-color: #a7e8d4;
+        }
+
+        .btn-approve:hover:not(:disabled) {
+          border-color: #6ee7b7;
+          box-shadow: 0 6px 16px rgba(16, 185, 129, 0.2);
+          transform: translateY(-2px);
+        }
+
+        .btn-more-info {
+          background: linear-gradient(135deg, #dbeafe 0%, #cde8ff 100%);
+          color: #0369a1;
+          border-color: #a3e0ff;
+        }
+
+        .btn-more-info:hover:not(:disabled) {
+          border-color: #7dd3fc;
+          box-shadow: 0 6px 16px rgba(2, 132, 199, 0.2);
+          transform: translateY(-2px);
+        }
+
+        .btn-reject {
+          background: linear-gradient(135deg, #fee2e2 0%, #fed7d7 100%);
+          color: #991b1b;
+          border-color: #fecaca;
+        }
+
+        .btn-reject:hover:not(:disabled) {
+          border-color: #f87171;
+          box-shadow: 0 6px 16px rgba(239, 68, 68, 0.2);
+          transform: translateY(-2px);
+        }
+
+        .reject-form {
+          display: none;
+          background: white;
+          border: 1.5px solid #dde4f0;
+          border-radius: 10px;
+          padding: 20px;
+          margin-top: 16px;
+        }
+
+        .reject-form.show {
+          display: block;
+          animation: slideDown 0.3s ease;
+        }
+
+        @keyframes slideDown {
+          from {
+            opacity: 0;
+            transform: translateY(-10px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+
+        .form-group {
+          margin-bottom: 16px;
+        }
+
+        .form-group label {
+          display: block;
+          margin-bottom: 8px;
+          font-weight: 700;
+          color: #0f0f2e;
+          font-size: 13px;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+
+        .form-group select,
+        .form-group textarea,
+        .form-group input {
+          width: 100%;
+          padding: 10px 12px;
+          border: 1.5px solid #dde4f0;
+          border-radius: 8px;
+          font-size: 14px;
+          font-weight: 500;
+          color: #4a5568;
+          font-family: inherit;
+          transition: all 0.3s ease;
+        }
+
+        .form-group select:focus,
+        .form-group textarea:focus,
+        .form-group input:focus {
+          outline: none;
+          border-color: #667eea;
+          box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .form-group textarea {
+          resize: vertical;
+          min-height: 100px;
+        }
+
+        .form-actions {
+          display: flex;
+          gap: 12px;
+          margin-top: 16px;
+        }
+
+        .btn-confirm,
+        .btn-cancel {
+          flex: 1;
+          padding: 12px 16px;
+          border: 2px solid;
+          border-radius: 8px;
+          font-weight: 700;
+          font-size: 14px;
+          cursor: pointer;
+          transition: all 0.3s ease;
+        }
+
+        .btn-confirm {
+          background: #667eea;
+          color: white;
+          border-color: #667eea;
+        }
+
+        .btn-confirm:hover {
+          background: #764ba2;
+          border-color: #764ba2;
+        }
+
+        .btn-confirm.btn-reject {
+          background: #dc2626;
+          border-color: #dc2626;
+        }
+
+        .btn-cancel {
+          background: white;
+          color: #667eea;
+          border-color: #dde4f0;
+        }
+
+        .btn-cancel:hover {
+          border-color: #667eea;
+          background: #f5f7ff;
+        }
+
+        .modal-overlay {
+          position: fixed;
+          top: 0;
+          left: 0;
+          right: 0;
+          bottom: 0;
+          background: rgba(0, 0, 0, 0.5);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 1000;
+        }
+
+        .modal-content {
+          background: white;
+          border-radius: 12px;
+          padding: 28px;
+          max-width: 500px;
+          width: 90%;
+          max-height: 90vh;
+          overflow-y: auto;
+          box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+
+        .more-info-modal h3 {
+          margin: 0 0 24px 0;
+          color: #0f0f2e;
+          font-size: 20px;
+          font-weight: 800;
+        }
+
+        .modal-actions {
+          display: flex;
+          gap: 12px;
+          margin-top: 24px;
+        }
+
+        .modal-actions button {
+          flex: 1;
+        }
+
+        .empty-message {
+          color: #9ca3af;
+          font-size: 14px;
+          text-align: center;
+          padding: 20px;
+        }
+
+        /* Applications Page Styles */
+        .applications-page {
+          min-height: 100vh;
+          background: linear-gradient(135deg, #f5f7ff 0%, #eff2f8 100%);
+          padding: 32px;
+        }
+
+        .page-header {
+          display: flex;
+          align-items: center;
+          gap: 20px;
+          margin-bottom: 32px;
+        }
+
+        .page-header h1 {
+          margin: 0;
+          font-size: 36px;
+          font-weight: 800;
+          color: #0f0f2e;
+        }
+
+        .page-header .btn-back {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+        @media (max-width: 1024px) {
+          .operator-risk-list,
+          .operator-metric-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+          }
+
+          .operator-actions {
+            grid-template-columns: 1fr;
+          }
+
+          .applications-filters {
+            grid-template-columns: 1fr;
+          }
+
+          .applications-table {
+            font-size: 13px;
+          }
+
+          .applications-table th,
+          .applications-table td {
+            padding: 12px 10px;
+          }
+
+          .date-range {
+            flex-direction: column;
+            align-items: flex-start;
+          }
+
+          .application-detail-view {
+            padding: 20px;
+          }
+
+          .detail-content {
+            padding: 20px;
+          }
+
+          .detail-content h2 {
+            font-size: 24px;
+          }
+
+          .detail-header {
+            flex-direction: column;
+            gap: 16px;
+          }
+
+          .detail-meta {
+            flex-direction: column;
+            gap: 12px;
+          }
+
+          .info-grid {
+            grid-template-columns: 1fr;
+          }
+
+          .portfolio-grid {
+            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+          }
+
+          .kyc-grid {
+            grid-template-columns: 1fr;
+          }
+
+          .social-grid {
+            grid-template-columns: 1fr;
+          }
+
+          .decision-buttons {
+            flex-direction: column;
+          }
+
+          .rate-card-grid {
+            grid-template-columns: repeat(2, 1fr);
+          }
+        }
+
         @media (max-width: 768px) {
+          .operator-dashboard {
+            gap: 20px;
+          }
+
+          .operator-section {
+            padding: 20px;
+          }
+
+          .operator-section-head {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 12px;
+          }
+
+          .operator-risk-list,
+          .operator-metric-grid {
+            grid-template-columns: 1fr;
+          }
+
+          .operator-actions {
+            grid-template-columns: 1fr;
+          }
+
+          .operator-actions button {
+            min-height: 52px;
+          }
+
+          .admin-dashboard {
+            flex-direction: column;
+          }
+
+          .admin-sidebar {
+            width: 100%;
+            min-height: auto;
+            position: static;
+            border-radius: 0;
+            padding: 20px;
+            gap: 18px;
+          }
+
+          .admin-sidebar-brand {
+            margin-bottom: 18px;
+          }
+
+          .admin-sidebar-nav {
+            flex-direction: row;
+            overflow-x: auto;
+            padding-bottom: 4px;
+          }
+
+          .admin-nav-label,
+          .admin-sidebar-profile {
+            display: none;
+          }
+
+          .admin-nav-item {
+            width: max-content;
+            flex: 0 0 auto;
+          }
+
+          .dashboard-header,
+          .dashboard-content {
+            padding-left: 20px;
+            padding-right: 20px;
+          }
+
           .header-content {
             flex-direction: column;
             gap: 20px;
@@ -4015,6 +5620,17 @@ export default function AdminDashboard() {
 
           .campaign-count-badge {
             align-self: flex-start;
+          }
+
+          .operator-risk-list,
+          .operator-metric-grid,
+          .operator-actions {
+            grid-template-columns: 1fr;
+          }
+
+          .operator-section-head {
+            align-items: flex-start;
+            flex-direction: column;
           }
         }
       `}</style>
