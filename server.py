@@ -2714,11 +2714,13 @@ async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict 
     return {"message": "Profile submitted for review"}
 
 @api_router.patch("/profile/portfolio")
-async def update_portfolio(portfolio: List[str], current_user: dict = Depends(get_current_user)):
-    """Update only the portfolio field without affecting approval status"""
+async def update_portfolio(portfolio: List[Any], current_user: dict = Depends(get_current_user)):
+    """Update only the portfolio field without affecting approval status.
+    Accepts either legacy List[str] (URLs) or List[dict] (rich items with title/description/cost/duration).
+    """
     if current_user['role'] != UserRole.CREATOR:
         raise HTTPException(status_code=403, detail="Only creators can update portfolio")
-    
+
     await db.users.update_one(
         {"id": current_user['id']},
         {"$set": {
@@ -2726,7 +2728,7 @@ async def update_portfolio(portfolio: List[str], current_user: dict = Depends(ge
             "updated_at": datetime.now(timezone.utc).isoformat()
         }}
     )
-    
+
     return {"message": "Portfolio updated successfully"}
 
 @api_router.put("/profile/business")
@@ -4416,9 +4418,9 @@ async def get_pending_profiles(current_user: dict = Depends(get_current_user)):
 async def approve_profile(data: ApprovalAction, current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in [UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Admin access required")
-    
+
     status = ApprovalStatus.APPROVED if data.action == "approve" else ApprovalStatus.REJECTED
-    user = await db.users.find_one({"id": data.item_id}, {"_id": 0, "role": 1})
+    user = await db.users.find_one({"id": data.item_id}, {"_id": 0, "role": 1, "public_creator_id": 1})
     if not user:
         raise HTTPException(status_code=404, detail="Profile not found")
     update_data = {
@@ -4430,12 +4432,25 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(get
         is_approved = status == ApprovalStatus.APPROVED
         update_data["creator_directory_visible"] = is_approved
         update_data["curated_brand_visible"] = is_approved
-    
+
+        # Generate a unique non-sequential public creator ID on approval (e.g., UGC-A7B3K9)
+        if is_approved and not user.get("public_creator_id"):
+            charset = string.ascii_uppercase + string.digits
+            for _ in range(10):
+                candidate = "UGC-" + ''.join(random.choices(charset, k=6))
+                existing = await db.users.find_one(
+                    {"public_creator_id": candidate},
+                    {"_id": 1}
+                )
+                if not existing:
+                    update_data["public_creator_id"] = candidate
+                    break
+
     await db.users.update_one(
         {"id": data.item_id},
         {"$set": update_data}
     )
-    
+
     return {"message": f"Profile {data.action}d"}
 
 @api_router.get("/admin/pending-campaigns")

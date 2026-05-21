@@ -98,6 +98,9 @@ class GigResponse(BaseModel):
     creator_id: str
     creator_name: Optional[str] = None
     creator_email: Optional[str] = None
+    public_creator_id: Optional[str] = None
+    creator_avg_rating: Optional[float] = 0.0
+    creator_total_reviews: Optional[int] = 0
     attachments: List[str]
     requirements: Optional[str]
     target_audience: Optional[str]
@@ -190,6 +193,9 @@ def normalize_gig_response(gig: dict, creator_info: dict = None) -> GigResponse:
         creator_id=gig.get("creator_id"),
         creator_name=creator_info.get("name") if creator_info else None,
         creator_email=creator_info.get("email") if creator_info else None,
+        public_creator_id=creator_info.get("public_creator_id") if creator_info else None,
+        creator_avg_rating=float(creator_info.get("average_rating") or 0) if creator_info else 0.0,
+        creator_total_reviews=int(creator_info.get("total_reviews") or 0) if creator_info else 0,
         attachments=attachments,
         requirements=gig.get("requirements"),
         target_audience=gig.get("target_audience"),
@@ -306,7 +312,7 @@ async def list_gigs(
     # Get creator info for each gig
     gig_responses = []
     for gig in gigs:
-        creator = await db.users.find_one({"id": gig.get("creator_id")}, {"_id": 0, "name": 1, "email": 1})
+        creator = await db.users.find_one({"id": gig.get("creator_id")}, {"_id": 0, "name": 1, "email": 1, "public_creator_id": 1, "average_rating": 1, "total_reviews": 1})
         gig_responses.append(normalize_gig_response(gig, creator or {}))
 
     return GigListResponse(
@@ -336,7 +342,7 @@ async def get_gig(gig_id: str) -> GigResponse:
         raise HTTPException(status_code=404, detail="Gig not found")
 
     # Get creator info
-    creator = await db.users.find_one({"id": gig.get("creator_id")}, {"_id": 0, "name": 1, "email": 1})
+    creator = await db.users.find_one({"id": gig.get("creator_id")}, {"_id": 0, "name": 1, "email": 1, "public_creator_id": 1, "average_rating": 1, "total_reviews": 1})
 
     response = normalize_gig_response(gig, creator or {})
 
@@ -454,7 +460,7 @@ async def get_creator_gigs(
     total = await db.gigs.count_documents(filter_dict)
 
     # Get creator info
-    creator = await db.users.find_one({"id": creator_id}, {"_id": 0, "name": 1, "email": 1})
+    creator = await db.users.find_one({"id": creator_id}, {"_id": 0, "name": 1, "email": 1, "public_creator_id": 1, "average_rating": 1, "total_reviews": 1})
 
     gig_responses = [normalize_gig_response(gig, creator or {}) for gig in gigs]
 
