@@ -338,7 +338,12 @@ async def get_gig(gig_id: str) -> GigResponse:
     # Get creator info
     creator = await db.users.find_one({"id": gig.get("creator_id")}, {"_id": 0, "name": 1, "email": 1})
 
-    return normalize_gig_response(gig, creator or {})
+    response = normalize_gig_response(gig, creator or {})
+
+    # Debug: Print attachment URLs being returned
+    print(f"[DEBUG] Gig {gig_id} returning attachments: {response.attachments}")
+
+    return response
 
 @gigs_router.patch("/{gig_id}", status_code=200)
 async def update_gig_status(
