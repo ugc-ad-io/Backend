@@ -4818,20 +4818,33 @@ async def upload_file(file: UploadFile = File(...), current_user: dict = Depends
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
 
+@api_router.options("/image/{filename}")
+async def image_options(filename: str):
+    """Handle CORS preflight requests for images"""
+    return {
+        "headers": {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "Content-Type, Range",
+            "Access-Control-Max-Age": "86400"
+        }
+    }
+
 @api_router.get("/image/{filename}")
 async def get_image(filename: str):
     """Serve images from uploads directory with proper CORS headers"""
     upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads")))
+
+    # Security: Prevent directory traversal
+    if ".." in filename or filename.startswith("/"):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     file_path = upload_dir / filename
 
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Image not found")
 
     if not file_path.is_file():
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    # Prevent directory traversal attacks
-    if not str(file_path.resolve()).startswith(str(upload_dir.resolve())):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # Determine content type
@@ -4854,9 +4867,10 @@ async def get_image(filename: str):
         media_type=content_type,
         headers={
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-            "Cache-Control": "public, max-age=31536000"
+            "Access-Control-Allow-Methods": "GET, OPTIONS, HEAD",
+            "Access-Control-Allow-Headers": "Content-Type, Range",
+            "Access-Control-Max-Age": "86400",
+            "Cache-Control": "public, max-age=31536000, immutable"
         }
     )
 
