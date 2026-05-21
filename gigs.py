@@ -25,6 +25,7 @@ security = HTTPBearer()
 
 JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key-change-in-production')
 JWT_ALGORITHM = 'HS256'
+BASE_URL = os.environ.get('BASE_URL', 'https://backend-chq9.onrender.com')
 
 # ============================================================================
 # ENUMS
@@ -165,11 +166,18 @@ async def get_admin_user(user: dict = Depends(get_current_user)) -> dict:
 # HELPER FUNCTIONS
 # ============================================================================
 
-def normalize_gig_response(gig: dict, creator_info: dict = None, base_url: str = None) -> GigResponse:
+def normalize_gig_response(gig: dict, creator_info: dict = None) -> GigResponse:
     """Convert MongoDB gig to response format"""
-    # Return attachments as-is (they should be full URLs from uploads)
-    # The frontend will use them directly without modification
-    attachments = gig.get("attachments", []) or []
+    # Convert attachment URLs to use /api/image/ endpoint which has proper CORS
+    attachments = []
+    for attachment in (gig.get("attachments", []) or []):
+        if attachment.startswith('http'):
+            # Extract filename from full URL and convert to /api/image/ endpoint
+            filename = attachment.split('/')[-1]
+            attachments.append(f"{BASE_URL}/api/image/{filename}")
+        else:
+            # Already just filename
+            attachments.append(f"{BASE_URL}/api/image/{attachment}")
 
     return GigResponse(
         id=gig.get("id"),
