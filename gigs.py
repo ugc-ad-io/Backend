@@ -101,6 +101,10 @@ class GigResponse(BaseModel):
     public_creator_id: Optional[str] = None
     creator_avg_rating: Optional[float] = 0.0
     creator_total_reviews: Optional[int] = 0
+    creator_gender: Optional[str] = None
+    creator_language: Optional[List[str]] = []
+    creator_country: Optional[str] = None
+    creator_age_range: Optional[str] = None
     attachments: List[str]
     requirements: Optional[str]
     target_audience: Optional[str]
@@ -182,6 +186,24 @@ def normalize_gig_response(gig: dict, creator_info: dict = None) -> GigResponse:
             # Already just filename
             attachments.append(f"{BASE_URL}/api/image/{attachment}")
 
+    # Extract creator's profile fields — check root level first, then profile sub-object (legacy)
+    creator_lang_raw = None
+    creator_gender = None
+    creator_country = None
+    creator_age_range = None
+    if creator_info:
+        creator_gender = creator_info.get("gender") or (creator_info.get("profile") or {}).get("gender")
+        creator_country = creator_info.get("country") or (creator_info.get("profile") or {}).get("country")
+        creator_age_range = creator_info.get("age_range") or (creator_info.get("profile") or {}).get("age_range")
+        creator_lang_raw = creator_info.get("language") or (creator_info.get("profile") or {}).get("language")
+
+    if isinstance(creator_lang_raw, list):
+        creator_language = [l for l in creator_lang_raw if l]
+    elif isinstance(creator_lang_raw, str) and creator_lang_raw:
+        creator_language = [creator_lang_raw]
+    else:
+        creator_language = []
+
     return GigResponse(
         id=gig.get("id"),
         title=gig.get("title"),
@@ -196,6 +218,10 @@ def normalize_gig_response(gig: dict, creator_info: dict = None) -> GigResponse:
         public_creator_id=creator_info.get("public_creator_id") if creator_info else None,
         creator_avg_rating=float(creator_info.get("average_rating") or 0) if creator_info else 0.0,
         creator_total_reviews=int(creator_info.get("total_reviews") or 0) if creator_info else 0,
+        creator_gender=creator_gender,
+        creator_language=creator_language,
+        creator_country=creator_country,
+        creator_age_range=creator_age_range,
         attachments=attachments,
         requirements=gig.get("requirements"),
         target_audience=gig.get("target_audience"),
@@ -312,7 +338,7 @@ async def list_gigs(
     # Get creator info for each gig
     gig_responses = []
     for gig in gigs:
-        creator = await db.users.find_one({"id": gig.get("creator_id")}, {"_id": 0, "name": 1, "email": 1, "public_creator_id": 1, "average_rating": 1, "total_reviews": 1})
+        creator = await db.users.find_one({"id": gig.get("creator_id")}, {"_id": 0, "name": 1, "email": 1, "public_creator_id": 1, "average_rating": 1, "total_reviews": 1, "gender": 1, "language": 1, "country": 1, "age_range": 1, "profile": 1})
         gig_responses.append(normalize_gig_response(gig, creator or {}))
 
     return GigListResponse(
@@ -342,7 +368,7 @@ async def get_gig(gig_id: str) -> GigResponse:
         raise HTTPException(status_code=404, detail="Gig not found")
 
     # Get creator info
-    creator = await db.users.find_one({"id": gig.get("creator_id")}, {"_id": 0, "name": 1, "email": 1, "public_creator_id": 1, "average_rating": 1, "total_reviews": 1})
+    creator = await db.users.find_one({"id": gig.get("creator_id")}, {"_id": 0, "name": 1, "email": 1, "public_creator_id": 1, "average_rating": 1, "total_reviews": 1, "gender": 1, "language": 1, "country": 1, "age_range": 1, "profile": 1})
 
     response = normalize_gig_response(gig, creator or {})
 
@@ -460,7 +486,7 @@ async def get_creator_gigs(
     total = await db.gigs.count_documents(filter_dict)
 
     # Get creator info
-    creator = await db.users.find_one({"id": creator_id}, {"_id": 0, "name": 1, "email": 1, "public_creator_id": 1, "average_rating": 1, "total_reviews": 1})
+    creator = await db.users.find_one({"id": creator_id}, {"_id": 0, "name": 1, "email": 1, "public_creator_id": 1, "average_rating": 1, "total_reviews": 1, "gender": 1, "language": 1, "country": 1, "age_range": 1, "profile": 1})
 
     gig_responses = [normalize_gig_response(gig, creator or {}) for gig in gigs]
 
