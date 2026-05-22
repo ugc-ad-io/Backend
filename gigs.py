@@ -451,6 +451,40 @@ async def update_gig_status(
             "data": normalize_gig_response(updated_gig)
         }
 
+@gigs_router.post("/{gig_id}/wishlist")
+async def toggle_gig_wishlist(gig_id: str, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+    """Add/remove a gig from current user's wishlist. Returns new count + is_wishlisted state."""
+    user_id = current_user.get("id")
+    gig = await db.gigs.find_one({"id": gig_id}, {"_id": 0, "id": 1})
+    if not gig:
+        raise HTTPException(status_code=404, detail="Gig not found")
+
+    existing = await db.wishlists.find_one({"user_id": user_id, "gig_id": gig_id})
+    if existing:
+        await db.wishlists.delete_one({"user_id": user_id, "gig_id": gig_id})
+        is_wishlisted = False
+    else:
+        await db.wishlists.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "gig_id": gig_id,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        })
+        is_wishlisted = True
+
+    count = await db.wishlists.count_documents({"gig_id": gig_id})
+    return {"is_wishlisted": is_wishlisted, "count": count}
+
+
+@gigs_router.get("/{gig_id}/wishlist")
+async def get_gig_wishlist(gig_id: str, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+    """Get wishlist count and whether current user has wishlisted this gig."""
+    user_id = current_user.get("id")
+    count = await db.wishlists.count_documents({"gig_id": gig_id})
+    mine = await db.wishlists.find_one({"user_id": user_id, "gig_id": gig_id}, {"_id": 1})
+    return {"count": count, "is_wishlisted": bool(mine)}
+
+
 @gigs_router.get("/creator/{creator_id}")
 async def get_creator_gigs(
     creator_id: str,
