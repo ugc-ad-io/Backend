@@ -1901,9 +1901,9 @@ async def ensure_public_creator_id(creator: dict) -> str:
     existing = creator.get("public_creator_id")
     if existing:
         return existing
-    charset = string.ascii_uppercase + string.digits
+    charset = string.ascii_letters + string.digits  # a-z + A-Z + 0-9
     for _ in range(10):
-        candidate = "UGC-" + ''.join(random.choices(charset, k=6))
+        candidate = "UGC-" + ''.join(random.choices(charset, k=8))
         collision = await db.users.find_one({"public_creator_id": candidate}, {"_id": 1})
         if not collision:
             await db.users.update_one(
@@ -4525,11 +4525,11 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(get
         update_data["creator_directory_visible"] = is_approved
         update_data["curated_brand_visible"] = is_approved
 
-        # Generate a unique non-sequential public creator ID on approval (e.g., UGC-A7B3K9)
+        # Generate a unique non-sequential public creator ID on approval (e.g., UGC-aB3kQ7Xz)
         if is_approved and not user.get("public_creator_id"):
-            charset = string.ascii_uppercase + string.digits
+            charset = string.ascii_letters + string.digits  # a-z + A-Z + 0-9
             for _ in range(10):
-                candidate = "UGC-" + ''.join(random.choices(charset, k=6))
+                candidate = "UGC-" + ''.join(random.choices(charset, k=8))
                 existing = await db.users.find_one(
                     {"public_creator_id": candidate},
                     {"_id": 1}
