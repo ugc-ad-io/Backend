@@ -189,6 +189,7 @@ class LoginRequest(BaseModel):
     password: str
 
 class CreatorProfileUpdate(BaseModel):
+    username: Optional[str] = None
     profile_picture: Optional[str] = None
     banner: Optional[str] = None
     intro_video: Optional[str] = None
@@ -885,6 +886,19 @@ async def validate_message_attachments(attachment_urls: List[str]):
                 raise HTTPException(status_code=400, detail="A chat message can include at most 5 images.")
         if meta.get("size"):
             validate_upload_payload(meta.get("content_type"), meta.get("filename") or url, int(meta["size"]), meta.get("duration_seconds"))
+
+def strip_private_fields(user_doc: dict, requester_role: Optional[str]) -> dict:
+    """Remove fields that should not leak to other roles.
+
+    Username is a creator's private internal handle — only visible to the creator
+    themselves and admin/staff. Brands continue to see the auto-generated nickname.
+    """
+    if not isinstance(user_doc, dict):
+        return user_doc
+    if requester_role == UserRole.BUSINESS:
+        user_doc.pop("username", None)
+        user_doc.pop("email", None)
+    return user_doc
 
 def message_to_chat_item(msg: dict) -> dict:
     created_at = msg.get("created_at") or msg.get("timestamp")
@@ -2699,19 +2713,34 @@ async def get_business_settings_summary(current_user: dict = Depends(get_current
 async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
         raise HTTPException(status_code=403, detail="Only creators can update creator profile")
-    
+
     profile_data = data.dict()
+    username = (profile_data.pop("username", None) or "").strip().lower()
+
+    update_fields = {
+        "profile": profile_data,
+        "profile_completed": True,
+        "approval_status": ApprovalStatus.PENDING,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    if username:
+        if not re.match(r"^[a-z0-9_]{3,20}$", username):
+            raise HTTPException(status_code=400, detail="Username must be 3-20 characters: lowercase letters, numbers, or underscores")
+        existing = await db.users.find_one(
+            {"username": username, "id": {"$ne": current_user['id']}},
+            {"_id": 1}
+        )
+        if existing:
+            raise HTTPException(status_code=400, detail="Username already taken")
+        update_fields["username"] = username
+
     await db.users.update_one(
         {"id": current_user['id']},
-        {"$set": {
-            "profile": profile_data,
-            "profile_completed": True,
-            "approval_status": ApprovalStatus.PENDING,
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }}
+        {"$set": update_fields}
     )
-    
-    return {"message": "Profile submitted for review"}
+
+    return {"message": "Profile submitted for review", "username": username or None}
 
 @api_router.patch("/profile/portfolio")
 async def update_portfolio(portfolio: List[Any], current_user: dict = Depends(get_current_user)):
@@ -2969,12 +2998,17 @@ async def get_profile(user_id: str, current_user: dict = Depends(get_current_use
     user = await db.users.find_one({"id": user_id}, {"_id": 0, "password": 0})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
     # Hide sensitive info based on role
     if user['role'] == UserRole.CREATOR and current_user['role'] != UserRole.ADMIN:
         if 'profile' in user and 'social_links' in user['profile']:
             user['profile']['social_links'] = {}
-    
+
+    # Username is private — strip it (and email) from brand-facing responses,
+    # unless the requester is the user themselves.
+    if current_user.get('id') != user.get('id'):
+        strip_private_fields(user, current_user.get('role'))
+
     return user
 
 # Campaign Routes - Extended for 5-step flow
@@ -3798,24 +3832,26 @@ async def get_all_chats(current_user: dict = Depends(get_current_user)):
     # Enrich with user details
     conversations = []
     for user_pair, conv_data in conversations_dict.items():
-        user1 = await db.users.find_one({"id": conv_data['user1_id']}, {"_id": 0, "nickname": 1, "role": 1})
-        user2 = await db.users.find_one({"id": conv_data['user2_id']}, {"_id": 0, "nickname": 1, "role": 1})
-        
+        user1 = await db.users.find_one({"id": conv_data['user1_id']}, {"_id": 0, "nickname": 1, "username": 1, "role": 1})
+        user2 = await db.users.find_one({"id": conv_data['user2_id']}, {"_id": 0, "nickname": 1, "username": 1, "role": 1})
+
         # Count violations for this conversation
         violation_count = await db.violations.count_documents({
             "user_id": {"$in": [conv_data['user1_id'], conv_data['user2_id']]}
         })
-        
+
         conversations.append({
             "conversation_id": f"{conv_data['user1_id']}_{conv_data['user2_id']}",
             "user1": {
                 "id": conv_data['user1_id'],
                 "nickname": user1.get('nickname', 'Unknown') if user1 else 'Unknown',
+                "username": user1.get('username') if user1 else None,
                 "role": user1.get('role', '') if user1 else ''
             },
             "user2": {
                 "id": conv_data['user2_id'],
                 "nickname": user2.get('nickname', 'Unknown') if user2 else 'Unknown',
+                "username": user2.get('username') if user2 else None,
                 "role": user2.get('role', '') if user2 else ''
             },
             "last_message": conv_data['last_message'],
@@ -3834,7 +3870,7 @@ async def get_chat_for_admin(user1_id: str, user2_id: str, current_user: dict = 
     """Admin endpoint to view specific chat conversation"""
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
         raise HTTPException(status_code=403, detail="Admin access required")
-    
+
     # Get all messages between these two users
     messages = await db.messages.find({
         "$or": [
@@ -3842,7 +3878,23 @@ async def get_chat_for_admin(user1_id: str, user2_id: str, current_user: dict = 
             {"sender_id": user2_id, "recipient_id": user1_id}
         ]
     }, {"_id": 0}).sort("timestamp", 1).to_list(1000)
-    
+
+    # Enrich each message with the sender's current nickname/username for admin display
+    sender_cache: Dict[str, dict] = {}
+    for msg in messages:
+        sender_id = msg.get("sender_id")
+        if not sender_id or sender_id == "system":
+            msg["sender_username"] = None
+            continue
+        if sender_id not in sender_cache:
+            sender_cache[sender_id] = await db.users.find_one(
+                {"id": sender_id},
+                {"_id": 0, "nickname": 1, "username": 1}
+            ) or {}
+        sender = sender_cache[sender_id]
+        msg["sender_nickname"] = sender.get("nickname") or msg.get("sender_nickname")
+        msg["sender_username"] = sender.get("username")
+
     return messages
 
 # Work Submission Routes
