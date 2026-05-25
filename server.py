@@ -1753,6 +1753,7 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
         "token": token,
         "user_id": user['id'],
         "nickname": user['nickname'],
+        "username": user.get('username'),
         "role": user['role'],
         "profile_completed": user.get('profile_completed', False),
         "approval_status": user.get('approval_status', ApprovalStatus.PENDING),
@@ -1847,7 +1848,7 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
     )
     return {
         "id": creator.get("id"),
-        "handle": normalize_handle(creator.get("nickname")),
+        "public_creator_id": creator.get("public_creator_id") or "",
         "profile_photo": first_non_empty(creator.get("profile_photo"), creator.get("profile_picture"), profile.get("profile_photo"), profile.get("profile_picture")),
         "primary_category": primary_category or "",
         "languages": compact_list(creator.get("languages"), profile.get("languages"), creator.get("content_languages"), profile.get("content_languages")),
@@ -1894,6 +1895,25 @@ def creator_best_match_score(creator: dict, brand: dict) -> int:
     )]
     return 1 if any(term in creator_terms for term in terms) else 0
 
+async def ensure_public_creator_id(creator: dict) -> str:
+    """Lazily backfill public_creator_id for approved creators that were approved
+    before the public_creator_id system was introduced. Returns the id."""
+    existing = creator.get("public_creator_id")
+    if existing:
+        return existing
+    charset = string.ascii_uppercase + string.digits
+    for _ in range(10):
+        candidate = "UGC-" + ''.join(random.choices(charset, k=6))
+        collision = await db.users.find_one({"public_creator_id": candidate}, {"_id": 1})
+        if not collision:
+            await db.users.update_one(
+                {"id": creator.get("id")},
+                {"$set": {"public_creator_id": candidate}}
+            )
+            creator["public_creator_id"] = candidate
+            return candidate
+    return ""
+
 @api_router.get("/business/creator-directory")
 async def get_creator_directory(
     category: Optional[str] = None,
@@ -1925,6 +1945,7 @@ async def get_creator_directory(
     for creator in creators:
         if not creator_matches_directory_filters(creator, category, language, region, style, budget):
             continue
+        await ensure_public_creator_id(creator)
         deliverables = await creator_deliverables_completed(creator)
         rows.append({
             "creator": creator,
