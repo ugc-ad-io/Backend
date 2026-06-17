@@ -193,25 +193,36 @@ class CreatorProfileUpdate(BaseModel):
     profile_picture: Optional[str] = None
     banner: Optional[str] = None
     intro_video: Optional[str] = None
-    bio: str
-    tags: List[str]
-    social_links: Dict[str, str]
-    portfolio: List[str] = []
-    rate_card: Dict[str, Any]
+    # All optional so a partial onboarding submit doesn't 422; extra="allow" (below) keeps every
+    # additional detail the form sends (name, age, contact, equipment, languages, ...) instead of
+    # silently dropping it — those get stored via data.dict() in the route.
+    bio: Optional[str] = ""
+    tags: List[str] = []
+    social_links: Dict[str, Any] = {}
+    portfolio: List[Any] = []
+    rate_card: Dict[str, Any] = {}
     availability_calendar: Optional[Dict[str, Any]] = None
-    payment_methods: Dict[str, str]
+    payment_methods: Dict[str, Any] = {}
     receive_briefs: bool = True
-    terms_agreed: bool
+    terms_agreed: bool = False
+
+    class Config:
+        extra = "allow"
 
 class BusinessProfileUpdate(BaseModel):
     business_name: Optional[str] = None
     logo: Optional[str] = None
     banner: Optional[str] = None
-    business_description: str
+    # All optional so the onboarding form doesn't 422; extra="allow" stores the extra fields the
+    # form sends (country, phone, gstin, ...) that aren't declared here, via data.dict().
+    business_description: Optional[str] = ""
     website: Optional[str] = None
-    social_links: Dict[str, str]
-    product_type: str
-    industry_category: str
+    social_links: Dict[str, Any] = {}
+    product_type: Optional[str] = ""
+    industry_category: Optional[str] = ""
+
+    class Config:
+        extra = "allow"
 
 class PayoutRangeCreate(BaseModel):
     key: str
