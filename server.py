@@ -48,6 +48,7 @@ load_dotenv(ROOT_DIR / '.env')
 from applications import applications_router
 from categories import categories_router, seed_categories
 from gigs import gigs_router
+import creator_features as cf
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -526,6 +527,16 @@ async def generate_nickname() -> str:
     # Fallback: use UUID if all attempts fail
     return f"@User{str(uuid.uuid4())[:8]}"
 
+async def generate_creator_code() -> str:
+    """Generate a permanent, unique public creator code (e.g. CR-7F3A2B).
+    Distinct from the handle; never changes once assigned."""
+    for _ in range(50):
+        code = cf.generate_creator_code()
+        existing = await db.users.find_one({"creator_code": code}, {"_id": 1})
+        if not existing:
+            return code
+    return cf.generate_creator_code()
+
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -949,18 +960,43 @@ def require_fields(fields: Dict[str, Any], required: List[str], card_type: str):
     if missing:
         raise HTTPException(status_code=400, detail=f"{card_type} requires: {', '.join(missing)}")
 
+async def enforce_offer_price_floor(sender: dict, recipient_id: str, price: Any, field_name: str):
+    """Reject offers/counter-offers priced below the creator's level floor (PRD:
+    level-based price floors). The floor is keyed off the creator in the thread,
+    whether the offer is sent by the creator or by the brand."""
+    if sender.get("role") == UserRole.CREATOR:
+        creator = sender
+    else:
+        creator = await db.users.find_one({"id": recipient_id}, {"_id": 0, "level": 1, "role": 1})
+        if not creator or creator.get("role") != UserRole.CREATOR:
+            return  # not a creator thread; no floor to enforce
+    floor = cf.price_floor_for_level(creator.get("level"))
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a number.")
+    if value < floor:
+        level_label = cf.CREATOR_LEVELS[cf.normalize_level(creator.get("level"))]["label"]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Offer is below the minimum for a {level_label} creator. The price floor is ₹{floor}.",
+        )
+
+
 async def validate_action_card_payload(data: ChatActionCardCreate, current_user: dict):
     if data.type not in ACTION_CARD_TYPES:
         raise HTTPException(status_code=400, detail="Invalid action card type")
     fields = data.fields or {}
     if data.type == "custom_offer":
         require_fields(fields, ["deliverable_type", "quantity", "duration", "price", "timeline", "usage_rights"], "custom_offer")
+        await enforce_offer_price_floor(current_user, data.recipient_id, fields.get("price"), "price")
         fields.setdefault("expires_at", (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat())
     elif data.type == "private_invitation":
         require_fields(fields, ["campaign_name", "deliverable_summary", "budget", "timeline", "usage_rights", "full_brief_link"], "private_invitation")
         fields.setdefault("response_deadline", (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat())
     elif data.type == "counter_offer":
         require_fields(fields, ["modified_price", "revisions", "timeline", "usage_rights", "diff_vs_original"], "counter_offer")
+        await enforce_offer_price_floor(current_user, data.recipient_id, fields.get("modified_price"), "modified_price")
         existing_rounds = await db.chat_action_cards.count_documents({
             "thread_key": thread_key_for(current_user["id"], data.recipient_id),
             "type": "counter_offer"
@@ -1372,6 +1408,8 @@ def normalize_content_submission(campaign: dict, content_versions: List[dict], w
             "caption_url": version.get('caption_url'),
             "thumbnail_url": version.get('thumbnail_url'),
             "raw_footage_url": version.get('raw_footage_url'),
+            "original_url": version.get('original_url') or version.get('video_url'),
+            "watermark": version.get('watermark') or cf.build_watermark_record(version.get('video_url'), "video"),
             "submitted_at": version.get('submitted_at'),
             "status": version.get('status', 'submitted')
         })
@@ -1398,9 +1436,13 @@ def normalize_revision_tracker(work: Optional[dict], response: Optional[dict]) -
     requested_changes = latest.get('requested_changes')
     if not requested_changes and latest.get('feedback'):
         requested_changes = [line.strip() for line in latest['feedback'].splitlines() if line.strip()]
+    used = len(revisions)
     return {
-        "revision_count_used": len(revisions),
-        "revision_limit": (work or {}).get('revision_limit', 2),
+        "revision_count_used": used,
+        "revision_limit": (work or {}).get('revision_limit', cf.FREE_REVISION_LIMIT),
+        "free_revision_limit": cf.FREE_REVISION_LIMIT,
+        "free_revisions_remaining": max(0, cf.FREE_REVISION_LIMIT - used),
+        "next_revision_fee": cf.revision_fee_for(used),
         "latest_feedback": latest.get('feedback'),
         "requested_changes": requested_changes or [],
         "new_deadline_at": latest.get('new_deadline_at'),
@@ -1578,6 +1620,15 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
     state = compute_deal_state(campaign, context['shipment'], normalized_receipt, context['work'], context['escrow'], context['action_cards'])
     escrow = normalize_escrow(context['escrow'], context['my_bid'], state['current_state'])
     content_submission = normalize_content_submission(campaign, context['content_versions'], context['work'])
+    # Watermark gating: a brand viewer only sees raw originals once the work is
+    # approved; before that, versions are stripped to watermark-protected
+    # previews (PRD Section 8). Creators and admins always see their own assets.
+    work_approved = (context['work'] or {}).get('status') == WorkStatus.APPROVED or campaign.get('status') == CampaignStatus.COMPLETED
+    if viewer.get('id') == brand.get('id') and viewer.get('role') == UserRole.BUSINESS:
+        content_submission["versions"] = [
+            cf.to_brand_facing_asset(version, approved=work_approved)
+            for version in content_submission["versions"]
+        ]
     revision_tracker = normalize_revision_tracker(context['work'], context['revision_response'])
 
     legacy_messages = await db.messages.find({
@@ -1709,7 +1760,7 @@ async def signup(data: SignupRequest):
     
     user_id = str(uuid.uuid4())
     nickname = await generate_nickname()
-    
+
     user_doc = {
         "id": user_id,
         "email": data.email,
@@ -1723,11 +1774,24 @@ async def signup(data: SignupRequest):
         "created_at": datetime.now(timezone.utc).isoformat(),
         "balance": 0.0
     }
-    
+
+    # Creators get a permanent, unique public code + a default level used for
+    # offer price-floor enforcement.
+    if data.role == UserRole.CREATOR:
+        user_doc["creator_code"] = await generate_creator_code()
+        user_doc["level"] = cf.DEFAULT_CREATOR_LEVEL
+        user_doc["handle_locked"] = False
+
     await db.users.insert_one(user_doc)
     token = create_token(user_id, data.email, data.role)
-    
-    return {"token": token, "user_id": user_id, "nickname": nickname, "role": data.role}
+
+    return {
+        "token": token,
+        "user_id": user_id,
+        "nickname": nickname,
+        "creator_code": user_doc.get("creator_code"),
+        "role": data.role,
+    }
 
 @api_router.post("/auth/login")
 async def login(data: LoginRequest, totp_token: Optional[str] = None):
@@ -1765,6 +1829,8 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
         "user_id": user['id'],
         "nickname": user['nickname'],
         "username": user.get('username'),
+        "creator_code": user.get('creator_code'),
+        "level": user.get('level'),
         "role": user['role'],
         "profile_completed": user.get('profile_completed', False),
         "approval_status": user.get('approval_status', ApprovalStatus.PENDING),
@@ -1849,6 +1915,9 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
     profile = creator.get("profile") or {}
     portfolio = first_non_empty(creator.get("portfolio"), profile.get("portfolio")) or []
     portfolio_preview = portfolio[0] if isinstance(portfolio, list) and portfolio else portfolio
+    # Brands only ever see the watermark-protected preview of a sample (PRD 2.7).
+    if isinstance(portfolio_preview, dict):
+        portfolio_preview = cf.to_brand_facing_asset(portfolio_preview, approved=False)
     primary_category = first_non_empty(
         creator.get("primary_category"),
         creator.get("category"),
@@ -2741,13 +2810,59 @@ async def get_business_settings_summary(current_user: dict = Depends(get_current
     }
 
 # Profile Routes
+@api_router.get("/profile/handle/check")
+async def check_handle_availability(handle: str, current_user: dict = Depends(get_current_user)):
+    """Validate a proposed creator handle and report availability + suggestions (PRD 2.5)."""
+    ok, normalized, error = cf.validate_handle(handle)
+    if not ok:
+        return {"valid": False, "available": False, "reason": error, "suggestions": []}
+    existing = await db.users.find_one(
+        {"username": normalized, "id": {"$ne": current_user['id']}},
+        {"_id": 1}
+    )
+    if existing:
+        taken = set(
+            doc["username"]
+            for doc in await db.users.find(
+                {"username": {"$regex": f"^{re.escape(normalized)}"}}, {"_id": 0, "username": 1}
+            ).to_list(50)
+            if doc.get("username")
+        )
+        return {
+            "valid": True,
+            "available": False,
+            "reason": "Handle already taken",
+            "suggestions": cf.handle_suggestions(normalized, taken),
+        }
+    return {"valid": True, "available": True, "reason": "", "display": f"@{normalized}", "suggestions": []}
+
+
+@api_router.get("/creator/levels")
+async def get_creator_levels():
+    """Expose the creator level table and per-level offer price floors."""
+    return {
+        "levels": [
+            {"key": key, **value} for key, value in cf.CREATOR_LEVELS.items()
+        ],
+        "default_level": cf.DEFAULT_CREATOR_LEVEL,
+    }
+
+
 @api_router.put("/profile/creator")
 async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
         raise HTTPException(status_code=403, detail="Only creators can update creator profile")
 
     profile_data = data.dict()
-    username = (profile_data.pop("username", None) or "").strip().lower()
+    username = cf.normalize_handle(profile_data.pop("username", None))
+
+    # Optional portfolio enforcement: if the submit carries samples, they must
+    # satisfy the 3-5 + metadata rules (PRD 2.7).
+    submitted_portfolio = profile_data.get("portfolio") or []
+    if submitted_portfolio:
+        ok, error = cf.validate_portfolio(submitted_portfolio)
+        if not ok:
+            raise HTTPException(status_code=400, detail=error)
 
     update_fields = {
         "profile": profile_data,
@@ -2757,15 +2872,22 @@ async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict 
     }
 
     if username:
-        if not re.match(r"^[a-z0-9_]{3,20}$", username):
-            raise HTTPException(status_code=400, detail="Username must be 3-20 characters: lowercase letters, numbers, or underscores")
-        existing = await db.users.find_one(
-            {"username": username, "id": {"$ne": current_user['id']}},
-            {"_id": 1}
-        )
-        if existing:
-            raise HTTPException(status_code=400, detail="Username already taken")
-        update_fields["username"] = username
+        current_handle = current_user.get("username")
+        # Handle is permanent once set: changing it requires admin review.
+        if current_user.get("handle_locked") and current_handle and username != current_handle:
+            raise HTTPException(status_code=400, detail="Your handle is permanent and cannot be changed without admin review.")
+        if username != current_handle:
+            ok, normalized, error = cf.validate_handle(username)
+            if not ok:
+                raise HTTPException(status_code=400, detail=error)
+            existing = await db.users.find_one(
+                {"username": normalized, "id": {"$ne": current_user['id']}},
+                {"_id": 1}
+            )
+            if existing:
+                raise HTTPException(status_code=400, detail="Handle already taken")
+            update_fields["username"] = normalized
+            update_fields["handle_locked"] = True
 
     await db.users.update_one(
         {"id": current_user['id']},
@@ -2782,15 +2904,31 @@ async def update_portfolio(portfolio: List[Any], current_user: dict = Depends(ge
     if current_user['role'] != UserRole.CREATOR:
         raise HTTPException(status_code=403, detail="Only creators can update portfolio")
 
+    # PRD 2.7: a creator cannot save a portfolio with fewer than 3 or more than
+    # 5 samples, and each rich sample must carry its metadata.
+    ok, error = cf.validate_portfolio(portfolio)
+    if not ok:
+        raise HTTPException(status_code=400, detail=error)
+
+    # Build watermark-protected previews so brands never receive raw assets.
+    uploads_dir = str(Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))))
+    enriched = []
+    for item in portfolio:
+        if isinstance(item, dict):
+            asset_url = item.get("video_url") or item.get("url") or item.get("original_url")
+            kind = "image" if str(item.get("deliverable_type") or "").lower() in ("static", "static post", "image", "carousel post") else "video"
+            item = {**item, "original_url": asset_url, "watermark": cf.build_watermark_record(asset_url, kind, uploads_dir)}
+        enriched.append(item)
+
     await db.users.update_one(
         {"id": current_user['id']},
         {"$set": {
-            "portfolio": portfolio,
+            "portfolio": enriched,
             "updated_at": datetime.now(timezone.utc).isoformat()
         }}
     )
 
-    return {"message": "Portfolio updated successfully"}
+    return {"message": "Portfolio updated successfully", "count": len(enriched)}
 
 @api_router.put("/profile/business")
 async def update_business_profile(data: BusinessProfileUpdate, current_user: dict = Depends(get_current_user)):
@@ -3939,6 +4077,8 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
     if not campaign or campaign.get('selected_creator') != current_user['id']:
         raise HTTPException(status_code=403, detail="Not authorized")
 
+    uploads_dir = str(Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))))
+    primary_file = data.work_files[0] if data.work_files else None
     work_doc = {
         "id": str(uuid.uuid4()),
         "campaign_id": data.campaign_id,
@@ -3947,6 +4087,7 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         "description": data.description,
         "status": WorkStatus.SUBMITTED,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "watermark": cf.build_watermark_record(primary_file, "video", uploads_dir),
         "revisions": []
     }
 
@@ -3986,11 +4127,22 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
             {"id": escrow['id']},
             {"$set": {"status": "released", "released_at": datetime.now(timezone.utc).isoformat()}}
         )
-        
+
         # Update creator balance
         await db.users.update_one(
             {"id": work['creator_id']},
             {"$inc": {"balance": escrow['amount']}}
+        )
+
+        # Manual payout receipt for the released earning (PRD 1.6: payment status
+        # tracking + payout receipt).
+        await create_payout_receipt(
+            creator_id=work['creator_id'],
+            receipt_type="earning",
+            gross_amount=float(escrow.get('amount') or 0),
+            campaign_id=work['campaign_id'],
+            reference_id=escrow.get('id'),
+            note="Escrow released on content approval",
         )
     
     # Update campaign status
@@ -4013,21 +4165,56 @@ async def request_revision(work_id: str, feedback: str, current_user: dict = Dep
     campaign = await db.campaigns.find_one({"id": work['campaign_id']})
     if campaign['business_id'] != current_user['id']:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
+    # PRD Section 8: first 2 revisions are free; each one thereafter costs the
+    # brand a flat ₹500, debited from the wallet at request time.
+    used = len(work.get('revisions') or [])
+    fee = cf.revision_fee_for(used)
+    paid = False
+    if fee > 0:
+        balance = float(current_user.get('balance') or 0)
+        if balance < fee:
+            raise HTTPException(
+                status_code=402,
+                detail=f"This is a paid revision (₹{fee}). Your wallet balance (₹{int(balance)}) is insufficient. Please recharge.",
+            )
+        await db.users.update_one({"id": current_user['id']}, {"$inc": {"balance": -fee}})
+        await db.wallet_ledger.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": current_user['id'],
+            "type": "debit",
+            "category": "revision_fee",
+            "amount": fee,
+            "campaign_id": work['campaign_id'],
+            "work_id": work_id,
+            "description": f"Paid revision #{used + 1} for campaign {work['campaign_id']}",
+            "created_at": now_iso(),
+        })
+        paid = True
+
     revision = {
         "feedback": feedback,
-        "requested_at": datetime.now(timezone.utc).isoformat()
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "index": used + 1,
+        "paid": paid,
+        "fee": fee,
     }
-    
+
     await db.work_submissions.update_one(
         {"id": work_id},
         {"$set": {"status": WorkStatus.REVISION_REQUESTED}, "$push": {"revisions": revision}}
     )
 
-    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "revision_requested", "Brand requested content revisions.")
-    await insert_deal_system_message(campaign, "Brand requested content revisions.")
-    
-    return {"message": "Revision requested"}
+    note = f" (paid revision, ₹{fee} charged)" if paid else f" ({cf.FREE_REVISION_LIMIT - used - 1} free revision(s) remaining)"
+    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "revision_requested", f"Brand requested content revisions.{note}")
+    await insert_deal_system_message(campaign, f"Brand requested content revisions.{note}")
+
+    return {
+        "message": "Revision requested",
+        "revision_number": used + 1,
+        "free_revisions_remaining": max(0, cf.FREE_REVISION_LIMIT - (used + 1)),
+        "fee_charged": fee,
+    }
 
 @api_router.get("/deals/my")
 async def get_my_deals(current_user: dict = Depends(get_current_user)):
@@ -4134,6 +4321,7 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         "creator_id": current_user['id']
     })
     version = existing_versions + 1
+    uploads_dir = str(Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))))
     submission = {
         "id": str(uuid.uuid4()),
         "deal_id": make_deal_id(campaign),
@@ -4144,6 +4332,10 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         "caption_url": data.caption_url,
         "thumbnail_url": data.thumbnail_url,
         "raw_footage_url": data.raw_footage_url,
+        "original_url": data.video_url,
+        # Watermark-protected preview so the brand never receives the raw cut
+        # before approval (PRD Section 8).
+        "watermark": cf.build_watermark_record(data.video_url, "video", uploads_dir),
         "creator_note": data.creator_note,
         "submitted_at": now_iso(),
         "status": "submitted"
@@ -4157,6 +4349,7 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         "description": data.creator_note or f"Deal content submission v{version}",
         "status": WorkStatus.SUBMITTED,
         "submitted_at": submission['submitted_at'],
+        "watermark": submission['watermark'],
         "revisions": []
     }
     await db.work_submissions.insert_one(work_doc)
@@ -4320,7 +4513,9 @@ async def get_work_pending_review(current_user: dict = Depends(get_current_user)
         {"_id": 0}
     ).to_list(1000)
 
-    return work_submissions
+    # Brand review happens on watermark-protected previews only; raw files are
+    # withheld until approval (PRD Section 8).
+    return [cf.to_brand_facing_asset(work, approved=False) for work in work_submissions]
 
 @api_router.get("/work/{work_id}")
 async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_user)):
@@ -4335,6 +4530,9 @@ async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_
         campaign = await db.campaigns.find_one({"id": work['campaign_id']})
         if campaign['business_id'] != current_user['id']:
             raise HTTPException(status_code=403, detail="Not authorized to view this work")
+        # Brand viewer gets the watermark-protected preview until approval.
+        approved = work.get('status') == WorkStatus.APPROVED
+        return cf.to_brand_facing_asset(work, approved=approved)
 
     return work
 
@@ -4457,6 +4655,35 @@ async def get_shipment(campaign_id: str, current_user: dict = Depends(get_curren
     return shipment
 
 # Withdrawal Routes
+PLATFORM_COMMISSION_PERCENT = 25  # PRD Section 3: platform takes 25%.
+
+async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount: float,
+                                campaign_id: Optional[str] = None, reference_id: Optional[str] = None,
+                                note: Optional[str] = None) -> dict:
+    """Generate and persist a payout receipt for a creator. receipt_type is
+    'earning' (escrow release) or 'withdrawal' (payout to bank/UPI)."""
+    commission = round(gross_amount * PLATFORM_COMMISSION_PERCENT / 100, 2) if receipt_type == "earning" else 0.0
+    net_amount = round(gross_amount - commission, 2)
+    seq = await db.payout_receipts.count_documents({}) + 1
+    receipt = {
+        "id": str(uuid.uuid4()),
+        "receipt_number": f"PR-{datetime.now(timezone.utc).year}-{seq:05d}",
+        "creator_id": creator_id,
+        "type": receipt_type,
+        "gross_amount": gross_amount,
+        "commission_percent": PLATFORM_COMMISSION_PERCENT if receipt_type == "earning" else 0,
+        "commission_amount": commission,
+        "net_amount": net_amount,
+        "currency": "INR",
+        "campaign_id": campaign_id,
+        "reference_id": reference_id,
+        "note": note,
+        "created_at": now_iso(),
+    }
+    await db.payout_receipts.insert_one(receipt)
+    return {k: v for k, v in receipt.items() if k != "_id"}
+
+
 @api_router.post("/withdrawal/request")
 async def request_withdrawal(data: WithdrawalRequest, current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
@@ -4490,6 +4717,23 @@ async def request_withdrawal(data: WithdrawalRequest, current_user: dict = Depen
 async def get_withdrawal_history(current_user: dict = Depends(get_current_user)):
     withdrawals = await db.withdrawals.find({"user_id": current_user['id']}, {"_id": 0}).to_list(1000)
     return withdrawals
+
+@api_router.get("/payouts/receipts")
+async def get_payout_receipts(current_user: dict = Depends(get_current_user)):
+    """All payout receipts (earnings + withdrawals) for the current creator."""
+    receipts = await db.payout_receipts.find(
+        {"creator_id": current_user['id']}, {"_id": 0}
+    ).sort("created_at", -1).to_list(1000)
+    return receipts
+
+@api_router.get("/payouts/receipts/{receipt_id}")
+async def get_payout_receipt(receipt_id: str, current_user: dict = Depends(get_current_user)):
+    receipt = await db.payout_receipts.find_one({"id": receipt_id}, {"_id": 0})
+    if not receipt:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    if receipt['creator_id'] != current_user['id'] and current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
+        raise HTTPException(status_code=403, detail="Not authorized to view this receipt")
+    return receipt
 
 @api_router.get("/payout-ranges")
 async def get_payout_ranges(current_user: dict = Depends(get_current_user)):
@@ -4850,16 +5094,26 @@ async def approve_withdrawal(withdrawal_id: str, current_user: dict = Depends(ge
     if withdrawal['status'] != WithdrawalStatus.PENDING:
         raise HTTPException(status_code=400, detail="Withdrawal already processed")
     
+    receipt = await create_payout_receipt(
+        creator_id=withdrawal['user_id'],
+        receipt_type="withdrawal",
+        gross_amount=float(withdrawal.get('amount') or 0),
+        reference_id=withdrawal_id,
+        note=f"Payout via {withdrawal.get('payment_method', 'bank/UPI')}",
+    )
+
     await db.withdrawals.update_one(
         {"id": withdrawal_id},
         {"$set": {
             "status": WithdrawalStatus.COMPLETED,
             "approved_by": current_user['id'],
-            "approved_at": datetime.now(timezone.utc).isoformat()
+            "approved_at": datetime.now(timezone.utc).isoformat(),
+            "receipt_id": receipt['id'],
+            "receipt_number": receipt['receipt_number'],
         }}
     )
-    
-    return {"message": "Withdrawal approved successfully"}
+
+    return {"message": "Withdrawal approved successfully", "receipt": receipt}
 
 @api_router.post("/admin/withdrawals/{withdrawal_id}/reject")
 async def reject_withdrawal(withdrawal_id: str, reason: str, current_user: dict = Depends(get_current_user)):
