@@ -24,6 +24,62 @@ class IndustryType(str, Enum):
     FOOD_BEVERAGE = "foodBeverage"
 
 
+class BriefSectionsMixin(BaseModel):
+    """
+    Structured fields for the 8-section "Post a Brief" template.
+    Mixed into the create/draft/update campaign models so every section of the
+    brief is persisted as queryable structured data (instead of being flattened
+    into the brief_text blob). All fields are optional to support partial drafts.
+    """
+    # Section 1: Campaign Basics (extra)
+    target_audience: Optional[str] = None
+    budget_visible: Optional[bool] = None
+
+    # Section 2: Deliverables (structured list of {type, quantity, duration, aspect_ratios, raw_required})
+    deliverable_items: Optional[List[Dict[str, Any]]] = None
+
+    # Section 3: Must-Include
+    product_visible: Optional[bool] = None
+    product_visible_seconds: Optional[str] = None
+    verbal_mention: Optional[bool] = None
+    verbal_mention_text: Optional[str] = None
+    required_phrases: Optional[List[str]] = None
+    required_shots: Optional[List[str]] = None
+    call_to_action: Optional[str] = None
+    promo_code: Optional[str] = None
+    hashtags: Optional[str] = None
+    brand_handle_tag: Optional[bool] = None
+
+    # Section 4: Must-Avoid
+    no_competitors: Optional[bool] = None
+    competitors_text: Optional[str] = None
+    no_other_products: Optional[bool] = None
+    no_profanity: Optional[bool] = None
+    no_political: Optional[bool] = None
+    avoid_filters: Optional[bool] = None
+    filter_types_text: Optional[str] = None
+    avoid_text: Optional[str] = None
+
+    # Section 5: Style Guidance
+    pacing: Optional[str] = None
+    music_preference: Optional[str] = None
+    reference_videos: Optional[List[str]] = None
+    mood_images: Optional[List[str]] = None
+
+    # Section 6: Usage Rights
+    usage_platforms: Optional[List[str]] = None
+    rights_duration: Optional[str] = None
+    exclusivity: Optional[str] = None
+    whitelisting: Optional[bool] = None
+    modification_rights: Optional[str] = None
+
+    # Section 7: Timeline & Budget (extra)
+    product_shipping_by: Optional[str] = None
+    draft_delivery_by: Optional[str] = None
+    final_delivery_by: Optional[str] = None
+    budget_mode: Optional[str] = None
+
+
 # Step 1: Product Info
 class ProductInfo(BaseModel):
     product_name: Optional[str] = None
@@ -71,7 +127,7 @@ class BudgetReview(BaseModel):
 
 
 # Extended Campaign Create Model (supports both old and new fields)
-class CampaignCreateExtended(BaseModel):
+class CampaignCreateExtended(BriefSectionsMixin):
     # Legacy fields (backward compatibility)
     title: Optional[str] = None
     objectives: Optional[List[str]] = None
@@ -145,8 +201,11 @@ class CampaignCreateExtended(BaseModel):
     # Industry classification
     industry_type: Optional[IndustryType] = None
 
+    # Matching (PRD 5.2 Path B): brand requests an ops-curated shortlist
+    match_requested: Optional[bool] = None
 
-class CampaignDraftCreate(BaseModel):
+
+class CampaignDraftCreate(BriefSectionsMixin):
     """Model for creating draft campaigns - allows partial data"""
     # Any field can be optional for drafts
     title: Optional[str] = None
@@ -198,7 +257,7 @@ class CampaignDraftCreate(BaseModel):
     industry_type: Optional[IndustryType] = None
 
 
-class CampaignUpdate(BaseModel):
+class CampaignUpdate(BriefSectionsMixin):
     """Model for updating existing campaigns"""
     title: Optional[str] = None
     objectives: Optional[List[str]] = None
@@ -255,3 +314,6 @@ class CampaignUpdate(BaseModel):
     shipment_option: Optional[str] = None
     content_requirements: Optional[Dict[str, bool]] = None
     revision_limit: Optional[int] = None
+
+    # Matching (PRD 5.2 Path B)
+    match_requested: Optional[bool] = None

@@ -30,6 +30,14 @@ const ACTION_CARD_LABELS = {
   raise_dispute: 'Raise Dispute'
 };
 const ACTION_CARD_TYPES = Object.keys(ACTION_CARD_LABELS);
+const OFFER_CARD_TYPES = ['custom_offer', 'private_invitation', 'counter_offer'];
+const DECLINE_REASONS = [
+  { value: 'not_my_niche', label: 'Not my niche' },
+  { value: 'budget', label: "Budget doesn't fit" },
+  { value: 'timeline', label: 'Timeline too short' },
+  { value: 'unavailable', label: 'Currently unavailable' },
+  { value: 'other', label: 'Other' }
+];
 
 // Define which action cards are available for each role
 const ACTION_CARDS_BY_ROLE = {
@@ -130,6 +138,9 @@ export default function MessagesPage() {
   const [creatingCard, setCreatingCard] = useState(false);
   const [actionComposerType, setActionComposerType] = useState(null);
   const [actionForm, setActionForm] = useState({});
+  const [declineCardId, setDeclineCardId] = useState(null);
+  const [declineReason, setDeclineReason] = useState('');
+  const [declineNote, setDeclineNote] = useState('');
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const typingSentAtRef = useRef(0);
@@ -416,14 +427,30 @@ export default function MessagesPage() {
     return 'Delivered';
   };
 
-  const respondToActionCard = async (cardId, action) => {
+  const respondToActionCard = async (cardId, action, extra = {}) => {
     try {
-      await axios.post(`${API}/chat/action-cards/${cardId}/respond`, { action });
+      await axios.post(`${API}/chat/action-cards/${cardId}/respond`, { action, ...extra });
       toast.success('Action card updated');
       fetchMessages(selectedId);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Action failed');
+      const detail = err.response?.data?.detail;
+      toast.error((detail && (typeof detail === 'string' ? detail : detail.message)) || 'Action failed');
     }
+  };
+
+  const startDecline = (cardId) => {
+    setDeclineCardId(cardId);
+    setDeclineReason('');
+    setDeclineNote('');
+  };
+
+  const submitDecline = async () => {
+    if (!declineReason) {
+      toast.error('Please select a reason for declining');
+      return;
+    }
+    await respondToActionCard(declineCardId, 'reject', { decline_reason: declineReason, note: declineNote });
+    setDeclineCardId(null);
   };
 
   const renderActionCard = (item) => {
@@ -444,11 +471,39 @@ export default function MessagesPage() {
             <p key={key}><span>{key.replaceAll('_', ' ')}</span><strong>{formatActionValue(value)}</strong></p>
           ))}
         </div>
-        {!isOwn && item.status === 'open' && item.available_actions?.length ? (
+        {item.is_expired ? <em className="msg-action-card-expired">Expired</em> : null}
+        {!isOwn && item.status === 'open' && !item.is_expired && item.available_actions?.length ? (
           <div className="msg-action-card-actions">
-            {item.available_actions.map((action) => (
-              <button key={action} type="button" onClick={() => respondToActionCard(item.id, action)}>{action}</button>
-            ))}
+            {item.available_actions.map((action) => {
+              const isOfferDecline = action === 'reject' && OFFER_CARD_TYPES.includes(item.type);
+              return (
+                <button
+                  key={action}
+                  type="button"
+                  onClick={() => (isOfferDecline ? startDecline(item.id) : respondToActionCard(item.id, action))}
+                >
+                  {isOfferDecline ? 'decline' : action}
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
+        {declineCardId === item.id ? (
+          <div className="msg-action-card-decline">
+            <select value={declineReason} onChange={(e) => setDeclineReason(e.target.value)}>
+              <option value="">Select a reason…</option>
+              {DECLINE_REASONS.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
+            </select>
+            <input
+              type="text"
+              placeholder="Optional comment (no contact info)"
+              value={declineNote}
+              onChange={(e) => setDeclineNote(e.target.value)}
+            />
+            <div className="msg-action-card-decline-actions">
+              <button type="button" onClick={submitDecline}>Send decline</button>
+              <button type="button" onClick={() => setDeclineCardId(null)}>Cancel</button>
+            </div>
           </div>
         ) : null}
         <small className="msg-action-card-time">{new Date(getItemTime(item)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small>
@@ -648,7 +703,16 @@ export default function MessagesPage() {
               </div>
               <div className="msg-chat-actions">
                 <button type="button" title="View profile" onClick={() => navigate(`/profile/${selectedId}`)}><User size={18} /></button>
-                <button type="button" title="Report user" onClick={() => toast.info('Report flow coming soon')}><Flag size={18} /></button>
+                <button type="button" title="Report user" onClick={async () => {
+                  const reason = window.prompt('Briefly describe the issue (spam, harassment, etc.):');
+                  if (reason === null) return;
+                  try {
+                    await axios.post(`${API}/chat/report`, { reported_user_id: selectedId, reason });
+                    toast.success('Report submitted to admin');
+                  } catch (err) {
+                    toast.error(err.response?.data?.detail || 'Failed to submit report');
+                  }
+                }}><Flag size={18} /></button>
                 <button type="button" title="Mute notifications" onClick={() => toast.success('Notifications muted for this thread')}><BellOff size={18} /></button>
                 <button type="button" title="More actions"><MoreHorizontal size={18} /></button>
               </div>

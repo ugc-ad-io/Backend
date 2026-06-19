@@ -772,6 +772,7 @@ export default function AdminDashboard() {
     { id: 'gigs', label: `Gig Management (${pendingGigs.length})`, icon: Briefcase, testId: 'tab-gigs', slug: 'gigs' },
     { id: 'withdrawals', label: `Withdrawals (${pendingWithdrawals.length})`, icon: Briefcase, testId: 'tab-withdrawals', slug: 'withdrawals' },
     { id: 'allcampaigns', label: 'All Campaigns', icon: Briefcase, testId: 'tab-allcampaigns', slug: 'all-campaigns' },
+    { id: 'matchqueue', label: 'Match Queue', icon: UserPlus, testId: 'tab-matchqueue', slug: 'match-queue' },
     ...(user?.role === 'admin' ? [
       { id: 'users', label: 'All Users', icon: Users, testId: 'tab-users', slug: 'users' },
       { id: 'assignments', label: 'Campaign Assignments', icon: Briefcase, testId: 'tab-assignments', slug: 'assignments' },

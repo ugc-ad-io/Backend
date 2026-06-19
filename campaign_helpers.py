@@ -148,6 +148,13 @@ def normalize_campaign_response(campaign: Dict[str, Any]) -> Dict[str, Any]:
     campaign.setdefault('creator_niche_tags', [])
     campaign.setdefault('objectives', [])
     campaign.setdefault('brief_attachments', [])
+    # Structured brief section lists
+    campaign.setdefault('deliverable_items', [])
+    campaign.setdefault('required_phrases', [])
+    campaign.setdefault('required_shots', [])
+    campaign.setdefault('reference_videos', [])
+    campaign.setdefault('mood_images', [])
+    campaign.setdefault('usage_platforms', [])
 
     # Ensure currency default
     campaign.setdefault('currency', 'INR')
@@ -188,6 +195,13 @@ def prepare_campaign_for_storage(campaign_data: Dict[str, Any], status: str = 'd
     campaign_data.setdefault('objectives', [])
     campaign_data.setdefault('brief_attachments', [])
     campaign_data.setdefault('bids', [])
+    # Structured brief section lists
+    campaign_data.setdefault('deliverable_items', [])
+    campaign_data.setdefault('required_phrases', [])
+    campaign_data.setdefault('required_shots', [])
+    campaign_data.setdefault('reference_videos', [])
+    campaign_data.setdefault('mood_images', [])
+    campaign_data.setdefault('usage_platforms', [])
     
     # Set defaults
     campaign_data.setdefault('currency', 'INR')
@@ -209,42 +223,43 @@ def can_edit_campaign(campaign: Dict[str, Any]) -> bool:
 
 def get_campaign_completion_percentage(campaign: Dict[str, Any]) -> int:
     """
-    Calculate the completion percentage of a campaign based on filled fields.
+    Calculate the completion percentage of a brief across the 8 sections of the
+    "Post a Brief" template. Each section is weighted equally (one section = one
+    point) and a section counts as complete when its key fields are present.
     """
-    total_fields = 0
-    filled_fields = 0
-    
-    # Step 1: Product Info (7 fields, but 4 required)
-    product_fields = ['product_name', 'product_category', 'product_description', 'product_url']
-    for field in product_fields:
-        total_fields += 1
-        if campaign.get(field):
-            filled_fields += 1
-    
-    # Step 2: Content Requirements (6 fields, but 2 required)
-    content_fields = ['campaign_hook', 'key_message', 'what_not_to_do', 'brief_type']
-    for field in content_fields:
-        total_fields += 1
-        if campaign.get(field):
-            filled_fields += 1
-    
-    # Step 3: Deliverables (5 fields, but 3 required)
-    deliverable_fields = ['video_format', 'aspect_ratio', 'duration_seconds', 'free_revisions']
-    for field in deliverable_fields:
-        total_fields += 1
-        if campaign.get(field):
-            filled_fields += 1
-    
-    # Step 4: Creator Requirements (5 fields, but 1 required)
-    creator_fields = ['creator_level', 'content_quality_tier', 'gender_preference']
-    for field in creator_fields:
-        total_fields += 1
-        if campaign.get(field):
-            filled_fields += 1
-    
-    # Step 5: Budget (1 required field)
-    total_fields += 1
-    if campaign.get('per_video_budget'):
-        filled_fields += 1
-    
-    return int((filled_fields / total_fields) * 100) if total_fields > 0 else 0
+    sections_complete = 0
+    total_sections = 8
+
+    # Section 1: Campaign Basics
+    if all(campaign.get(f) for f in ['title', 'product_name', 'product_description', 'campaign_hook', 'key_message', 'product_category']) and campaign.get('objectives') and campaign.get('target_audience'):
+        sections_complete += 1
+
+    # Section 2: Deliverables
+    if campaign.get('deliverable_items') or (campaign.get('video_format') and campaign.get('aspect_ratio')):
+        sections_complete += 1
+
+    # Section 3: Must-Include
+    if campaign.get('call_to_action'):
+        sections_complete += 1
+
+    # Section 4: Must-Avoid (guidance section; complete once any avoid rule or text is set)
+    if any(campaign.get(f) for f in ['no_competitors', 'no_other_products', 'no_profanity', 'no_political', 'avoid_filters', 'avoid_text', 'what_not_to_do']):
+        sections_complete += 1
+
+    # Section 5: Style Guidance
+    if campaign.get('tone_tags') and (campaign.get('pacing') or campaign.get('tone_reference')):
+        sections_complete += 1
+
+    # Section 6: Usage Rights
+    if campaign.get('usage_platforms') and campaign.get('rights_duration') and campaign.get('exclusivity') and campaign.get('modification_rights'):
+        sections_complete += 1
+
+    # Section 7: Timeline & Budget
+    if (campaign.get('per_video_budget') or campaign.get('budget_max')) and campaign.get('creator_level') and campaign.get('final_delivery_by'):
+        sections_complete += 1
+
+    # Section 8: Review & Publish (complete once the brief has been submitted out of draft)
+    if campaign.get('status') and campaign.get('status') != 'draft':
+        sections_complete += 1
+
+    return int((sections_complete / total_sections) * 100) if total_sections > 0 else 0

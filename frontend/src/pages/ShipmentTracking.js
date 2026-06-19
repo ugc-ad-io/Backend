@@ -19,6 +19,8 @@ export default function ShipmentTracking() {
   const [showUpdateModal, setShowUpdateModal] = useState(false);
   const [showReceiveModal, setShowReceiveModal] = useState(false);
   const [shipmentData, setShipmentData] = useState({
+    courier_name: '',
+    courier_tracking_url: '',
     tracking_number: '',
     expected_delivery: '',
     shipment_checklist: {
@@ -67,6 +69,8 @@ export default function ShipmentTracking() {
       const courierSlip = `https://storage.example.com/courier/${Date.now()}.pdf`;
       await axios.post(`${API}/shipment/update`, {
         campaign_id: campaignId,
+        courier_name: shipmentData.courier_name,
+        courier_tracking_url: shipmentData.courier_tracking_url,
         tracking_number: shipmentData.tracking_number,
         courier_slip: courierSlip,
         expected_delivery: shipmentData.expected_delivery,
@@ -259,6 +263,33 @@ export default function ShipmentTracking() {
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
             <h2>Update Shipment Details</h2>
             <form onSubmit={handleUpdateShipment} className="shipment-form">
+              <div className="form-group">
+                <label htmlFor="courier">Courier Name</label>
+                <input
+                  id="courier"
+                  type="text"
+                  value={shipmentData.courier_name}
+                  onChange={(e) => setShipmentData({ ...shipmentData, courier_name: e.target.value })}
+                  className="input-field"
+                  placeholder="e.g. Delhivery, Bluedart, FedEx"
+                  required
+                  data-testid="courier-input"
+                />
+              </div>
+
+              <div className="form-group">
+                <label htmlFor="courier-url">Courier Tracking URL</label>
+                <input
+                  id="courier-url"
+                  type="url"
+                  value={shipmentData.courier_tracking_url}
+                  onChange={(e) => setShipmentData({ ...shipmentData, courier_tracking_url: e.target.value })}
+                  className="input-field"
+                  placeholder="https://courier.com/track/ABC123456789"
+                  data-testid="courier-url-input"
+                />
+              </div>
+
               <div className="form-group">
                 <label htmlFor="tracking">Tracking Number</label>
                 <input

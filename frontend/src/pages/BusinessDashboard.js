@@ -172,7 +172,7 @@ function normalizeCreatorDirectoryItem(item = {}) {
 
   return {
     id: item.id || item.creator_id,
-    handle: item.handle || (item.nickname ? `@${String(item.nickname).replace(/^@/, '')}` : '@creator'),
+    handle: item.handle || item.public_creator_id || (item.nickname ? `@${String(item.nickname).replace(/^@/, '')}` : '@creator'),
     avatar: item.profile_photo || item.profile_picture || profile.profile_picture || profile.avatar_url || '',
     category: item.primary_category || profile.primary_category || tags[0] || 'Creator',
     languages: Array.isArray(languages) ? languages : [languages].filter(Boolean),
@@ -201,7 +201,7 @@ function formatWalletDate(value) {
 function normalizeWalletData(data = {}) {
   return {
     available_balance: Number(data.available_balance || 0),
-    minimum_chat_balance: Number(data.minimum_chat_balance || 5000),
+    minimum_chat_balance: Number(data.minimum_chat_balance || 2500),
     chat_unlocked: Boolean(data.chat_unlocked),
     plan_name: data.plan_name || 'Brand Starter',
     recharge_bonus: data.recharge_bonus || {},
@@ -458,8 +458,9 @@ export default function BusinessDashboard({ page = 'overview' }) {
 
   const handleWalletRecharge = async (amountOverride) => {
     const amount = Number(amountOverride || walletAmount);
-    if (!amount || amount < 5000) {
-      toast.error('Minimum recharge amount is Rs. 5,000');
+    const minRecharge = Number(walletData.minimum_chat_balance) || 2500;
+    if (!amount || amount < minRecharge) {
+      toast.error(`Minimum recharge amount is Rs. ${minRecharge.toLocaleString('en-IN')}`);
       return;
     }
     setRechargingWallet(true);
@@ -494,6 +495,7 @@ export default function BusinessDashboard({ page = 'overview' }) {
     { id: 'browse-creator', label: 'Browse Creator', icon: Search, path: '/dashboard/business/browse-creator' },
     { id: 'all-campaigns', label: `All Campaigns (${campaigns.length})`, icon: ClipboardList, path: '/dashboard/business/all-campaigns' },
     { id: 'work-review', label: 'Work Review', icon: FileCheck, path: '/dashboard/business/work-review' },
+    { id: 'deal-room', label: 'Deal Room', icon: Briefcase, path: '/dashboard/business/deal-room' },
     { id: 'messages', label: 'Messages', icon: MessageSquare, path: '/messages' },
     { id: 'shipments', label: 'Manage Shipment', icon: Package, path: '/dashboard/business/shipments' },
     { id: 'wallet', label: 'Wallet', icon: Wallet, path: '/dashboard/business/wallet' },
@@ -1577,6 +1579,15 @@ export default function BusinessDashboard({ page = 'overview' }) {
                         >
                           <Eye size={18} /> View Details
                         </button>
+                        {campaign.match_status === 'shortlisted' && (
+                          <button
+                            className="btn-secondary"
+                            onClick={() => navigate(`/dashboard/business/campaigns/${campaign.id}/shortlist`)}
+                            data-testid={`shortlist-${campaign.id}`}
+                          >
+                            <Users size={18} /> View Shortlist
+                          </button>
+                        )}
                         {campaign.selected_creator && (
                           <button
                             className="btn-secondary"

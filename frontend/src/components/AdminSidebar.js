@@ -1,4 +1,4 @@
-import { TrendingUp, FileText, Users, Briefcase, DollarSign, Download, UserPlus, BarChart } from 'lucide-react';
+import { TrendingUp, FileText, Users, Briefcase, DollarSign, Download, UserPlus, BarChart, Handshake, MessagesSquare, ShieldAlert } from 'lucide-react';
 
 function AdminSidebar({ activeTab, onTabClick, user }) {
   const adminTabs = [
@@ -7,8 +7,12 @@ function AdminSidebar({ activeTab, onTabClick, user }) {
     { id: 'profiles', label: 'Profiles', icon: Users, testId: 'tab-profiles', slug: 'profiles' },
     { id: 'campaigns', label: 'Campaigns', icon: Briefcase, testId: 'tab-campaigns', slug: 'campaigns' },
     { id: 'gigs', label: 'Gig Management', icon: Briefcase, testId: 'tab-gigs', slug: 'gigs' },
+    { id: 'dealroom', label: 'Deal Room', icon: Handshake, testId: 'tab-dealroom', slug: 'deal-room' },
+    { id: 'chatoversight', label: 'Chat Oversight', icon: MessagesSquare, testId: 'tab-chatoversight', slug: 'chat-oversight' },
     { id: 'withdrawals', label: 'Withdrawals', icon: DollarSign, testId: 'tab-withdrawals', slug: 'withdrawals' },
     { id: 'allcampaigns', label: 'All Campaigns', icon: Briefcase, testId: 'tab-allcampaigns', slug: 'all-campaigns' },
+    { id: 'matchqueue', label: 'Match Queue', icon: UserPlus, testId: 'tab-matchqueue', slug: 'match-queue' },
+    { id: 'disputes', label: 'Disputes', icon: ShieldAlert, testId: 'tab-disputes', slug: 'disputes' },
     { id: 'users', label: 'Users', icon: Users, testId: 'tab-users', slug: 'users' },
     { id: 'assignments', label: 'Assignments', icon: UserPlus, testId: 'tab-assignments', slug: 'assignments' },
     { id: 'analytics', label: 'Analytics', icon: BarChart, testId: 'tab-analytics', slug: 'analytics' },

@@ -12,6 +12,10 @@ import BrandWelcomePage from './pages/BrandWelcomePage';
 import AdminDashboard from './pages/AdminDashboard';
 import ProfileSettings from './pages/ProfileSettings';
 import CampaignDetails from './pages/CampaignDetails';
+import BrandShortlist from './pages/BrandShortlist';
+import AdminMatchQueue from './pages/AdminMatchQueue';
+import AdminDisputes from './pages/AdminDisputes';
+import RaiseDispute from './pages/RaiseDispute';
 import MessagesPage from './pages/MessagesPage';
 import ChatPage from './pages/ChatPage';
 import WorkSubmission from './pages/WorkSubmission';
@@ -20,6 +24,9 @@ import PayoutWithLayout from './pages/PayoutWithLayout';
 import ShipmentTracking from './pages/ShipmentTracking';
 import BrowseBriefs from './pages/BrowseBriefs';
 import MyDealsPage from './pages/MyDealsPage';
+import BrandDealRoom from './pages/BrandDealRoom';
+import AdminDealRoom from './pages/AdminDealRoom';
+import AdminChat from './pages/AdminChat';
 import MyBidsPage from './pages/MyBidsPage';
 import MyActiveWorkPage from './pages/MyActiveWorkPage';
 import ReviewsPage from './pages/ReviewsPage';
@@ -271,6 +278,22 @@ function App() {
               }
             />
             <Route
+              path="/dashboard/business/deal-room"
+              element={
+                <ProtectedRoute allowedRoles={['business']}>
+                  <BrandDealRoom />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/business/campaigns/:id/shortlist"
+              element={
+                <ProtectedRoute allowedRoles={['business']}>
+                  <BrandShortlist />
+                </ProtectedRoute>
+              }
+            />
+            <Route
               path="/dashboard/admin"
               element={
                 <ProtectedRoute allowedRoles={['admin', 'campaign_manager', 'support_staff']}>
@@ -301,6 +324,46 @@ function App() {
               element={
                 <ProtectedRoute allowedRoles={['admin', 'campaign_manager', 'support_staff']}>
                   <AdminGigManagement />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/admin/deal-room"
+              element={
+                <ProtectedRoute allowedRoles={['admin', 'campaign_manager', 'support_staff']}>
+                  <AdminDealRoom />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/admin/chat-oversight"
+              element={
+                <ProtectedRoute allowedRoles={['admin', 'campaign_manager', 'support_staff']}>
+                  <AdminChat />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/admin/match-queue"
+              element={
+                <ProtectedRoute allowedRoles={['admin', 'campaign_manager', 'support_staff']}>
+                  <AdminMatchQueue />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/dashboard/admin/disputes"
+              element={
+                <ProtectedRoute allowedRoles={['admin', 'campaign_manager', 'support_staff']}>
+                  <AdminDisputes />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/disputes/new/:dealId"
+              element={
+                <ProtectedRoute allowedRoles={['creator', 'business']}>
+                  <RaiseDispute />
                 </ProtectedRoute>
               }
             />

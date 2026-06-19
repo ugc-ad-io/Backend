@@ -282,7 +282,8 @@ class WorkSubmission(BaseModel):
 
 class ReviewSubmit(BaseModel):
     campaign_id: str
-    creator_id: str
+    creator_id: Optional[str] = None
+    business_id: Optional[str] = None  # set when a creator rates a brand (PRD 8.9)
     rating: int
     review: str
 
@@ -439,6 +440,7 @@ class DealContentSubmit(BaseModel):
     thumbnail_url: Optional[str] = None
     raw_footage_url: Optional[str] = None
     creator_note: Optional[str] = None
+    self_assessment: Optional[List[str]] = None  # PRD 8.3: confirmed must-include items
 
 class DealRevisionResponseSubmit(BaseModel):
     response: str
@@ -469,6 +471,7 @@ class ChatActionCardCreate(BaseModel):
 class ChatActionCardRespond(BaseModel):
     action: str
     note: Optional[str] = None
+    decline_reason: Optional[str] = None
 
 class CreatorDirectoryInviteCreate(BaseModel):
     campaign_id: Optional[str] = None
@@ -479,9 +482,44 @@ class CreatorDirectoryInviteCreate(BaseModel):
     usage_rights: str
     message: Optional[str] = ""
 
+class ShortlistCandidate(BaseModel):
+    creator_id: str
+    ops_note: str
+
+class ShortlistCreate(BaseModel):
+    candidates: List[ShortlistCandidate]
+
+class ShortlistInviteCreate(BaseModel):
+    deliverable_summary: Optional[str] = None
+    budget: Optional[str] = None
+    timeline: Optional[str] = None
+    usage_rights: Optional[str] = None
+    message: Optional[str] = ""
+
 class DealIssueSubmit(BaseModel):
     message: Optional[str] = None
     attachment_urls: List[str] = []
+
+class DisputeCreate(BaseModel):
+    dispute_type: str          # PRD 9.3 dropdown
+    description: str           # 100-1000 chars
+    desired_outcome: str       # full_refund / partial_refund / extension / redo / reassignment / other
+    evidence_urls: List[str] = []   # min 1 required
+
+class DisputeRuling(BaseModel):
+    ruling: str                # favor_brand / favor_creator / split / no_fault
+    refund_amount: Optional[float] = 0     # to brand wallet
+    creator_amount: Optional[float] = 0    # released to creator
+    reasoning: str
+    extension_days: Optional[int] = 0
+
+class DisputeInfoRequest(BaseModel):
+    party: str                 # brand / creator
+    message: str
+
+class DisputeAppeal(BaseModel):
+    new_evidence_urls: List[str] = []
+    grounds: str               # new evidence / points not previously considered
 
 class StaffCreate(BaseModel):
     email: EmailStr
@@ -581,8 +619,8 @@ def hours_until(value: Optional[str]) -> Optional[int]:
     return int((target - datetime.now(timezone.utc)).total_seconds() // 3600)
 
 CONTACT_INFO_BLOCK_DETAIL = "Your message appears to contain contact information. This cannot be shared on UGCAD.IO to protect both parties."
-MIN_BRAND_CHAT_BALANCE = 5000
-WALLET_MIN_RECHARGE = 5000
+MIN_BRAND_CHAT_BALANCE = 2500
+WALLET_MIN_RECHARGE = 2500
 WALLET_BONUS_TIERS = [
     {"amount": 10000, "bonus_percent": 3, "label": "₹10K"},
     {"amount": 25000, "bonus_percent": 7, "label": "₹25K"},
@@ -747,6 +785,56 @@ async def notify_admins(title: str, message: str, link: Optional[str] = None):
     await db.in_app_notifications.insert_one(notification)
     await db.admin_notifications.insert_one(notification.copy())
 
+async def notify_user(user_id: str, title: str, message: str, link: Optional[str] = None, ntype: str = "info"):
+    """Send an in-app notification to a single user."""
+    await db.in_app_notifications.insert_one({
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "title": title,
+        "message": message,
+        "type": ntype,
+        "link": link,
+        "read": False,
+        "created_at": now_iso(),
+        "created_by": "system",
+    })
+
+async def record_match_event(event_type: str, brand_id: Optional[str], creator_id: Optional[str], card_id: Optional[str] = None, campaign_id: Optional[str] = None, extra: Optional[dict] = None):
+    """PRD 5.8: capture match-interaction events for later analysis (not shown
+    publicly in V0.5)."""
+    doc = {
+        "id": str(uuid.uuid4()),
+        "event_type": event_type,
+        "brand_id": brand_id,
+        "creator_id": creator_id,
+        "card_id": card_id,
+        "campaign_id": campaign_id,
+        "created_at": now_iso(),
+    }
+    if extra:
+        doc.update(extra)
+    await db.match_events.insert_one(doc)
+
+REPEATED_DECLINE_THRESHOLD = 3
+
+async def notify_if_repeated_declines(brand_id: str, creator_id: str):
+    """PRD 5.9: if a creator has declined 3+ invitations from the same brand in
+    the past 90 days, alert admin when a new invitation is sent (possible
+    harassment, or legitimate retargeting)."""
+    since = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+    declines = await db.chat_action_cards.count_documents({
+        "sender_id": brand_id,
+        "recipient_id": creator_id,
+        "type": "private_invitation",
+        "status": "reject",
+        "created_at": {"$gte": since},
+    })
+    if declines >= REPEATED_DECLINE_THRESHOLD:
+        await notify_admins(
+            "Repeated invitations to a creator who declined",
+            f"Brand {brand_id} is inviting creator {creator_id} again after {declines} declines in 90 days.",
+        )
+
 async def find_chat_deal(user_id: str, other_user_id: str) -> Optional[dict]:
     return await db.campaigns.find_one({
         "$or": [
@@ -798,7 +886,7 @@ async def validate_chat_access(current_user: dict, recipient_id: str, allow_acti
         if fresh_user.get("approval_status") != ApprovalStatus.APPROVED:
             raise HTTPException(status_code=403, detail="Brand profile must be approved before starting chat.")
         if float(fresh_user.get("balance") or 0) < MIN_BRAND_CHAT_BALANCE:
-            raise HTTPException(status_code=403, detail="Brand wallet balance must be at least INR 5,000 to start chat.")
+            raise HTTPException(status_code=403, detail="Brand wallet balance must be at least INR 2,500 to start chat.")
     elif role == UserRole.CREATOR and recipient_role == UserRole.BUSINESS:
         if not await creator_has_chat_relationship(current_user["id"], recipient_id):
             raise HTTPException(status_code=403, detail="Creators can chat only with brands who invited them or with whom they have a deal.")
@@ -938,6 +1026,7 @@ def message_to_chat_item(msg: dict) -> dict:
     }
 
 def action_card_to_chat_item(card: dict) -> dict:
+    expired = is_action_card_expired(card)
     return {
         **card,
         "item_type": "action_card",
@@ -945,8 +1034,29 @@ def action_card_to_chat_item(card: dict) -> dict:
         "attachment_urls": card.get("attachment_urls", []),
         "read": bool(card.get("read")),
         "read_by": card.get("read_by", []),
+        "is_expired": expired,
+        "display_status": "expired" if expired else card.get("status"),
         "timestamp": card.get("created_at")
     }
+
+OFFER_CARD_TYPES = ["custom_offer", "private_invitation", "counter_offer"]
+DECLINE_REASONS = ["not_my_niche", "budget", "timeline", "unavailable", "other"]
+
+
+def action_card_deadline(card: dict) -> Optional[datetime]:
+    """The response deadline for an offer-type card (72h invites, 48h offers)."""
+    fields = card.get("fields") or {}
+    return parse_iso(fields.get("response_deadline") or fields.get("expires_at"))
+
+
+def is_action_card_expired(card: dict) -> bool:
+    if card.get("type") not in OFFER_CARD_TYPES:
+        return False
+    if card.get("status") not in ["open", "pending"]:
+        return False
+    deadline = action_card_deadline(card)
+    return bool(deadline and deadline < datetime.now(timezone.utc))
+
 
 def get_action_card_available_actions(card_type: str) -> List[str]:
     if card_type in ["custom_offer", "private_invitation", "counter_offer"]:
@@ -967,19 +1077,75 @@ async def enforce_offer_price_floor(sender: dict, recipient_id: str, price: Any,
     if sender.get("role") == UserRole.CREATOR:
         creator = sender
     else:
-        creator = await db.users.find_one({"id": recipient_id}, {"_id": 0, "level": 1, "role": 1})
+        creator = await db.users.find_one(
+            {"id": recipient_id},
+            {"_id": 0, "level": 1, "role": 1, "quality_tier": 1, "content_quality_tier": 1, "profile": 1},
+        )
         if not creator or creator.get("role") != UserRole.CREATOR:
             return  # not a creator thread; no floor to enforce
-    floor = cf.price_floor_for_level(creator.get("level"))
+    quality_tier = (
+        creator.get("quality_tier")
+        or creator.get("content_quality_tier")
+        or (creator.get("profile") or {}).get("quality_tier")
+    )
+    floor = cf.price_floor_for_level(creator.get("level"), quality_tier)
     try:
         value = float(price)
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail=f"{field_name} must be a number.")
     if value < floor:
         level_label = cf.CREATOR_LEVELS[cf.normalize_level(creator.get("level"))]["label"]
+        tier_note = f" (tier {cf.normalize_quality_tier(quality_tier).upper()})" if quality_tier else ""
         raise HTTPException(
             status_code=400,
-            detail=f"Offer is below the minimum for a {level_label} creator. The price floor is ₹{floor}.",
+            detail=f"Offer is below the minimum for a {level_label} creator{tier_note}. The price floor is ₹{floor}.",
+        )
+
+
+CUSTOM_OFFER_DAILY_LIMIT = 5
+CUSTOM_OFFER_ANOMALY_MULTIPLE = 5  # price >= this * floor → admin spot-check
+
+
+async def enforce_custom_offer_abuse_rules(sender: dict, recipient_id: str, fields: Dict[str, Any]) -> None:
+    """PRD 5.7 anti-abuse: max 5 custom offers/day, 24h resend block on a declined
+    offer, and an admin spot-check flag for anomalous pricing."""
+    now = datetime.now(timezone.utc)
+    day_ago = (now - timedelta(hours=24)).isoformat()
+
+    # 1. Max 5 custom offers per creator per day
+    sent_today = await db.chat_action_cards.count_documents({
+        "sender_id": sender["id"],
+        "type": "custom_offer",
+        "created_at": {"$gte": day_ago},
+    })
+    if sent_today >= CUSTOM_OFFER_DAILY_LIMIT:
+        raise HTTPException(status_code=429, detail=f"You can send at most {CUSTOM_OFFER_DAILY_LIMIT} custom offers per day.")
+
+    # 2. If declined, the same offer cannot be resent for 24 hours
+    recent_declined = await db.chat_action_cards.find_one({
+        "sender_id": sender["id"],
+        "recipient_id": recipient_id,
+        "type": "custom_offer",
+        "status": "reject",
+        "fields.deliverable_type": fields.get("deliverable_type"),
+        "fields.price": fields.get("price"),
+        "response.responded_at": {"$gte": day_ago},
+    })
+    if recent_declined:
+        raise HTTPException(status_code=429, detail="This offer was declined in the last 24 hours. Please wait before resending the same offer.")
+
+    # 3. Flag anomalous pricing for admin spot-check (does not block)
+    quality_tier = sender.get("quality_tier") or sender.get("content_quality_tier") or (sender.get("profile") or {}).get("quality_tier")
+    floor = cf.price_floor_for_level(sender.get("level"), quality_tier)
+    try:
+        value = float(fields.get("price"))
+    except (TypeError, ValueError):
+        value = 0.0
+    if floor and value >= floor * CUSTOM_OFFER_ANOMALY_MULTIPLE:
+        fields["flagged_for_review"] = True
+        await notify_admins(
+            "Custom offer flagged for spot-check",
+            f"{sender.get('nickname', sender['id'])} sent a custom offer of ₹{int(value)} (≥{CUSTOM_OFFER_ANOMALY_MULTIPLE}× their ₹{floor} floor).",
         )
 
 
@@ -990,6 +1156,7 @@ async def validate_action_card_payload(data: ChatActionCardCreate, current_user:
     if data.type == "custom_offer":
         require_fields(fields, ["deliverable_type", "quantity", "duration", "price", "timeline", "usage_rights"], "custom_offer")
         await enforce_offer_price_floor(current_user, data.recipient_id, fields.get("price"), "price")
+        await enforce_custom_offer_abuse_rules(current_user, data.recipient_id, fields)
         fields.setdefault("expires_at", (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat())
     elif data.type == "private_invitation":
         require_fields(fields, ["campaign_name", "deliverable_summary", "budget", "timeline", "usage_rights", "full_brief_link"], "private_invitation")
@@ -1004,6 +1171,7 @@ async def validate_action_card_payload(data: ChatActionCardCreate, current_user:
         if existing_rounds >= 3:
             raise HTTPException(status_code=400, detail="Counter offers are limited to 3 rounds.")
         fields["round"] = existing_rounds + 1
+        fields.setdefault("expires_at", (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat())
     elif data.type == "revision_request":
         items = fields.get("revision_items") or fields.get("items") or []
         if not isinstance(items, list) or not 1 <= len(items) <= 5:
@@ -1565,11 +1733,40 @@ def ensure_deal_access(campaign: dict, current_user: dict):
         return
     raise HTTPException(status_code=403, detail="Not authorized for this deal")
 
+async def settle_deal_lazily(campaign: dict) -> None:
+    """Per-deal lazy settlement so payouts/auto-approval work without a cron.
+    Auto-approves a stale submission and releases a due scheduled payout."""
+    now = datetime.now(timezone.utc)
+    cid = campaign.get('id')
+    # Auto-approve a stale, undisputed submission (PRD 8.4).
+    work = await db.work_submissions.find_one({"campaign_id": cid, "status": WorkStatus.SUBMITTED})
+    if work:
+        submitted = parse_iso(work.get('submitted_at') or work.get('created_at'))
+        if submitted and (now - submitted).days >= AUTO_APPROVE_DAYS:
+            cards = await db.deal_action_cards.find({"campaign_id": cid}, {"_id": 0}).to_list(100)
+            disputed = any(c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open' for c in cards)
+            if not disputed:
+                await db.work_submissions.update_one({"id": work['id']}, {"$set": {"status": WorkStatus.APPROVED, "approved_at": now_iso(), "auto_approved": True}})
+                await schedule_payout_for_deal(campaign, work, source="auto_approval")
+                await db.campaigns.update_one({"id": cid}, {"$set": {"payout_status": "scheduled", "updated_at": now_iso()}})
+                await notify_user(work['creator_id'], "Your content was auto-approved", "The brand didn't review in time, so your content was auto-approved.", link="/my-deals")
+    # Release a due scheduled payout (PRD 8.7).
+    escrow = await db.escrow.find_one({"campaign_id": cid, "payout_status": "scheduled"})
+    if escrow:
+        scheduled = parse_iso(escrow.get('payout_scheduled_at'))
+        if scheduled and scheduled <= now:
+            await release_scheduled_payout(escrow)
+
+
 async def get_deal_context(deal_id: str, current_user: dict) -> dict:
     campaign = await get_campaign_by_deal_id(deal_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Deal not found")
     ensure_deal_access(campaign, current_user)
+    # Lazy settlement (no cron needed): release a due payout / auto-approve a stale
+    # submission for this specific deal when it is viewed (PRD 8.4 / 8.7).
+    await settle_deal_lazily(campaign)
+    campaign = await get_campaign_by_deal_id(deal_id) or campaign
     creator = await db.users.find_one({"id": campaign.get('selected_creator')}, {"_id": 0, "password": 0})
     if not creator:
         raise HTTPException(status_code=404, detail="Creator not found for deal")
@@ -2124,6 +2321,9 @@ async def invite_creator_from_directory(
     }
     await db.chat_action_cards.insert_one(action_card)
 
+    await notify_if_repeated_declines(current_user["id"], creator_id)
+    await record_match_event("invitation_sent", current_user["id"], creator_id, card_id=action_card["id"], campaign_id=data.campaign_id, extra={"source": "directory"})
+
     return {
         "message": "Invitation sent",
         "invitation": {key: value for key, value in invitation.items() if key != "_id"},
@@ -2185,7 +2385,7 @@ async def recharge_business_wallet(
     if current_user.get("approval_status") != ApprovalStatus.APPROVED:
         raise HTTPException(status_code=403, detail="Business profile must be approved")
     if data.amount < WALLET_MIN_RECHARGE:
-        raise HTTPException(status_code=400, detail="Minimum wallet recharge amount is INR 5,000")
+        raise HTTPException(status_code=400, detail="Minimum wallet recharge amount is INR 2,500")
 
     gateway = await get_active_gateway(data.gateway)
     if gateway["gateway_name"] not in ["razorpay", "cashfree"]:
@@ -3181,6 +3381,41 @@ async def get_profile(user_id: str, current_user: dict = Depends(get_current_use
 
     return user
 
+def enforce_brief_contact_policy(campaign_like: dict) -> None:
+    """Moderate the brief's free-text 'things to avoid' field for contact info.
+    Raises HTTPException if the text appears to contain emails/phones/handles/links."""
+    avoid_text = (campaign_like or {}).get('avoid_text')
+    if not avoid_text:
+        return
+    result = check_contact_info_policy(avoid_text)
+    if not result.get('safe'):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "The 'things to avoid' text appears to contain contact information, which cannot be shared in a brief.",
+                "field": "avoid_text",
+                "violations": result.get('violations', []),
+            },
+        )
+
+
+async def flag_hidden_budget_if_needed(campaign_doc: dict) -> None:
+    """When a published brief hides its budget from creators, raise an admin flag
+    on the campaign and notify the admin/ops team."""
+    if campaign_doc.get('budget_visible') is not False:
+        return
+    campaign_doc['budget_hidden'] = True
+    flags = campaign_doc.get('admin_flags') or []
+    if 'hidden_budget' not in flags:
+        flags.append('hidden_budget')
+    campaign_doc['admin_flags'] = flags
+    await notify_admins(
+        "Brief published with hidden budget",
+        f"Campaign '{campaign_doc.get('title', '')}' was published with the budget hidden from creators.",
+        link=f"/admin/campaigns/{campaign_doc.get('id', '')}",
+    )
+
+
 # Campaign Routes - Extended for 5-step flow
 @api_router.post("/campaigns/draft")
 async def create_draft(data: CampaignDraftCreate, current_user: dict = Depends(get_current_user)):
@@ -3290,17 +3525,37 @@ async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(g
     
     # Validate all required fields
     validate_campaign_for_submission(campaign)
-    
+
+    # Moderate the free-text "things to avoid" field for contact info
+    enforce_brief_contact_policy(campaign)
+
+    update_fields = {
+        "status": CampaignStatus.PENDING_APPROVAL,
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    # Flag to admin if the budget is hidden from creators
+    await flag_hidden_budget_if_needed(campaign)
+    if campaign.get('budget_hidden'):
+        update_fields['budget_hidden'] = True
+        update_fields['admin_flags'] = campaign.get('admin_flags')
+
+    # PRD 5.2 Path B: brand requested an ops-curated shortlist
+    if campaign.get('match_requested'):
+        update_fields['match_status'] = 'queued'
+        await notify_admins(
+            "New brief awaiting matches",
+            f"'{campaign.get('title', '')}' was published with Request Matches and needs an ops shortlist.",
+            link="/admin/match-queue",
+        )
+
     # Update status to pending_approval
     await db.campaigns.update_one(
         {"id": campaign_id},
-        {"$set": {
-            "status": CampaignStatus.PENDING_APPROVAL,
-            "submitted_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }}
+        {"$set": update_fields}
     )
-    
+
     return {
         "campaign_id": campaign_id,
         "status": "pending_approval",
@@ -3390,7 +3645,11 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
             if status is not None:
                 raise
             final_status = CampaignStatus.DRAFT.value
-    
+
+    # Moderate the free-text "things to avoid" field for contact info on publish
+    if final_status == CampaignStatus.PENDING_APPROVAL.value:
+        enforce_brief_contact_policy(campaign_data)
+
     # Prepare campaign for storage
     campaign_doc = prepare_campaign_for_storage(campaign_data, status=final_status)
 
@@ -3416,9 +3675,19 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
 
     if final_status == CampaignStatus.PENDING_APPROVAL.value:
         campaign_doc['submitted_at'] = datetime.now(timezone.utc).isoformat()
-    
+        # Flag to admin if the budget is hidden from creators
+        await flag_hidden_budget_if_needed(campaign_doc)
+        # PRD 5.2 Path B: brand requested an ops-curated shortlist
+        if campaign_doc.get('match_requested'):
+            campaign_doc['match_status'] = 'queued'
+            await notify_admins(
+                "New brief awaiting matches",
+                f"'{campaign_doc.get('title', '')}' was published with Request Matches and needs an ops shortlist.",
+                link=f"/admin/match-queue",
+            )
+
     await db.campaigns.insert_one(campaign_doc)
-    
+
     message = "Campaign submitted for approval" if final_status == CampaignStatus.PENDING_APPROVAL.value else "Draft campaign created"
     
     return {
@@ -3426,6 +3695,253 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
         "status": final_status,
         "message": message
     }
+
+# ---------------------------------------------------------------------------
+# PRD Section 5.2 Path B — Ops-mediated shortlist matching
+# ---------------------------------------------------------------------------
+
+OPS_ROLES = [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]
+SHORTLIST_MIN = 3
+SHORTLIST_MAX = 5
+
+
+def shortlist_candidate_public(candidate: dict, creator: Optional[dict], deliverables: int = 0) -> dict:
+    public = creator_directory_public_view(creator, deliverables) if creator else {}
+    return {
+        "creator_id": candidate.get("creator_id"),
+        "ops_note": candidate.get("ops_note"),
+        "status": candidate.get("status", "pending"),
+        "creator": public,
+    }
+
+
+@api_router.get("/admin/match-queue")
+async def get_match_queue(current_user: dict = Depends(get_current_user)):
+    """Ops view: briefs that requested matches and await a shortlist."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view the match queue")
+    campaigns = await db.campaigns.find(
+        {"match_requested": True, "match_status": {"$in": ["queued", "shortlisted"]}},
+        {"_id": 0},
+    ).sort("submitted_at", 1).to_list(500)
+    return [normalize_campaign_response(c) for c in campaigns]
+
+
+@api_router.post("/admin/campaigns/{campaign_id}/shortlist")
+async def create_campaign_shortlist(campaign_id: str, data: ShortlistCreate, current_user: dict = Depends(get_current_user)):
+    """Ops submits a 3-5 creator shortlist (with a 'why we chose them' note each)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can create a shortlist")
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if not (SHORTLIST_MIN <= len(data.candidates) <= SHORTLIST_MAX):
+        raise HTTPException(status_code=400, detail=f"A shortlist must have {SHORTLIST_MIN} to {SHORTLIST_MAX} creators.")
+
+    seen = set()
+    shortlist = []
+    for cand in data.candidates:
+        if cand.creator_id in seen:
+            raise HTTPException(status_code=400, detail="Duplicate creator in shortlist.")
+        seen.add(cand.creator_id)
+        if not cand.ops_note or not cand.ops_note.strip():
+            raise HTTPException(status_code=400, detail="Each candidate needs a 'why we chose them' note.")
+        creator = await db.users.find_one({"id": cand.creator_id, "role": UserRole.CREATOR}, {"_id": 0, "id": 1})
+        if not creator:
+            raise HTTPException(status_code=400, detail=f"Creator {cand.creator_id} not found.")
+        shortlist.append({
+            "creator_id": cand.creator_id,
+            "ops_note": cand.ops_note.strip(),
+            "status": "pending",
+            "added_by": current_user["id"],
+            "added_at": now_iso(),
+        })
+
+    await db.campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {"shortlist": shortlist, "match_status": "shortlisted", "updated_at": now_iso()}},
+    )
+    await notify_user(
+        campaign["business_id"],
+        "Your creator matches are ready",
+        f"Our team shortlisted {len(shortlist)} creators for '{campaign.get('title', '')}'.",
+        link=f"/dashboard/business/campaigns/{campaign_id}/shortlist",
+    )
+    return {"campaign_id": campaign_id, "match_status": "shortlisted", "count": len(shortlist)}
+
+
+@api_router.get("/campaigns/{campaign_id}/shortlist")
+async def get_campaign_shortlist(campaign_id: str, current_user: dict = Depends(get_current_user)):
+    """Brand (or ops) views the curated shortlist for a brief."""
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if current_user["role"] not in OPS_ROLES and campaign.get("business_id") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="You can only view shortlists for your own briefs")
+
+    candidates = []
+    for cand in campaign.get("shortlist", []):
+        creator = await db.users.find_one({"id": cand.get("creator_id")}, {"_id": 0})
+        deliverables = await creator_deliverables_completed(creator) if creator else 0
+        candidates.append(shortlist_candidate_public(cand, creator, deliverables))
+    return {
+        "campaign_id": campaign_id,
+        "campaign_name": campaign.get("title", ""),
+        "match_status": campaign.get("match_status"),
+        "shortlist_request_count": campaign.get("shortlist_request_count", 0),
+        "candidates": candidates,
+    }
+
+
+@api_router.post("/campaigns/{campaign_id}/shortlist/{creator_id}/invite")
+async def invite_shortlist_candidate(campaign_id: str, creator_id: str, data: ShortlistInviteCreate, current_user: dict = Depends(get_current_user)):
+    """Brand picks one shortlisted creator; a private invitation is sent and the
+    other candidates are dismissed (PRD 5.4: one at a time in V0.5)."""
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("business_id") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="You can only invite from your own brief")
+    shortlist = campaign.get("shortlist", [])
+    if not any(c.get("creator_id") == creator_id for c in shortlist):
+        raise HTTPException(status_code=400, detail="That creator is not on this brief's shortlist.")
+
+    created_at = now_iso()
+    budget_text = data.budget or (f"₹{int(campaign.get('per_video_budget') or campaign.get('budget_max') or 0)}")
+    action_card = {
+        "id": str(uuid.uuid4()),
+        "thread_key": thread_key_for(current_user["id"], creator_id),
+        "participants": sorted([current_user["id"], creator_id]),
+        "sender_id": current_user["id"],
+        "sender_nickname": current_user.get("nickname"),
+        "recipient_id": creator_id,
+        "deal_id": campaign_id,
+        "type": "private_invitation",
+        "fields": {
+            "campaign_id": campaign_id,
+            "campaign_name": campaign.get("title", ""),
+            "deliverable_summary": data.deliverable_summary or campaign.get("brief_text", "")[:140],
+            "budget": budget_text,
+            "timeline": data.timeline or campaign.get("final_delivery_by") or campaign.get("due_date") or "",
+            "usage_rights": data.usage_rights or (", ".join(campaign.get("usage_platforms", [])) or "As per brief"),
+            "full_brief_link": f"/dashboard/business/campaigns/{campaign_id}",
+            "message": data.message or "",
+            "source": "ops_shortlist",
+            "response_deadline": (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(),
+        },
+        "status": "open",
+        "created_at": created_at,
+        "available_actions": get_action_card_available_actions("private_invitation"),
+        "read_by": [current_user["id"]],
+        "immutable": True,
+    }
+    await db.chat_action_cards.insert_one(action_card)
+
+    await notify_if_repeated_declines(current_user["id"], creator_id)
+    await record_match_event("invitation_sent", current_user["id"], creator_id, card_id=action_card["id"], campaign_id=campaign_id, extra={"source": "ops_shortlist"})
+
+    # Mark the chosen candidate invited, dismiss the rest.
+    for cand in shortlist:
+        cand["status"] = "invited" if cand.get("creator_id") == creator_id else "dismissed"
+    await db.campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {"shortlist": shortlist, "match_status": "fulfilled", "updated_at": created_at}},
+    )
+    await notify_user(creator_id, "You've received a brief invitation", f"{current_user.get('nickname', 'A brand')} invited you to '{campaign.get('title', '')}'.", link="/dashboard/creator/inbox")
+    return {"message": "Invitation sent", "campaign_id": campaign_id, "creator_id": creator_id, "action_card": {k: v for k, v in action_card.items() if k != "_id"}}
+
+
+@api_router.post("/campaigns/{campaign_id}/shortlist/request-new")
+async def request_new_shortlist(campaign_id: str, current_user: dict = Depends(get_current_user)):
+    """Brand isn't satisfied with the shortlist and requests a new one (PRD 5.4)."""
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("business_id") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="You can only request matches for your own brief")
+    count = (campaign.get("shortlist_request_count") or 0) + 1
+    await db.campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {"match_status": "queued", "shortlist": [], "shortlist_request_count": count, "updated_at": now_iso()}},
+    )
+    await notify_admins(
+        "Brand requested a new shortlist",
+        f"'{campaign.get('title', '')}' requested new matches (request #{count}).",
+        link="/admin/match-queue",
+    )
+    return {"campaign_id": campaign_id, "match_status": "queued", "shortlist_request_count": count}
+
+
+@api_router.get("/creator/capacity-status")
+async def get_creator_capacity_status(current_user: dict = Depends(get_current_user)):
+    """PRD 5.9: creators set a monthly capacity in onboarding. When they're at
+    capacity, new invitations show a soft warning (not blocked)."""
+    if current_user["role"] != UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Only creators have a capacity status")
+    profile = current_user.get("profile") or {}
+    capacity = current_user.get("monthly_capacity") or profile.get("monthly_capacity")
+    month_start_iso = month_start(datetime.now(timezone.utc)).isoformat()
+    accepted_this_month = await db.campaigns.count_documents({
+        "selected_creator": current_user["id"],
+        "status": {"$in": [CampaignStatus.IN_PROGRESS, CampaignStatus.ACTIVE, "work_submitted", CampaignStatus.COMPLETED]},
+        "work_started_at": {"$gte": month_start_iso},
+    })
+    at_capacity = bool(capacity) and accepted_this_month >= int(capacity)
+    return {
+        "monthly_capacity": capacity,
+        "accepted_this_month": accepted_this_month,
+        "at_capacity": at_capacity,
+        "warning": "You're at your monthly capacity. You can still accept, but consider your workload." if at_capacity else None,
+    }
+
+
+@api_router.get("/admin/match-metrics")
+async def get_match_metrics(current_user: dict = Depends(get_current_user)):
+    """PRD 5.8: aggregate match-interaction metrics for ops (not shown publicly)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view match metrics")
+    events = await db.match_events.find({}, {"_id": 0}).to_list(20000)
+
+    def count_type(suffix):
+        return sum(1 for e in events if (e.get("event_type") or "").endswith(suffix))
+
+    invitations_sent = sum(1 for e in events if e.get("event_type") == "invitation_sent")
+    accepts = count_type("_accept")
+    rejects = count_type("_reject")
+    expirations = count_type("_expired")
+    responded = accepts + rejects
+    acceptance_rate = round((accepts / responded) * 100, 1) if responded else 0
+
+    decline_reasons = {}
+    for e in events:
+        if e.get("action") == "reject" and e.get("decline_reason"):
+            decline_reasons[e["decline_reason"]] = decline_reasons.get(e["decline_reason"], 0) + 1
+
+    response_times = [e["response_seconds"] for e in events if isinstance(e.get("response_seconds"), int)]
+    avg_response_hours = round((sum(response_times) / len(response_times)) / 3600, 1) if response_times else 0
+
+    counters_sent = sum(1 for e in events if e.get("event_type") == "counter_sent")
+    counter_accepts = sum(1 for e in events if e.get("event_type") == "counter_offer_accept")
+    counter_success_rate = round((counter_accepts / counters_sent) * 100, 1) if counters_sent else 0
+
+    shortlisted = await db.campaigns.count_documents({"match_status": {"$in": ["shortlisted", "fulfilled"]}})
+    queued = await db.campaigns.count_documents({"match_status": "queued"})
+
+    return {
+        "invitations_sent": invitations_sent,
+        "accepts": accepts,
+        "rejects": rejects,
+        "expirations": expirations,
+        "acceptance_rate_pct": acceptance_rate,
+        "avg_response_hours": avg_response_hours,
+        "decline_reasons": decline_reasons,
+        "counters_sent": counters_sent,
+        "counter_success_rate_pct": counter_success_rate,
+        "shortlists_delivered": shortlisted,
+        "briefs_in_queue": queued,
+        "total_events": len(events),
+    }
+
 
 @api_router.get("/campaigns")
 async def get_campaigns(
@@ -3879,7 +4395,180 @@ async def create_chat_action_card(data: ChatActionCardCreate, current_user: dict
             await db.campaigns.update_one({"id": campaign["id"]}, {"$set": {"chat_issue_status": data.type, "updated_at": created_at}})
     if data.type in ["damage_report", "escalate_to_admin", "raise_dispute"] or fields.get("notify_admin"):
         await notify_admins("Chat action card needs attention", f"{current_user.get('nickname', current_user['id'])} created {data.type}.")
+    if data.type == "private_invitation" and current_user.get("role") == UserRole.BUSINESS:
+        await notify_if_repeated_declines(current_user["id"], data.recipient_id)
+        await record_match_event("invitation_sent", current_user["id"], data.recipient_id, card_id=card["id"], campaign_id=data.deal_id)
+    elif data.type == "custom_offer" and current_user.get("role") == UserRole.CREATOR:
+        await record_match_event("custom_offer_sent", data.recipient_id, current_user["id"], card_id=card["id"])
+    elif data.type == "counter_offer":
+        await record_match_event("counter_sent", None, None, card_id=card["id"])
     return {"message": "Action card created", "action_card": {key: value for key, value in card.items() if key != "_id"}}
+
+# Offer cards that, when accepted, should create/activate a funded deal.
+DEAL_FORMING_CARD_TYPES = {"custom_offer", "counter_offer", "private_invitation"}
+
+def parse_money(value: Any) -> float:
+    """Parse a money value that may be a number or a string like '₹5,000'."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    digits = re.sub(r"[^\d.]", "", str(value))
+    try:
+        return float(digits) if digits else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _accepted_offer_amount(card: dict) -> float:
+    """Extract the agreed amount from an accepted offer card."""
+    fields = card.get("fields") or {}
+    raw = (
+        fields.get("price")
+        if card.get("type") == "custom_offer"
+        else fields.get("modified_price")
+        if card.get("type") == "counter_offer"
+        else fields.get("budget")
+    )
+    return parse_money(raw)
+
+
+async def enforce_brand_wallet_for_acceptance(card: dict) -> None:
+    """PRD 5.9: at acceptance the brand's wallet must cover the full deal value.
+    If short, the acceptance is blocked and the brand is asked to top up within 24h."""
+    participants = card.get("participants") or []
+    users = await db.users.find({"id": {"$in": participants}}, {"_id": 0}).to_list(2)
+    brand = next((u for u in users if u.get("role") == UserRole.BUSINESS), None)
+    if not brand:
+        return
+    amount = _accepted_offer_amount(card)
+    if amount <= 0:
+        return
+    balance = to_float(brand.get("balance"))
+    if balance < amount:
+        shortfall = round(amount - balance, 2)
+        deadline = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+        await db.chat_action_cards.update_one(
+            {"id": card["id"]},
+            {"$set": {"pending_topup": True, "topup_deadline": deadline, "shortfall": shortfall}},
+        )
+        await notify_user(
+            brand["id"],
+            "Top up to confirm this deal",
+            f"A creator accepted your offer for ₹{int(amount)} but your wallet holds ₹{int(balance)}. Add ₹{int(shortfall)} within 24 hours to confirm the deal.",
+            link="/dashboard/business/wallet",
+        )
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "message": "The brand's wallet has insufficient balance for this deal. The brand has been asked to top up within 24 hours.",
+                "shortfall": shortfall,
+            },
+        )
+
+async def activate_deal_from_card(card: dict) -> Optional[dict]:
+    """Bridge the chat layer to the deal layer: when an offer card is accepted,
+    create/activate the underlying campaign, hold escrow, and open the deal room.
+
+    Returns the activated campaign (or None if a deal couldn't be formed, e.g.
+    the two participants aren't a brand+creator pair). Idempotent: if the linked
+    campaign already has a selected creator + escrow, it is returned unchanged.
+    """
+    participants = card.get("participants") or []
+    if len(participants) != 2:
+        return None
+    users = await db.users.find({"id": {"$in": participants}}, {"_id": 0}).to_list(2)
+    brand = next((u for u in users if u.get("role") == UserRole.BUSINESS), None)
+    creator = next((u for u in users if u.get("role") == UserRole.CREATOR), None)
+    if not brand or not creator:
+        return None  # not a brand<->creator thread; nothing to fund
+
+    amount = _accepted_offer_amount(card)
+    fields = card.get("fields") or {}
+    now = now_iso()
+
+    # Locate an existing campaign this card is tied to, else create a direct one.
+    campaign = None
+    if card.get("deal_id"):
+        campaign = await get_campaign_by_deal_id(card["deal_id"])
+    if not campaign and fields.get("campaign_id"):
+        campaign = await db.campaigns.find_one({"id": fields["campaign_id"]}, {"_id": 0})
+
+    if campaign:
+        # Already activated for this creator with escrow held → nothing to do.
+        existing_escrow = await db.escrow.find_one({"campaign_id": campaign["id"]}, {"_id": 0})
+        if campaign.get("selected_creator") == creator["id"] and existing_escrow:
+            return campaign
+        if campaign.get("business_id") != brand["id"]:
+            return None  # mismatched ownership; refuse to cross-wire
+    else:
+        campaign = {
+            "id": str(uuid.uuid4()),
+            "business_id": brand["id"],
+            "brand_name": brand.get("nickname") or (brand.get("profile") or {}).get("business_name") or "Brand",
+            "title": fields.get("campaign_name") or "Direct deal",
+            "brief_text": fields.get("deliverable_summary") or fields.get("diff_vs_original") or "",
+            "objectives": [],
+            "budget_min": amount,
+            "budget_max": amount,
+            "requires_shipment": bool(fields.get("requires_shipment")),
+            "content_requirements": {},
+            "status": CampaignStatus.DRAFT,
+            "source": "chat_offer",
+            "origin_card_id": card.get("id"),
+            "created_at": now,
+        }
+        await db.campaigns.insert_one(dict(campaign))
+
+    # Fund escrow: atomically debit the brand wallet into a held record. The
+    # conditional update guarantees we never drive the wallet negative (the
+    # acceptance path already checked sufficiency in enforce_brand_wallet_for_acceptance).
+    escrow = await db.escrow.find_one({"campaign_id": campaign["id"]}, {"_id": 0})
+    if not escrow:
+        escrow_id = str(uuid.uuid4())
+        debit = await db.users.update_one(
+            {"id": brand["id"], "balance": {"$gte": amount}},
+            {"$inc": {"balance": -amount}},
+        )
+        funded = debit.modified_count == 1
+        await db.escrow.insert_one({
+            "id": escrow_id,
+            "campaign_id": campaign["id"],
+            "business_id": brand["id"],
+            "creator_id": creator["id"],
+            "amount": amount,
+            "status": "held",
+            "wallet_funded": funded,
+            "source": "chat_offer",
+            "origin_card_id": card.get("id"),
+            "created_at": now,
+        })
+    else:
+        escrow_id = escrow.get("id")
+
+    await db.campaigns.update_one(
+        {"id": campaign["id"]},
+        {"$set": {
+            "selected_creator": creator["id"],
+            "status": CampaignStatus.IN_PROGRESS,
+            "escrow_id": escrow_id,
+            "work_started_at": now,
+            "updated_at": now,
+        }}
+    )
+    campaign = await db.campaigns.find_one({"id": campaign["id"]}, {"_id": 0})
+
+    # Link the card back to its deal so the UI can deep-link into the deal room.
+    await db.chat_action_cards.update_one(
+        {"id": card["id"]},
+        {"$set": {"deal_campaign_id": campaign["id"], "deal_id": make_deal_id(campaign)}}
+    )
+
+    await insert_deal_activity(campaign, "system", "UGCAD.IO", "deal_started",
+                               f"Offer accepted — deal opened with ₹{int(amount)} held in escrow.")
+    await insert_deal_system_message(campaign, f"Offer accepted. ₹{int(amount)} is held in escrow and the deal room is now open.")
+    return campaign
+
 
 @api_router.post("/chat/action-cards/{card_id}/respond")
 async def respond_chat_action_card(card_id: str, data: ChatActionCardRespond, current_user: dict = Depends(get_current_user)):
@@ -3890,11 +4579,48 @@ async def respond_chat_action_card(card_id: str, data: ChatActionCardRespond, cu
         raise HTTPException(status_code=403, detail="Not authorized for this action card")
     if card.get("status") not in ["open", "pending"]:
         raise HTTPException(status_code=400, detail="Action card has already been responded to.")
+
+    # Enforce response deadlines (72h invites, 48h counter/custom offers).
+    if is_action_card_expired(card):
+        await db.chat_action_cards.update_one(
+            {"id": card_id},
+            {"$set": {"status": "expired", "expired_at": now_iso()}}
+        )
+        await record_match_event(f"{card.get('type')}_expired", None, None, card_id=card_id, campaign_id=card.get("deal_id"), extra={"card_type": card.get("type")})
+        raise HTTPException(status_code=400, detail="This offer has expired and can no longer be responded to.")
+
     if data.action not in card.get("available_actions", []):
         raise HTTPException(status_code=400, detail="Action is not available for this card.")
+
+    # Declining an offer: require a structured reason and moderate the comment.
+    decline_reason = None
+    if data.action == "reject" and card.get("type") in OFFER_CARD_TYPES:
+        decline_reason = data.decline_reason
+        if decline_reason not in DECLINE_REASONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"A decline reason is required. Choose one of: {', '.join(DECLINE_REASONS)}.",
+            )
+        if data.note:
+            moderation = check_contact_info_policy(data.note)
+            if not moderation.get("safe"):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "Your comment appears to contain contact information, which cannot be shared.",
+                        "field": "note",
+                        "violations": moderation.get("violations", []),
+                    },
+                )
+
+    # PRD 5.9: brand wallet must cover the deal at acceptance (blocks if short).
+    if data.action == "accept" and card.get("type") in DEAL_FORMING_CARD_TYPES:
+        await enforce_brand_wallet_for_acceptance(card)
+
     response = {
         "action": data.action,
         "note": data.note,
+        "decline_reason": decline_reason,
         "responded_by": current_user["id"],
         "responded_at": now_iso()
     }
@@ -3902,8 +4628,69 @@ async def respond_chat_action_card(card_id: str, data: ChatActionCardRespond, cu
         {"id": card_id},
         {"$set": {"status": data.action, "response": response}, "$addToSet": {"read_by": current_user["id"]}}
     )
+
+    # PRD 5.8: capture the response for metrics (acceptance rate, response time,
+    # decline reasons, counter-offer success).
+    if card.get("type") in OFFER_CARD_TYPES:
+        created = parse_iso(card.get("created_at"))
+        responded = parse_iso(response["responded_at"])
+        response_seconds = int((responded - created).total_seconds()) if created and responded else None
+        await record_match_event(
+            f"{card['type']}_{data.action}",
+            None, None,
+            card_id=card_id,
+            campaign_id=card.get("deal_id"),
+            extra={
+                "card_type": card["type"],
+                "action": data.action,
+                "decline_reason": decline_reason,
+                "response_seconds": response_seconds,
+                "responder_id": current_user["id"],
+            },
+        )
+
+    # Bridge to the deal layer: accepting an offer creates/activates the deal,
+    # holds escrow, and opens the deal room.
+    deal = None
+    if data.action == "accept" and card.get("type") in DEAL_FORMING_CARD_TYPES:
+        try:
+            deal = await activate_deal_from_card({**card, "status": data.action})
+        except Exception:
+            logger.exception("Failed to activate deal from accepted card %s", card_id)
+
     updated = await db.chat_action_cards.find_one({"id": card_id}, {"_id": 0})
-    return {"message": "Action card response saved", "action_card": updated}
+    result = {"message": "Action card response saved", "action_card": updated}
+    if deal:
+        result["deal"] = {"campaign_id": deal["id"], "deal_id": make_deal_id(deal), "status": deal.get("status")}
+    return result
+
+@api_router.post("/chat/action-cards/{card_id}/revoke")
+async def revoke_chat_action_card(card_id: str, current_user: dict = Depends(get_current_user)):
+    """PRD 5.9: the sender may revoke an offer/invitation while it is still open
+    and unanswered. The listing fee is not refunded here."""
+    card = await db.chat_action_cards.find_one({"id": card_id}, {"_id": 0})
+    if not card:
+        raise HTTPException(status_code=404, detail="Action card not found")
+    if card.get("sender_id") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Only the sender can revoke this card.")
+    if card.get("type") not in OFFER_CARD_TYPES:
+        raise HTTPException(status_code=400, detail="Only offers and invitations can be revoked.")
+    if card.get("status") not in ["open", "pending"]:
+        raise HTTPException(status_code=400, detail="This card has already been responded to and cannot be revoked.")
+
+    await db.chat_action_cards.update_one(
+        {"id": card_id},
+        {"$set": {"status": "revoked", "revoked_at": now_iso(), "revoked_by": current_user["id"]}},
+    )
+    await notify_user(
+        card.get("recipient_id"),
+        "An invitation was withdrawn",
+        f"{current_user.get('nickname', 'The brand')} withdrew their {card.get('type', 'offer').replace('_', ' ')}.",
+        link="/dashboard/creator/inbox",
+    )
+    await record_match_event(f"{card.get('type')}_revoked", None, None, card_id=card_id, campaign_id=card.get("deal_id"))
+    updated = await db.chat_action_cards.find_one({"id": card_id}, {"_id": 0})
+    return {"message": "Invitation revoked", "action_card": updated}
 
 @api_router.post("/chat/{other_user_id}/typing")
 async def set_chat_typing(other_user_id: str, current_user: dict = Depends(get_current_user)):
@@ -4104,57 +4891,354 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
 
     return {"message": "Work submitted successfully"}
 
+def deal_deadline_iso(campaign: dict) -> Optional[str]:
+    return campaign.get('final_delivery_by') or campaign.get('due_date') or campaign.get('deadline')
+
+
+async def assess_late_delivery(creator_id: str, campaign: dict, work: dict) -> dict:
+    """PRD 8.8: compare submission time to the brief deadline, record the offense
+    (rolling 6-month window) and return the penalty for this deal's payout."""
+    deadline = parse_iso(deal_deadline_iso(campaign))
+    submitted = parse_iso(work.get('submitted_at') or work.get('created_at'))
+    result = {"is_late": False, "severity": "on_time", "penalty_pct": 0, "offense_number": 0}
+    if not deadline or not submitted or submitted <= deadline:
+        return result
+    hours_late = (submitted - deadline).total_seconds() / 3600
+    severity = cf.classify_lateness(hours_late)
+    if severity == "on_time":
+        return result
+    since = (datetime.now(timezone.utc) - timedelta(days=cf.LATE_PENALTY_WINDOW_DAYS)).isoformat()
+    prior = await db.late_offenses.count_documents({"creator_id": creator_id, "created_at": {"$gte": since}})
+    offense_number = prior + 1
+    pct = cf.late_penalty_pct(offense_number, severity)
+    await db.late_offenses.insert_one({
+        "id": str(uuid.uuid4()),
+        "creator_id": creator_id,
+        "campaign_id": campaign.get('id'),
+        "severity": severity,
+        "hours_late": round(hours_late, 1),
+        "offense_number": offense_number,
+        "penalty_pct": pct,
+        "waived": False,
+        "created_at": now_iso(),
+    })
+    return {"is_late": True, "severity": severity, "penalty_pct": pct, "offense_number": offense_number, "hours_late": round(hours_late, 1)}
+
+
 @api_router.post("/work/{work_id}/approve")
 async def approve_work(work_id: str, current_user: dict = Depends(get_current_user)):
     work = await db.work_submissions.find_one({"id": work_id})
     if not work:
         raise HTTPException(status_code=404, detail="Work not found")
-    
+
     campaign = await db.campaigns.find_one({"id": work['campaign_id']})
     if campaign['business_id'] != current_user['id']:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # Update work status
+
+    # PRD 8.6: approval is final and irreversible.
+    if work.get('status') == WorkStatus.APPROVED:
+        raise HTTPException(status_code=400, detail="This content is already approved. Approval is final.")
+    # PRD 9.3: no approval while a dispute is open.
+    await ensure_not_disputed(work['campaign_id'])
+
+    now = now_iso()
     await db.work_submissions.update_one(
         {"id": work_id},
-        {"$set": {"status": WorkStatus.APPROVED, "approved_at": datetime.now(timezone.utc).isoformat()}}
+        {"$set": {"status": WorkStatus.APPROVED, "approved_at": now}}
     )
-    
-    # Release escrow to creator
-    escrow = await db.escrow.find_one({"campaign_id": work['campaign_id']})
-    if escrow:
-        await db.escrow.update_one(
-            {"id": escrow['id']},
-            {"$set": {"status": "released", "released_at": datetime.now(timezone.utc).isoformat()}}
-        )
 
-        # Update creator balance
-        await db.users.update_one(
-            {"id": work['creator_id']},
-            {"$inc": {"balance": escrow['amount']}}
-        )
+    payout_info = await schedule_payout_for_deal(campaign, work, source="approval")
 
-        # Manual payout receipt for the released earning (PRD 1.6: payment status
-        # tracking + payout receipt).
-        await create_payout_receipt(
-            creator_id=work['creator_id'],
-            receipt_type="earning",
-            gross_amount=float(escrow.get('amount') or 0),
-            campaign_id=work['campaign_id'],
-            reference_id=escrow.get('id'),
-            note="Escrow released on content approval",
-        )
-    
-    # Update campaign status
+    # PRD 8.6: content is approved; payout is queued (not released yet).
     await db.campaigns.update_one(
         {"id": work['campaign_id']},
-        {"$set": {"status": CampaignStatus.COMPLETED}}
+        {"$set": {"payout_status": "scheduled", "approved_at": now, "updated_at": now}}
     )
 
-    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "payment_released", "Work was approved and payment was released.")
-    await insert_deal_system_message(campaign, "Work was approved and payment was released.")
-    
-    return {"message": "Work approved and payment released"}
+    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "content_approved",
+                               f"Content approved. Payment scheduled for {payout_info.get('payout_scheduled_at', 'the payout date')[:10]}.")
+    await insert_deal_system_message(campaign, "Content approved. The creator's payout has been scheduled.")
+    await notify_user(work['creator_id'], "Your content was approved",
+                      f"Payment of ₹{int(payout_info.get('net_payable', 0))} is scheduled for {payout_info.get('payout_scheduled_at', '')[:10]}.",
+                      link="/my-deals")
+
+    return {"message": "Content approved. Payout scheduled.", **payout_info}
+
+
+async def schedule_payout_for_deal(campaign: dict, work: dict, source: str = "approval") -> dict:
+    """PRD 8.7: queue the creator's payout for `payout_delay_days` after approval,
+    netting TDS and any late-delivery penalty. Does NOT move money yet."""
+    escrow = await db.escrow.find_one({"campaign_id": campaign['id']})
+    if not escrow:
+        return {"payout_scheduled_at": None, "net_payable": 0, "tds_amount": 0, "penalty_amount": 0}
+    creator = await db.users.find_one({"id": work['creator_id']}, {"_id": 0, "level": 1, "tds_exempt": 1}) or {}
+    gross = float(escrow.get('amount') or 0)
+    delay = cf.payout_delay_days(creator.get('level'))
+    scheduled_at = (datetime.now(timezone.utc) + timedelta(days=delay)).isoformat()
+    tds = cf.compute_tds(gross, exempt=bool(creator.get('tds_exempt')))
+    late = await assess_late_delivery(work['creator_id'], campaign, work)
+    penalty = round(gross * late['penalty_pct'] / 100, 2) if late['is_late'] else 0.0
+    net = round(gross - tds - penalty, 2)
+    await db.escrow.update_one(
+        {"id": escrow['id']},
+        {"$set": {
+            "payout_status": "scheduled",
+            "approved_at": now_iso(),
+            "payout_scheduled_at": scheduled_at,
+            "estimated_payout_at": scheduled_at,
+            "payout_delay_days": delay,
+            "gross_amount": gross,
+            "tds_amount": tds,
+            "penalty_amount": penalty,
+            "penalty_pct": late['penalty_pct'],
+            "penalty_brand_credit": round(penalty * cf.LATE_PENALTY_BRAND_SHARE, 2),
+            "late_severity": late['severity'],
+            "net_payable": net,
+            "deductions": [{"label": "TDS", "amount": tds}, {"label": "Penalty", "amount": penalty}],
+            "creator_level": creator.get('level') or cf.DEFAULT_CREATOR_LEVEL,
+        }}
+    )
+    # Brand-facing invoice + creator TDS record (PRD 8.6)
+    await db.invoices.insert_one({
+        "id": str(uuid.uuid4()),
+        "campaign_id": campaign['id'],
+        "business_id": campaign.get('business_id'),
+        "creator_id": work['creator_id'],
+        "gross_amount": gross,
+        "tds_amount": tds,
+        "net_to_creator": net,
+        "created_at": now_iso(),
+        "source": source,
+    })
+    return {"payout_scheduled_at": scheduled_at, "net_payable": net, "tds_amount": tds, "penalty_amount": penalty, "late": late}
+
+
+async def release_scheduled_payout(escrow: dict) -> bool:
+    """PRD 8.7: on the scheduled date, move the net payout to the creator, credit
+    any brand goodwill from a late penalty, and mark the deal complete."""
+    if escrow.get('payout_status') != 'scheduled':
+        return False
+    campaign = await db.campaigns.find_one({"id": escrow.get('campaign_id')})
+    if not campaign:
+        return False
+    creator_id = escrow.get('creator_id') or campaign.get('selected_creator')
+    gross = float(escrow.get('gross_amount') or escrow.get('amount') or 0)
+    tds = float(escrow.get('tds_amount') or 0)
+    penalty = float(escrow.get('penalty_amount') or 0)
+    net = float(escrow.get('net_payable') if escrow.get('net_payable') is not None else gross - tds - penalty)
+    now = now_iso()
+
+    await db.escrow.update_one({"id": escrow['id']}, {"$set": {"status": "released", "payout_status": "released", "released_at": now}})
+    if creator_id:
+        await db.users.update_one({"id": creator_id}, {"$inc": {"balance": net}})
+    # Half of any late penalty is credited to the brand as goodwill (PRD 8.8).
+    brand_credit = float(escrow.get('penalty_brand_credit') or 0)
+    if brand_credit > 0 and campaign.get('business_id'):
+        await db.users.update_one({"id": campaign['business_id']}, {"$inc": {"balance": brand_credit}})
+        await notify_user(campaign['business_id'], "Goodwill credit applied", f"₹{int(brand_credit)} was credited to your wallet from a late-delivery penalty.", link="/dashboard/business/wallet")
+
+    await create_payout_receipt(
+        creator_id=creator_id, receipt_type="earning", gross_amount=gross,
+        campaign_id=campaign['id'], reference_id=escrow.get('id'),
+        note="Scheduled payout released", tds_amount=tds, penalty_amount=penalty,
+    )
+    await db.campaigns.update_one({"id": campaign['id']}, {"$set": {"status": CampaignStatus.COMPLETED, "payout_status": "released", "updated_at": now}})
+    await insert_deal_activity(campaign, "system", "UGCAD.IO", "payment_released", f"Payout of ₹{int(net)} released to the creator.")
+    if creator_id:
+        await notify_user(creator_id, "Payment released", f"₹{int(net)} has been released to your wallet.", link="/payouts")
+    return True
+
+
+async def release_due_payouts() -> int:
+    """Release every scheduled payout whose date has arrived."""
+    now = now_iso()
+    due = await db.escrow.find({"payout_status": "scheduled", "payout_scheduled_at": {"$lte": now}}).to_list(1000)
+    released = 0
+    for escrow in due:
+        try:
+            if await release_scheduled_payout(escrow):
+                released += 1
+        except Exception:
+            logger.exception("Failed to release payout for escrow %s", escrow.get('id'))
+    return released
+
+
+AUTO_APPROVE_DAYS = 5  # PRD 8.4
+
+
+async def auto_approve_stale_submissions() -> int:
+    """PRD 8.4: content auto-approves 5 days after submission if the brand never
+    acts, protecting creators from ghosting brands."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=AUTO_APPROVE_DAYS)).isoformat()
+    stale = await db.work_submissions.find({
+        "status": WorkStatus.SUBMITTED,
+        "submitted_at": {"$lte": cutoff},
+    }).to_list(1000)
+    approved = 0
+    for work in stale:
+        campaign = await db.campaigns.find_one({"id": work.get('campaign_id')})
+        if not campaign:
+            continue
+        # Don't auto-approve a deal that's under dispute.
+        cards = await db.deal_action_cards.find({"campaign_id": campaign['id']}, {"_id": 0}).to_list(100)
+        if any(c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open' for c in cards):
+            continue
+        await db.work_submissions.update_one({"id": work['id']}, {"$set": {"status": WorkStatus.APPROVED, "approved_at": now_iso(), "auto_approved": True}})
+        await schedule_payout_for_deal(campaign, work, source="auto_approval")
+        await db.campaigns.update_one({"id": campaign['id']}, {"$set": {"payout_status": "scheduled", "updated_at": now_iso()}})
+        await insert_deal_system_message(campaign, f"Content auto-approved after {AUTO_APPROVE_DAYS} days with no brand review (PRD 8.4). Payout scheduled.")
+        await notify_user(work['creator_id'], "Your content was auto-approved", "The brand didn't review in time, so your content was auto-approved and payout scheduled.", link="/my-deals")
+        approved += 1
+    return approved
+
+
+@api_router.post("/admin/payouts/run-due")
+async def run_due_payouts(current_user: dict = Depends(get_current_user)):
+    """Sweep: release due payouts and auto-approve stale submissions. Safe to call
+    on a schedule (cron) or manually from the admin dashboard."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can run payout sweeps")
+    auto_approved = await auto_approve_stale_submissions()
+    released = await release_due_payouts()
+    return {"auto_approved": auto_approved, "payouts_released": released}
+
+
+# PRD 8.8 — consequence ladder shown to creators ("fair systems explain themselves")
+LATE_PENALTY_LADDER = [
+    {"offense": 1, "consequence": "Warning + 5% payout penalty on that deal"},
+    {"offense": 2, "consequence": "10% penalty + 60-day pause on level upgrades"},
+    {"offense": 3, "consequence": "15% penalty + level demotion + 90-day probation"},
+    {"offense": 4, "consequence": "25% penalty + 14-day cooldown on new briefs"},
+    {"offense": 5, "consequence": "100% payout forfeit + account review + possible ban"},
+]
+
+
+@api_router.get("/creator/penalties")
+async def get_creator_penalties(current_user: dict = Depends(get_current_user)):
+    """PRD 8.8: creator's current penalty count, rolling reset date and the
+    consequence ladder."""
+    if current_user["role"] != UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Only creators have a penalty record")
+    since_dt = datetime.now(timezone.utc) - timedelta(days=cf.LATE_PENALTY_WINDOW_DAYS)
+    offenses = await db.late_offenses.find(
+        {"creator_id": current_user["id"], "created_at": {"$gte": since_dt.isoformat()}, "waived": {"$ne": True}},
+        {"_id": 0},
+    ).sort("created_at", 1).to_list(100)
+    oldest = parse_iso(offenses[0]["created_at"]) if offenses else None
+    reset_at = (oldest + timedelta(days=cf.LATE_PENALTY_WINDOW_DAYS)).isoformat() if oldest else None
+    return {
+        "offense_count": len(offenses),
+        "rolling_window_days": cf.LATE_PENALTY_WINDOW_DAYS,
+        "rolling_reset_at": reset_at,
+        "offenses": offenses,
+        "consequence_ladder": LATE_PENALTY_LADDER,
+        "next_consequence": LATE_PENALTY_LADDER[min(len(offenses), len(LATE_PENALTY_LADDER) - 1)],
+    }
+
+
+@api_router.post("/admin/late-offenses/{offense_id}/waive")
+async def waive_late_offense(offense_id: str, current_user: dict = Depends(get_current_user)):
+    """PRD 8.8 exception grants: admin waives a late-delivery penalty (medical,
+    platform issue, brand-caused delay, force majeure)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can waive penalties")
+    offense = await db.late_offenses.find_one({"id": offense_id}, {"_id": 0})
+    if not offense:
+        raise HTTPException(status_code=404, detail="Offense not found")
+    await db.late_offenses.update_one({"id": offense_id}, {"$set": {"waived": True, "waived_by": current_user["id"], "waived_at": now_iso()}})
+    # If the payout hasn't released yet, drop the penalty from the escrow.
+    escrow = await db.escrow.find_one({"campaign_id": offense.get("campaign_id"), "payout_status": "scheduled"})
+    if escrow and float(escrow.get("penalty_amount") or 0) > 0:
+        gross = float(escrow.get("gross_amount") or escrow.get("amount") or 0)
+        tds = float(escrow.get("tds_amount") or 0)
+        net = round(gross - tds, 2)
+        await db.escrow.update_one({"id": escrow["id"]}, {"$set": {
+            "penalty_amount": 0, "penalty_pct": 0, "penalty_brand_credit": 0, "net_payable": net,
+            "deductions": [{"label": "TDS", "amount": tds}, {"label": "Penalty", "amount": 0}],
+        }})
+    await notify_user(offense.get("creator_id"), "Late-delivery penalty waived", "An admin waived a late-delivery penalty on one of your deals.", link="/my-deals")
+    return {"message": "Penalty waived", "offense_id": offense_id}
+
+
+# ---------------------------------------------------------------------------
+# Brand-side penalties (PRD Section 8.9)
+# ---------------------------------------------------------------------------
+
+LATE_SHIP_FEE_PER_DAY = 200
+LATE_SHIP_FEE_CAP = 1000
+POACHING_PENALTY = 25000
+LOW_RATING_THRESHOLD = 3.5
+LOW_RATING_MIN_REVIEWS = 3
+
+
+class ReportUserSubmit(BaseModel):
+    reported_user_id: str
+    deal_id: Optional[str] = None
+    reason: str
+    details: Optional[str] = None
+
+
+class BrandPenaltyApply(BaseModel):
+    business_id: str
+    penalty_type: str  # warning | fee | poaching | suspension | probation | fraud
+    amount: Optional[float] = 0
+    days: Optional[int] = 0
+    note: Optional[str] = None
+
+
+@api_router.post("/report-user")
+async def report_user(data: ReportUserSubmit, current_user: dict = Depends(get_current_user)):
+    """PRD 8.9: either party reports misconduct; admin investigates within 5 business days."""
+    if data.details:
+        moderation = check_contact_info_policy(data.details)
+        if not moderation.get("safe"):
+            raise HTTPException(status_code=400, detail={"message": "Your report contains contact information, which cannot be shared.", "violations": moderation.get("violations", [])})
+    report = {
+        "id": str(uuid.uuid4()),
+        "reporter_id": current_user["id"],
+        "reporter_role": current_user.get("role"),
+        "reported_user_id": data.reported_user_id,
+        "deal_id": data.deal_id,
+        "reason": data.reason,
+        "details": data.details,
+        "status": "open",
+        "created_at": now_iso(),
+    }
+    await db.user_reports.insert_one(report)
+    await notify_admins("User report filed", f"{current_user.get('nickname', current_user['id'])} reported {data.reported_user_id} ({data.reason}).", link="/dashboard/admin/disputes")
+    return {"message": "Report submitted. Our team will investigate within 5 business days.", "report_id": report["id"]}
+
+
+@api_router.post("/admin/brand-penalty")
+async def apply_brand_penalty(data: BrandPenaltyApply, current_user: dict = Depends(get_current_user)):
+    """PRD 8.9: admin applies a brand-side penalty (poaching ₹25k, fraud probation,
+    suspension, monetary fee, warning)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can apply brand penalties")
+    brand = await db.users.find_one({"id": data.business_id, "role": UserRole.BUSINESS}, {"_id": 0, "id": 1})
+    if not brand:
+        raise HTTPException(status_code=404, detail="Brand not found")
+    updates = {}
+    amount = float(data.amount or 0)
+    if data.penalty_type == "poaching":
+        amount = amount or POACHING_PENALTY
+        days = data.days or 90
+        updates["suspended_until"] = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    if data.penalty_type in ["suspension", "probation"] and data.days:
+        field = "suspended_until" if data.penalty_type == "suspension" else "probation_until"
+        updates[field] = (datetime.now(timezone.utc) + timedelta(days=data.days)).isoformat()
+    if amount > 0:
+        await db.users.update_one({"id": data.business_id}, {"$inc": {"balance": -amount}})
+    if updates:
+        await db.users.update_one({"id": data.business_id}, {"$set": updates})
+    await db.brand_penalties.insert_one({
+        "id": str(uuid.uuid4()), "business_id": data.business_id, "penalty_type": data.penalty_type,
+        "amount": amount, "days": data.days or 0, "note": data.note,
+        "applied_by": current_user["id"], "created_at": now_iso(),
+    })
+    await notify_user(data.business_id, "A penalty was applied to your account", f"{data.penalty_type.title()} penalty: {data.note or ''}", link="/dashboard/business")
+    return {"message": "Penalty applied", "business_id": data.business_id, "penalty_type": data.penalty_type, "amount": amount}
+
 
 @api_router.post("/work/{work_id}/request-revision")
 async def request_revision(work_id: str, feedback: str, current_user: dict = Depends(get_current_user)):
@@ -4166,9 +5250,17 @@ async def request_revision(work_id: str, feedback: str, current_user: dict = Dep
     if campaign['business_id'] != current_user['id']:
         raise HTTPException(status_code=403, detail="Not authorized")
 
+    # PRD 9.3: no revision requests while a dispute is open.
+    await ensure_not_disputed(work['campaign_id'])
+
+    # PRD 8.5: hard maximum of 5 revisions per deliverable, then admin must step in.
+    used = len(work.get('revisions') or [])
+    if used >= 5:
+        await notify_admins("Revision limit reached", f"Campaign {work['campaign_id']} hit 5 revisions and needs admin review (PRD 8.5/8.9).", link="/dashboard/admin/disputes")
+        raise HTTPException(status_code=400, detail="This deliverable has reached the 5-revision maximum. An admin must review before further revisions.")
+
     # PRD Section 8: first 2 revisions are free; each one thereafter costs the
     # brand a flat ₹500, debited from the wallet at request time.
-    used = len(work.get('revisions') or [])
     fee = cf.revision_fee_for(used)
     paid = False
     if fee > 0:
@@ -4224,6 +5316,23 @@ async def get_my_deals(current_user: dict = Depends(get_current_user)):
     campaigns = await db.campaigns.find({
         "selected_creator": current_user['id']
     }, {"_id": 0}).to_list(100)
+
+    result = []
+    for campaign in campaigns:
+        context = await get_deal_context(make_deal_id(campaign), current_user)
+        result.append(await build_deal_response(context, current_user))
+
+    return result
+
+@api_router.get("/deals/business")
+async def get_business_deals(current_user: dict = Depends(get_current_user)):
+    if current_user['role'] != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only brands can access this")
+
+    campaigns = await db.campaigns.find({
+        "business_id": current_user['id'],
+        "selected_creator": {"$nin": [None, ""]},
+    }, {"_id": 0}).to_list(200)
 
     result = []
     for campaign in campaigns:
@@ -4302,6 +5411,8 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
     campaign = context['campaign']
     if campaign.get('selected_creator') != current_user['id']:
         raise HTTPException(status_code=403, detail="Not authorized")
+    # PRD 9.3: no content uploads while a dispute is open.
+    await ensure_not_disputed(campaign['id'])
 
     required = get_required_assets(campaign)
     missing = []
@@ -4337,9 +5448,15 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         # before approval (PRD Section 8).
         "watermark": cf.build_watermark_record(data.video_url, "video", uploads_dir),
         "creator_note": data.creator_note,
+        "self_assessment": data.self_assessment or [],
         "submitted_at": now_iso(),
         "status": "submitted"
     }
+    # PRD 8.3: notes to brand are contact-info filtered.
+    if data.creator_note:
+        moderation = check_contact_info_policy(data.creator_note)
+        if not moderation.get("safe"):
+            raise HTTPException(status_code=400, detail={"message": "Your note to the brand contains contact information, which cannot be shared.", "violations": moderation.get("violations", [])})
     await db.deal_content_submissions.insert_one(submission)
     work_doc = {
         "id": str(uuid.uuid4()),
@@ -4486,6 +5603,341 @@ async def report_deal_damage(deal_id: str, data: DealIssueSubmit, current_user: 
         raise HTTPException(status_code=403, detail="Only creators can report damage")
     return await create_issue_action(deal_id, current_user, "damage_report", "Damage report created", data.message or "Damaged or wrong product was reported.", data)
 
+
+# ---------------------------------------------------------------------------
+# Dispute resolution engine (PRD Section 9)
+# ---------------------------------------------------------------------------
+
+DISPUTE_TYPES = ["non_delivery", "quality_below_brief", "damaged_wrong", "scope_creep",
+                 "revision_abuse", "communication_issue", "off_platform_attempt", "payment_issue", "other"]
+DESIRED_OUTCOMES = ["full_refund", "partial_refund", "extension", "redo", "reassignment", "other"]
+
+# type -> severity (PRD 9.7)
+DISPUTE_SEVERITY = {
+    "off_platform_attempt": "critical", "fraud": "critical",
+    "damaged_wrong": "high", "non_delivery": "high",
+    "scope_creep": "medium", "quality_below_brief": "medium", "revision_abuse": "medium", "payment_issue": "medium",
+    "communication_issue": "low", "other": "low",
+}
+# severity -> (first_response_hours, resolution_business_days)
+DISPUTE_SLA = {
+    "critical": (4, 1), "high": (24, 3), "medium": (24, 5), "low": (48, 7),
+}
+
+
+def dispute_severity(dispute_type: str) -> str:
+    return DISPUTE_SEVERITY.get(dispute_type, "low")
+
+
+async def get_open_dispute(campaign_id: str) -> Optional[dict]:
+    return await db.disputes.find_one({"campaign_id": campaign_id, "status": {"$in": ["open", "info_requested", "appealed"]}}, {"_id": 0})
+
+
+async def ensure_not_disputed(campaign_id: str):
+    """PRD 9.3: while a dispute is open, all non-dispute deal actions are paused."""
+    if await get_open_dispute(campaign_id):
+        raise HTTPException(status_code=409, detail="This deal is under dispute. Actions are paused until an admin resolves it.")
+
+
+@api_router.post("/deals/{deal_id}/raise-dispute")
+async def raise_structured_dispute(deal_id: str, data: DisputeCreate, current_user: dict = Depends(get_current_user)):
+    context = await get_deal_context(deal_id, current_user)
+    campaign = context['campaign']
+    # Validation (PRD 9.3)
+    if data.dispute_type not in DISPUTE_TYPES:
+        raise HTTPException(status_code=400, detail=f"dispute_type must be one of: {', '.join(DISPUTE_TYPES)}")
+    if data.desired_outcome not in DESIRED_OUTCOMES:
+        raise HTTPException(status_code=400, detail=f"desired_outcome must be one of: {', '.join(DESIRED_OUTCOMES)}")
+    if not (100 <= len(data.description) <= 1000):
+        raise HTTPException(status_code=400, detail="Description must be 100–1000 characters.")
+    if len(data.evidence_urls) < 1:
+        raise HTTPException(status_code=400, detail="At least one piece of evidence is required.")
+    # PRD 9.8: no disputes after approval / completion.
+    if campaign.get('status') == CampaignStatus.COMPLETED or (await db.escrow.find_one({"campaign_id": campaign['id'], "payout_status": "released"})):
+        raise HTTPException(status_code=400, detail="This deal is already approved/complete. Approval is final.")
+    if await get_open_dispute(campaign['id']):
+        raise HTTPException(status_code=400, detail="A dispute is already open on this deal.")
+
+    severity = dispute_severity(data.dispute_type)
+    first_hrs, res_days = DISPUTE_SLA[severity]
+    now = datetime.now(timezone.utc)
+    dispute = {
+        "id": str(uuid.uuid4()),
+        "deal_id": make_deal_id(campaign),
+        "campaign_id": campaign['id'],
+        "business_id": campaign.get('business_id'),
+        "creator_id": campaign.get('selected_creator'),
+        "raised_by": current_user['id'],
+        "raised_by_role": current_user.get('role'),
+        "dispute_type": data.dispute_type,
+        "severity": severity,
+        "description": data.description,
+        "desired_outcome": data.desired_outcome,
+        "evidence_urls": data.evidence_urls,
+        "status": "open",
+        "first_response_due_at": (now + timedelta(hours=first_hrs)).isoformat(),
+        "resolution_due_at": (now + timedelta(days=res_days)).isoformat(),
+        "created_at": now_iso(),
+    }
+    await db.disputes.insert_one(dispute)
+    # Pause activity + hold escrow + show Disputed state via a deal action card.
+    await db.escrow.update_one({"campaign_id": campaign['id']}, {"$set": {"status": "on_hold", "updated_at": now_iso()}}, upsert=True)
+    await db.deal_action_cards.insert_one({
+        "id": str(uuid.uuid4()), "deal_id": make_deal_id(campaign), "campaign_id": campaign['id'],
+        "type": "raise_dispute", "title": "Dispute raised", "status": "open", "created_at": now_iso(),
+        "created_by": current_user['id'], "message": data.description, "dispute_id": dispute["id"],
+    })
+    await insert_deal_activity(campaign, map_sender_type(current_user['id'], campaign, campaign.get('selected_creator'), current_user.get('role')), current_user.get('nickname', 'User'), "dispute_raised", f"A {severity} dispute was raised: {data.dispute_type.replace('_', ' ')}.")
+    # PRD 9.9: admin notified within 5 minutes.
+    await notify_admins(f"New {severity} dispute", f"{data.dispute_type.replace('_',' ')} on deal {make_deal_id(campaign)} — first response due in {first_hrs}h.", link="/dashboard/admin/disputes")
+    other_party = campaign.get('selected_creator') if current_user['id'] == campaign.get('business_id') else campaign.get('business_id')
+    if other_party:
+        await notify_user(other_party, "A dispute was raised on your deal", "Deal activity is paused while our team reviews. You'll be asked for any evidence.", link="/my-deals")
+    return {"message": "Dispute raised", "dispute_id": dispute["id"], "severity": severity}
+
+
+def _business_days_from(start: datetime, days: int) -> datetime:
+    d, added = start, 0
+    while added < days:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            added += 1
+    return d
+
+
+@api_router.get("/admin/disputes")
+async def list_disputes(status: Optional[str] = None, dispute_type: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    """PRD 9.4: admin dispute dashboard — all disputes sorted by age with SLA countdown."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view disputes")
+    query = {}
+    if status:
+        query["status"] = status
+    if dispute_type:
+        query["dispute_type"] = dispute_type
+    disputes = await db.disputes.find(query, {"_id": 0}).sort("created_at", 1).to_list(1000)
+    now = datetime.now(timezone.utc)
+    for d in disputes:
+        res_due = parse_iso(d.get("resolution_due_at"))
+        d["sla_hours_remaining"] = round((res_due - now).total_seconds() / 3600, 1) if res_due else None
+        d["sla_breached"] = bool(res_due and res_due < now and d.get("status") not in ["resolved", "closed"])
+    open_count = sum(1 for d in disputes if d.get("status") in ["open", "info_requested", "appealed"])
+    return {"disputes": disputes, "open_count": open_count, "sla_tiers": DISPUTE_SLA}
+
+
+@api_router.get("/admin/disputes/{dispute_id}")
+async def get_dispute_detail(dispute_id: str, current_user: dict = Depends(get_current_user)):
+    """PRD 9.4: full evidence review panel — brief, timeline, chat, content, shipping, prior disputes."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view disputes")
+    dispute = await db.disputes.find_one({"id": dispute_id}, {"_id": 0})
+    if not dispute:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    cid = dispute["campaign_id"]
+    bid, crid = dispute.get("business_id"), dispute.get("creator_id")
+    campaign = await db.campaigns.find_one({"id": cid}, {"_id": 0})
+    timeline = await db.deal_activity.find({"campaign_id": cid}, {"_id": 0}).sort("timestamp", 1).to_list(500)
+    content = await db.deal_content_submissions.find({"campaign_id": cid}, {"_id": 0}).sort("version", 1).to_list(50)
+    shipment = await db.shipments.find_one({"campaign_id": cid}, {"_id": 0})
+    chat = await db.messages.find(
+        {"$or": [{"sender_id": bid, "recipient_id": crid}, {"sender_id": crid, "recipient_id": bid}]},
+        {"_id": 0},
+    ).sort("created_at", 1).to_list(500) if bid and crid else []
+    prior = await db.disputes.find({"$or": [{"business_id": dispute.get("business_id")}, {"creator_id": dispute.get("creator_id")}], "id": {"$ne": dispute_id}}, {"_id": 0}).to_list(100)
+    return {
+        "dispute": dispute,
+        "brief": normalize_campaign_response(campaign) if campaign else None,
+        "timeline": timeline,
+        "content_versions": content,
+        "shipment": shipment,
+        "chat_history": chat,
+        "prior_disputes": prior,
+    }
+
+
+@api_router.post("/admin/disputes/{dispute_id}/request-info")
+async def dispute_request_info(dispute_id: str, data: DisputeInfoRequest, current_user: dict = Depends(get_current_user)):
+    """PRD 9.4: admin requests more info; SLA pauses; 72h response window."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can request info")
+    dispute = await db.disputes.find_one({"id": dispute_id}, {"_id": 0})
+    if not dispute:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    target = dispute.get("business_id") if data.party == "brand" else dispute.get("creator_id")
+    await db.disputes.update_one({"id": dispute_id}, {"$set": {"status": "info_requested", "info_requested_from": data.party, "info_request_due_at": (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(), "info_request_message": data.message}})
+    if target:
+        await notify_user(target, "More information needed for your dispute", data.message + " Please respond within 72 hours.", link="/my-deals")
+    return {"message": "Info requested", "dispute_id": dispute_id}
+
+
+@api_router.post("/admin/disputes/{dispute_id}/rule")
+async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict = Depends(get_current_user)):
+    """PRD 9.4/9.5: admin ruling + financial execution within 24h."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can rule on disputes")
+    if data.ruling not in ["favor_brand", "favor_creator", "split", "no_fault"]:
+        raise HTTPException(status_code=400, detail="Invalid ruling type")
+    dispute = await db.disputes.find_one({"id": dispute_id}, {"_id": 0})
+    if not dispute:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    if dispute.get("status") in ["resolved", "closed"]:
+        raise HTTPException(status_code=400, detail="This dispute is already resolved.")
+    campaign = await db.campaigns.find_one({"id": dispute["campaign_id"]})
+    escrow = await db.escrow.find_one({"campaign_id": dispute["campaign_id"]})
+    held = float((escrow or {}).get("amount") or 0)
+    refund = round(float(data.refund_amount or 0), 2)
+    creator_amt = round(float(data.creator_amount or 0), 2)
+
+    # Default money splits per ruling when amounts not explicitly given.
+    if data.ruling == "favor_creator" and creator_amt == 0:
+        creator_amt = held
+    elif data.ruling == "favor_brand" and refund == 0:
+        refund = held
+    elif data.ruling == "no_fault" and creator_amt == 0 and refund == 0:
+        creator_amt = held  # platform absorbs; creator still paid from reserve
+
+    # PRD 9.8: if escrow can't cover, platform reserve covers the gap (logged).
+    reserve_gap = round(max(0, (refund + creator_amt) - held), 2)
+
+    if refund > 0 and campaign and campaign.get("business_id"):
+        await db.users.update_one({"id": campaign["business_id"]}, {"$inc": {"balance": refund}})
+    if creator_amt > 0 and dispute.get("creator_id"):
+        await db.users.update_one({"id": dispute["creator_id"]}, {"$inc": {"balance": creator_amt}})
+        await create_payout_receipt(creator_id=dispute["creator_id"], receipt_type="earning", gross_amount=creator_amt, campaign_id=dispute["campaign_id"], reference_id=dispute_id, note=f"Dispute ruling ({data.ruling})")
+    if escrow:
+        await db.escrow.update_one({"id": escrow["id"]}, {"$set": {"status": "released", "payout_status": "released", "released_at": now_iso(), "dispute_resolution": data.ruling}})
+    if data.extension_days and campaign:
+        new_deadline = (datetime.now(timezone.utc) + timedelta(days=data.extension_days)).isoformat()
+        await db.campaigns.update_one({"id": campaign["id"]}, {"$set": {"final_delivery_by": new_deadline, "due_date": new_deadline}})
+
+    await db.disputes.update_one({"id": dispute_id}, {"$set": {
+        "status": "resolved", "ruling": data.ruling, "reasoning": data.reasoning,
+        "refund_amount": refund, "creator_amount": creator_amt, "reserve_gap": reserve_gap,
+        "ruled_by": current_user["id"], "resolved_at": now_iso(),
+        "appeal_deadline_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
+    }})
+    # Close the open dispute card so the deal unpauses.
+    await db.deal_action_cards.update_many({"campaign_id": dispute["campaign_id"], "type": "raise_dispute", "status": "open"}, {"$set": {"status": "resolved"}})
+    # PRD 9.5: record outcome on both users' history.
+    for uid, role in [(dispute.get("business_id"), "brand"), (dispute.get("creator_id"), "creator")]:
+        if uid:
+            await db.users.update_one({"id": uid}, {"$push": {"dispute_history": {"dispute_id": dispute_id, "ruling": data.ruling, "role": role, "at": now_iso()}}})
+            await notify_user(uid, "Your dispute has been resolved", f"Ruling: {data.ruling.replace('_',' ')}. {data.reasoning[:120]} You may appeal within 7 days.", link="/my-deals")
+    if reserve_gap > 0:
+        await notify_admins("Dispute ruling exceeded escrow", f"Dispute {dispute_id} needed ₹{reserve_gap} from reserve. Finance audit required.")
+    return {"message": "Dispute resolved", "ruling": data.ruling, "refund": refund, "creator_amount": creator_amt, "reserve_gap": reserve_gap}
+
+
+@api_router.post("/disputes/{dispute_id}/appeal")
+async def appeal_dispute(dispute_id: str, data: DisputeAppeal, current_user: dict = Depends(get_current_user)):
+    """PRD 9.5: either party appeals within 7 days with new evidence."""
+    dispute = await db.disputes.find_one({"id": dispute_id}, {"_id": 0})
+    if not dispute:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    if current_user["id"] not in [dispute.get("business_id"), dispute.get("creator_id")]:
+        raise HTTPException(status_code=403, detail="Only the parties can appeal this dispute")
+    if dispute.get("status") != "resolved":
+        raise HTTPException(status_code=400, detail="Only a resolved dispute can be appealed.")
+    if dispute.get("appealed"):
+        raise HTTPException(status_code=400, detail="This dispute has already been appealed. The second ruling is final.")
+    deadline = parse_iso(dispute.get("appeal_deadline_at"))
+    if deadline and datetime.now(timezone.utc) > deadline:
+        raise HTTPException(status_code=400, detail="The 7-day appeal window has closed.")
+    if not data.new_evidence_urls and not (data.grounds and data.grounds.strip()):
+        raise HTTPException(status_code=400, detail="An appeal requires new evidence or points not previously considered.")
+    await db.disputes.update_one({"id": dispute_id}, {"$set": {
+        "status": "appealed", "appealed": True, "appeal_by": current_user["id"],
+        "appeal_grounds": data.grounds, "appeal_evidence_urls": data.new_evidence_urls, "appealed_at": now_iso(),
+    }})
+    await notify_admins("Dispute appealed", f"Dispute {dispute_id} was appealed — senior review required. Second ruling is final.", link="/dashboard/admin/disputes")
+    return {"message": "Appeal submitted. A senior admin will review; the second ruling is final.", "dispute_id": dispute_id}
+
+
+@api_router.get("/disputes/my")
+async def get_my_disputes(current_user: dict = Depends(get_current_user)):
+    disputes = await db.disputes.find({"$or": [{"business_id": current_user["id"]}, {"creator_id": current_user["id"]}]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return disputes
+
+# --- Brand-side deal actions (Deal Room) ---
+class DealTrackingSubmit(BaseModel):
+    tracking_id: str
+    courier: Optional[str] = None
+    courier_tracking_url: Optional[str] = None
+    expected_delivery_at: Optional[str] = None
+
+class DealRevisionRequest(BaseModel):
+    feedback: str
+    requested_changes: Optional[List[str]] = None
+
+async def get_brand_deal_campaign(deal_id: str, current_user: dict) -> dict:
+    """Resolve a deal id to a campaign and assert the caller is its brand."""
+    if current_user.get('role') != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only brands can perform this action")
+    campaign = await get_campaign_by_deal_id(deal_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    if campaign.get('business_id') != current_user['id']:
+        raise HTTPException(status_code=403, detail="Not authorized for this deal")
+    return campaign
+
+@api_router.post("/deals/{deal_id}/tracking")
+async def submit_deal_tracking(deal_id: str, data: DealTrackingSubmit, current_user: dict = Depends(get_current_user)):
+    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    shipment_doc = {
+        "campaign_id": campaign['id'],
+        "tracking_number": data.tracking_id,
+        "courier_name": data.courier,
+        "courier_tracking_url": data.courier_tracking_url,
+        "courier_status": "shipped",
+        "expected_delivery": data.expected_delivery_at,
+        "updated_at": now_iso(),
+        "status": "shipped",
+    }
+    await db.shipments.update_one({"campaign_id": campaign['id']}, {"$set": shipment_doc}, upsert=True)
+    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "tracking_uploaded", "Shipment tracking was uploaded.")
+    await insert_deal_system_message(campaign, "Shipment tracking was uploaded by the brand.")
+    return {"message": "Tracking uploaded"}
+
+@api_router.post("/deals/{deal_id}/delivered")
+async def mark_deal_delivered(deal_id: str, current_user: dict = Depends(get_current_user)):
+    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    await db.shipments.update_one(
+        {"campaign_id": campaign['id']},
+        {"$set": {"courier_status": "delivered", "status": "delivered", "updated_at": now_iso()}},
+    )
+    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "delivered", "Shipment was marked delivered.")
+    await insert_deal_system_message(campaign, "Shipment was marked delivered.")
+    return {"message": "Marked delivered"}
+
+@api_router.post("/deals/{deal_id}/approve")
+async def approve_deal_content(deal_id: str, current_user: dict = Depends(get_current_user)):
+    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    work = await db.work_submissions.find_one(
+        {"campaign_id": campaign['id']}, {"_id": 0}, sort=[("submitted_at", -1)]
+    )
+    if not work:
+        raise HTTPException(status_code=404, detail="No submitted work to approve")
+    return await approve_work(work['id'], current_user)
+
+@api_router.post("/deals/{deal_id}/request-revision")
+async def request_deal_revision(deal_id: str, data: DealRevisionRequest, current_user: dict = Depends(get_current_user)):
+    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    work = await db.work_submissions.find_one(
+        {"campaign_id": campaign['id']}, {"_id": 0}, sort=[("submitted_at", -1)]
+    )
+    if not work:
+        raise HTTPException(status_code=404, detail="No submitted work to revise")
+    return await request_revision(work['id'], data.feedback, current_user)
+
+@api_router.post("/deals/{deal_id}/archive")
+async def archive_deal(deal_id: str, current_user: dict = Depends(get_current_user)):
+    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    await db.campaigns.update_one(
+        {"id": campaign['id']},
+        {"$set": {"archived_by_brand": True, "archived_at": now_iso()}},
+    )
+    return {"message": "Deal archived"}
+
 @api_router.get("/work/campaign/{campaign_id}")
 async def get_work_by_campaign(campaign_id: str, current_user: dict = Depends(get_current_user)):
     work = await db.work_submissions.find_one(
@@ -4525,11 +5977,23 @@ async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_
     if not work:
         raise HTTPException(status_code=404, detail="Work not found")
 
+    campaign = await db.campaigns.find_one({"id": work['campaign_id']}, {"_id": 0})
+
     # Verify authorization - user must be creator or the business reviewing it
+    is_brand_viewer = False
     if current_user['id'] != work['creator_id']:
-        campaign = await db.campaigns.find_one({"id": work['campaign_id']})
-        if campaign['business_id'] != current_user['id']:
+        if not campaign or campaign.get('business_id') != current_user['id']:
             raise HTTPException(status_code=403, detail="Not authorized to view this work")
+        is_brand_viewer = True
+
+    # Denormalize fields the review UI expects.
+    if campaign:
+        work['campaign_title'] = campaign.get('title') or campaign.get('campaign_name')
+    creator = await db.users.find_one({"id": work['creator_id']}, {"_id": 0, "nickname": 1, "full_name": 1})
+    if creator:
+        work['creator_nickname'] = creator.get('nickname') or creator.get('full_name')
+
+    if is_brand_viewer:
         # Brand viewer gets the watermark-protected preview until approval.
         approved = work.get('status') == WorkStatus.APPROVED
         return cf.to_brand_facing_asset(work, approved=approved)
@@ -4539,27 +6003,39 @@ async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_
 # Review Routes
 @api_router.post("/reviews")
 async def submit_review(data: ReviewSubmit, current_user: dict = Depends(get_current_user)):
+    rates_brand = bool(data.business_id) and current_user.get('role') == UserRole.CREATOR
     review_doc = {
         "id": str(uuid.uuid4()),
         "campaign_id": data.campaign_id,
         "creator_id": data.creator_id,
+        "business_id": data.business_id,
+        "reviewee_role": "business" if rates_brand else "creator",
         "reviewer_id": current_user['id'],
         "rating": data.rating,
         "review": data.review,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
-    
     await db.reviews.insert_one(review_doc)
-    
+
+    if rates_brand:
+        # PRD 8.9: chronic low ratings from creators (<3.5) restrict the brand.
+        brand_reviews = await db.reviews.find({"business_id": data.business_id, "reviewee_role": "business"}, {"_id": 0}).to_list(1000)
+        avg = sum(r['rating'] for r in brand_reviews) / len(brand_reviews)
+        updates = {"average_rating": round(avg, 2), "total_reviews": len(brand_reviews)}
+        if len(brand_reviews) >= LOW_RATING_MIN_REVIEWS and avg < LOW_RATING_THRESHOLD:
+            updates["posting_restricted"] = True
+            await notify_admins("Brand restricted for low ratings", f"Brand {data.business_id} fell below {LOW_RATING_THRESHOLD} ({round(avg,2)} over {len(brand_reviews)} reviews).")
+            await notify_user(data.business_id, "Posting privileges restricted", "Your creator ratings dropped below 3.5. Posting is restricted pending a support call.", link="/dashboard/business")
+        await db.users.update_one({"id": data.business_id}, {"$set": updates})
+        return {"message": "Review submitted"}
+
     # Update creator's average rating
-    reviews = await db.reviews.find({"creator_id": data.creator_id}, {"_id": 0}).to_list(1000)
+    reviews = await db.reviews.find({"creator_id": data.creator_id, "reviewee_role": {"$ne": "business"}}, {"_id": 0}).to_list(1000)
     avg_rating = sum(r['rating'] for r in reviews) / len(reviews)
-    
     await db.users.update_one(
         {"id": data.creator_id},
         {"$set": {"average_rating": avg_rating, "total_reviews": len(reviews)}}
     )
-    
     return {"message": "Review submitted"}
 
 @api_router.get("/reviews/creator/{creator_id}")
@@ -4587,6 +6063,7 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
         "status": data.courier_status or "shipped"
     }
     
+    existing = await db.shipments.find_one({"campaign_id": data.campaign_id}, {"_id": 0, "late_fee_applied": 1})
     await db.shipments.update_one(
         {"campaign_id": data.campaign_id},
         {"$set": shipment_doc},
@@ -4595,7 +6072,20 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
 
     await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "tracking_uploaded", "Shipment tracking was uploaded.")
     await insert_deal_system_message(campaign, "Shipment tracking was uploaded by the brand.")
-    
+
+    # PRD 8.9: late product shipping → ₹200/day to the creator (cap ₹1,000), once.
+    ship_by = parse_iso(campaign.get('product_shipping_by'))
+    if ship_by and not (existing or {}).get('late_fee_applied'):
+        days_late = (datetime.now(timezone.utc) - ship_by).days
+        if days_late >= 1:
+            fee = min(days_late * LATE_SHIP_FEE_PER_DAY, LATE_SHIP_FEE_CAP)
+            creator_id = campaign.get('selected_creator')
+            if creator_id and fee > 0:
+                await db.users.update_one({"id": creator_id}, {"$inc": {"balance": fee}})
+                await db.shipments.update_one({"campaign_id": data.campaign_id}, {"$set": {"late_fee_applied": fee, "late_fee_days": days_late}})
+                await notify_user(creator_id, "Late-shipping fee credited", f"₹{fee} was credited to you because the brand shipped {days_late} day(s) late.", link="/payouts")
+                await insert_deal_system_message(campaign, f"Brand shipped {days_late} day(s) late — ₹{fee} late-shipping fee credited to the creator (PRD 8.9).")
+
     return {"message": "Shipment details updated"}
 
 @api_router.post("/shipment/receive")
@@ -4649,6 +6139,17 @@ async def receive_shipment(data: ShipmentReceive, current_user: dict = Depends(g
 
 @api_router.get("/shipment/{campaign_id}")
 async def get_shipment(campaign_id: str, current_user: dict = Depends(get_current_user)):
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    role = current_user.get('role')
+    is_party = (
+        campaign.get('business_id') == current_user['id']
+        or campaign.get('selected_creator') == current_user['id']
+        or role in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]
+    )
+    if not is_party:
+        raise HTTPException(status_code=403, detail="Not authorized to view this shipment")
     shipment = await db.shipments.find_one({"campaign_id": campaign_id}, {"_id": 0})
     if not shipment:
         raise HTTPException(status_code=404, detail="Shipment not found")
@@ -4659,11 +6160,15 @@ PLATFORM_COMMISSION_PERCENT = 25  # PRD Section 3: platform takes 25%.
 
 async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount: float,
                                 campaign_id: Optional[str] = None, reference_id: Optional[str] = None,
-                                note: Optional[str] = None) -> dict:
+                                note: Optional[str] = None, tds_amount: float = 0.0,
+                                penalty_amount: float = 0.0) -> dict:
     """Generate and persist a payout receipt for a creator. receipt_type is
-    'earning' (escrow release) or 'withdrawal' (payout to bank/UPI)."""
+    'earning' (escrow release) or 'withdrawal' (payout to bank/UPI). TDS and any
+    late-delivery penalty are recorded as deductions (PRD 8.7/8.8)."""
     commission = round(gross_amount * PLATFORM_COMMISSION_PERCENT / 100, 2) if receipt_type == "earning" else 0.0
-    net_amount = round(gross_amount - commission, 2)
+    tds_amount = round(float(tds_amount or 0), 2)
+    penalty_amount = round(float(penalty_amount or 0), 2)
+    net_amount = round(gross_amount - commission - tds_amount - penalty_amount, 2)
     seq = await db.payout_receipts.count_documents({}) + 1
     receipt = {
         "id": str(uuid.uuid4()),
@@ -4673,6 +6178,8 @@ async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount
         "gross_amount": gross_amount,
         "commission_percent": PLATFORM_COMMISSION_PERCENT if receipt_type == "earning" else 0,
         "commission_amount": commission,
+        "tds_amount": tds_amount,
+        "penalty_amount": penalty_amount,
         "net_amount": net_amount,
         "currency": "INR",
         "campaign_id": campaign_id,
@@ -5258,8 +6765,16 @@ async def upload_campaign_file(file: UploadFile = File(...), current_user: dict 
         raise HTTPException(status_code=400, detail=f"File type {file.content_type} not allowed")
 
     content = await file.read()
-    if len(content) > 50 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File size exceeds 50MB limit")
+    # PRD 8.3 upload limits: 500MB video, 25MB image, 2GB raw footage, 25MB other.
+    ctype = file.content_type or ""
+    if ctype.startswith("video/"):
+        limit_mb = 2048 if "raw" in (file.filename or "").lower() else 500
+    elif ctype.startswith("image/"):
+        limit_mb = 25
+    else:
+        limit_mb = 25
+    if len(content) > limit_mb * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"File size exceeds {limit_mb}MB limit")
 
     upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads")))
     campaigns_upload_dir = upload_dir / "campaigns"

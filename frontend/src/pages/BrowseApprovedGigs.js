@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../App';
+import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { toast } from 'sonner';
 import {
@@ -55,12 +56,14 @@ const CreatorLevelBadge = ({ completedWorks = 0 }) => {
 
 export default function BrowseApprovedGigs() {
   const { user } = useAuth();
+  const navigate = useNavigate();
   const [gigs, setGigs] = useState([]);
   const [filteredGigs, setFilteredGigs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [categories, setCategories] = useState([]);
+  const [wishlisted, setWishlisted] = useState({});
 
   const categoryOptions = [
     { id: 'all', label: 'All Categories' },
@@ -119,8 +122,21 @@ export default function BrowseApprovedGigs() {
   };
 
   const handleContactCreator = (gigId, creatorId) => {
-    // TODO: Open contact/message modal or navigate to messages
-    toast.info(`Messaging creator for gig ${gigId}`);
+    if (!creatorId) {
+      toast.error('Creator is unavailable for this gig');
+      return;
+    }
+    navigate(`/chat/${creatorId}`);
+  };
+
+  const handleToggleWishlist = async (gigId) => {
+    try {
+      const res = await axios.post(`${API}/gigs/${gigId}/wishlist`);
+      setWishlisted(prev => ({ ...prev, [gigId]: res.data.is_wishlisted }));
+      toast.success(res.data.is_wishlisted ? 'Saved to wishlist' : 'Removed from wishlist');
+    } catch (error) {
+      toast.error('Could not update wishlist');
+    }
   };
 
   return (
@@ -182,7 +198,12 @@ export default function BrowseApprovedGigs() {
                   <h3 className="creator-name">{gig.creator_name || 'Unknown Creator'}</h3>
                   <CreatorLevelBadge completedWorks={gig.completed_works || 0} />
                 </div>
-                <Heart size={20} className="gig-heart-icon" />
+                <Heart
+                  size={20}
+                  className="gig-heart-icon"
+                  style={{ cursor: 'pointer', fill: wishlisted[gig.id] ? '#ef4444' : 'none', color: wishlisted[gig.id] ? '#ef4444' : undefined }}
+                  onClick={() => handleToggleWishlist(gig.id)}
+                />
               </div>
 
               {/* Gig Category Badge */}

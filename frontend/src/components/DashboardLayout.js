@@ -2,7 +2,8 @@ import { useAuth } from '../App';
 import { useNavigate } from 'react-router-dom';
 import { useEffect, useState } from 'react';
 import axios from 'axios';
-import { Bell, ChevronDown, LogOut, Search, Menu } from 'lucide-react';
+import { ChevronDown, LogOut, Search, Menu } from 'lucide-react';
+import NotificationBell from './NotificationBell';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -114,10 +115,7 @@ export default function DashboardLayout({
           <div className="pcd-top-actions">
             {sidebarVariant === 'business-match' ? (
               <>
-                <button type="button" className="pcd-business-round-action pcd-bell" aria-label="Notifications">
-                  <Bell size={18} />
-                  <span />
-                </button>
+                <NotificationBell />
                 <button type="button" className="pcd-business-profile-photo" onClick={() => navigate('/settings')} aria-label="Profile">
                   {user?.profile_photo ? (
                     <img src={`${BACKEND_URL}${user.profile_photo}`} alt={displayName} style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: '50%' }} />
@@ -135,10 +133,7 @@ export default function DashboardLayout({
             <button type="button" className="pcd-icon-btn" aria-label="Search">
               <Search size={18} />
             </button>
-            <button type="button" className="pcd-icon-btn pcd-bell" aria-label="Notifications">
-              <Bell size={18} />
-              <span />
-            </button>
+            <NotificationBell />
             <button type="button" className="pcd-profile-chip" onClick={() => navigate('/settings')}>
               <span className="pcd-avatar small">
                 {user?.profile_photo ? (

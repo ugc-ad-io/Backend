@@ -185,7 +185,7 @@ export default function AdminGigManagement() {
                   </div>
                   <div className="agm-gig-meta">
                     <span>{gig.category}</span>
-                    <span><IndianRupee size={14} /> {gig.price}</span>
+                    <span><IndianRupee size={14} /> {gig.budget}</span>
                   </div>
                 </div>
               ))
@@ -223,16 +223,16 @@ export default function AdminGigManagement() {
                     <dd>{selectedGig.category}</dd>
                   </div>
                   <div>
-                    <dt>Price</dt>
-                    <dd>₹{selectedGig.price}</dd>
+                    <dt>Budget</dt>
+                    <dd>₹{selectedGig.budget}</dd>
                   </div>
                   <div>
-                    <dt>Delivery Days</dt>
-                    <dd>{selectedGig.deliveryTime || 'N/A'} days</dd>
+                    <dt>Deadline</dt>
+                    <dd>{selectedGig.deadline ? new Date(selectedGig.deadline).toLocaleDateString() : 'N/A'}</dd>
                   </div>
                   <div>
-                    <dt>Niche</dt>
-                    <dd>{selectedGig.niche || 'Not specified'}</dd>
+                    <dt>Target Audience</dt>
+                    <dd>{selectedGig.target_audience || 'Not specified'}</dd>
                   </div>
                 </dl>
               </div>
@@ -274,42 +274,38 @@ export default function AdminGigManagement() {
                 <dl>
                   <div>
                     <dt>Gender</dt>
-                    <dd>{selectedGig.gender || 'Not specified'}</dd>
+                    <dd>{selectedGig.creator_gender || 'Not specified'}</dd>
                   </div>
                   <div>
                     <dt>Age Range</dt>
-                    <dd>{selectedGig.ageRange || 'Not specified'}</dd>
+                    <dd>{selectedGig.creator_age_range || 'Not specified'}</dd>
                   </div>
                   <div>
-                    <dt>City</dt>
-                    <dd>{selectedGig.city || 'Not specified'}</dd>
+                    <dt>Country</dt>
+                    <dd>{selectedGig.creator_country || 'Not specified'}</dd>
                   </div>
                   <div>
-                    <dt>Native Language</dt>
-                    <dd>{selectedGig.nativeLanguage || 'Not specified'}</dd>
+                    <dt>Language</dt>
+                    <dd>{selectedGig.creator_language?.length ? selectedGig.creator_language.join(', ') : 'Not specified'}</dd>
                   </div>
                 </dl>
               </div>
 
-              {selectedGig.videoStyles?.length > 0 && (
+              {selectedGig.skills_required?.length > 0 && (
                 <div className="agm-detail-section">
-                  <h3>Video Styles</h3>
+                  <h3>Skills Required</h3>
                   <div className="agm-tags">
-                    {selectedGig.videoStyles.map(style => (
-                      <span key={style} className="agm-tag">{style}</span>
+                    {selectedGig.skills_required.map(skill => (
+                      <span key={skill} className="agm-tag">{skill}</span>
                     ))}
                   </div>
                 </div>
               )}
 
-              {selectedGig.platforms?.length > 0 && (
+              {selectedGig.requirements && (
                 <div className="agm-detail-section">
-                  <h3>Platforms</h3>
-                  <div className="agm-tags">
-                    {selectedGig.platforms.map(platform => (
-                      <span key={platform} className="agm-tag">{platform}</span>
-                    ))}
-                  </div>
+                  <h3>Requirements</h3>
+                  <p>{selectedGig.requirements}</p>
                 </div>
               )}
 

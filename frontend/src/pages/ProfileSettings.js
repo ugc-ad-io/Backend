@@ -288,16 +288,47 @@ export default function ProfileSettings() {
     }
   };
 
+  const refreshTeam = async () => {
+    const res = await axios.get(`${API}/business/settings/team`);
+    setTeam({ ...defaultTeam, ...(res.data || {}) });
+  };
+
   const inviteMember = async () => {
     const email = window.prompt('Enter team member email');
     if (!email) return;
     try {
       await axios.post(`${API}/business/settings/team/invite`, { email, role: 'viewer' });
       toast.success('Invitation sent');
-      const res = await axios.get(`${API}/business/settings/team`);
-      setTeam({ ...defaultTeam, ...(res.data || {}) });
+      await refreshTeam();
     } catch (error) {
       toast.error(error.response?.data?.detail || 'Failed to invite member');
+    }
+  };
+
+  const changeMemberRole = async (member) => {
+    const role = window.prompt('Set role for this member (admin, editor, viewer)', member.role || 'viewer');
+    if (!role) return;
+    if (!['admin', 'editor', 'viewer'].includes(role)) {
+      toast.error('Role must be admin, editor, or viewer');
+      return;
+    }
+    try {
+      await axios.patch(`${API}/business/settings/team/${member.id}`, { role });
+      toast.success('Role updated');
+      await refreshTeam();
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to update role');
+    }
+  };
+
+  const removeMember = async (member) => {
+    if (!window.confirm(`Remove ${member.name || member.email} from the workspace?`)) return;
+    try {
+      await axios.delete(`${API}/business/settings/team/${member.id}`);
+      toast.success('Member removed');
+      await refreshTeam();
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to remove member');
     }
   };
 
@@ -596,7 +627,10 @@ export default function ProfileSettings() {
                 </div>
                 <span className="bs-role">{member.role}</span>
                 <span className={`bs-status ${member.status}`}><b /> {member.status}</span>
-                <button type="button" className="bs-icon-only"><MoreVertical size={18} /></button>
+                <span className="bs-team-actions" style={{ display: 'flex', gap: 8 }}>
+                  <button type="button" className="bs-icon-only" title="Change role" onClick={() => changeMemberRole(member)}><MoreVertical size={18} /></button>
+                  <button type="button" className="bs-icon-only" title="Remove member" onClick={() => removeMember(member)}><Trash2 size={18} /></button>
+                </span>
               </div>
             ))}
           </div>

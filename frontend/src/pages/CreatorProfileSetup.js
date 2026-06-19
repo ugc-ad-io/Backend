@@ -308,6 +308,18 @@ export default function CreatorProfileSetup() {
                 data-testid="youtube-input"
               />
             </div>
+            <div className="form-group">
+              <label htmlFor="tiktok">TikTok</label>
+              <input
+                id="tiktok"
+                type="text"
+                value={formData.social_links.tiktok}
+                onChange={(e) => handleNestedChange('social_links', 'tiktok', e.target.value)}
+                className="input-field"
+                placeholder="@username"
+                data-testid="tiktok-input"
+              />
+            </div>
           </div>
 
           <div className="form-section">

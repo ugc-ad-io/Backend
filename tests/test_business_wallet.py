@@ -145,7 +145,7 @@ async def test_wallet_returns_balance_tiers_progress_and_transactions():
 
         response = await server.get_business_wallet(brand_user)
         assert response["available_balance"] == 25000
-        assert response["minimum_chat_balance"] == 5000
+        assert response["minimum_chat_balance"] == 2500
         assert response["chat_unlocked"] is True
         assert response["plan_name"] == "Brand Pro"
         assert response["recharge_bonus"]["current_tier_percent"] == 7

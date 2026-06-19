@@ -357,10 +357,9 @@ export default function MyDealsPage() {
         ? attachmentUrls
         : [unboxingVideoUrl || selectedDeal?.receipt?.unboxing_video_url].filter(Boolean);
       if (type === 'raise_dispute') {
-        await axios.post(`${API}/deals/${selectedDeal.deal_id}/dispute`, {
-          message: label,
-          attachment_urls: attachments
-        });
+        // PRD 9.3: route to the structured dispute intake form.
+        navigate(`/disputes/new/${selectedDeal.deal_id}`);
+        return;
       } else if (type === 'escalate_to_admin') {
         await axios.post(`${API}/deals/${selectedDeal.deal_id}/escalate`, {
           message: label,

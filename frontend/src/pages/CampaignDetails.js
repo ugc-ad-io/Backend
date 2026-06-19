@@ -8,6 +8,136 @@ import { ArrowLeft, User, DollarSign, Calendar, MessageSquare, Package, Target, 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
+// Renders the structured 8-section brief. Each section only appears when it
+// has data, so older briefs (which only carried brief_text) degrade gracefully.
+function BriefSections({ campaign }) {
+  if (!campaign) return null;
+  const has = (v) => v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && v.length === 0);
+  const yn = (v) => (v ? 'Yes' : 'No');
+
+  const Field = ({ label, value }) => (
+    has(value) ? (
+      <div className="brief-field">
+        <span className="brief-field-label">{label}</span>
+        <span className="brief-field-value">{Array.isArray(value) ? value.join(', ') : String(value)}</span>
+      </div>
+    ) : null
+  );
+
+  const Section = ({ title, children }) => {
+    const kids = Array.isArray(children) ? children.filter(Boolean) : children;
+    if (!kids || (Array.isArray(kids) && kids.length === 0)) return null;
+    return (
+      <div className="campaign-section brief-structured-section">
+        <h3>{title}</h3>
+        <div className="brief-fields">{children}</div>
+      </div>
+    );
+  };
+
+  const avoidRules = [
+    campaign.no_competitors ? `No competitor brands${has(campaign.competitors_text) ? `: ${campaign.competitors_text}` : ''}` : '',
+    campaign.no_other_products ? 'No other products in frame' : '',
+    campaign.no_profanity ? 'No profanity / adult language' : '',
+    campaign.no_political ? 'No political or religious content' : '',
+    campaign.avoid_filters ? `Avoid filters/effects${has(campaign.filter_types_text) ? `: ${campaign.filter_types_text}` : ''}` : ''
+  ].filter(Boolean);
+
+  return (
+    <>
+      {/* Section 1: Campaign Basics */}
+      <Section title="Campaign Basics">
+        <Field label="Product" value={campaign.product_name} />
+        <Field label="Category" value={campaign.product_category} />
+        <Field label="Product description" value={campaign.product_description} />
+        <Field label="Hook" value={campaign.campaign_hook} />
+        <Field label="Key message" value={campaign.key_message} />
+        <Field label="Target audience" value={campaign.target_audience} />
+      </Section>
+
+      {/* Section 2: Deliverables */}
+      {has(campaign.deliverable_items) && (
+        <div className="campaign-section brief-structured-section">
+          <h3>Deliverables</h3>
+          <div className="brief-deliverables">
+            {campaign.deliverable_items.map((d, i) => (
+              <div key={i} className="brief-deliverable-row">
+                <strong>{d.quantity || 1} × {d.type || 'Deliverable'}</strong>
+                <span>
+                  {d.duration ? `${d.duration} · ` : ''}
+                  {Array.isArray(d.aspect_ratios) ? d.aspect_ratios.join(', ') : (d.aspect_ratios || '')}
+                  {d.raw_required ? ' · raw files required' : ''}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Section 3: Must-Include */}
+      <Section title="Must-Include">
+        {has(campaign.product_visible) ? <Field label="Product visible" value={campaign.product_visible ? `${campaign.product_visible_seconds || ''}s minimum` : 'No'} /> : null}
+        {has(campaign.verbal_mention) ? <Field label="Verbal mention" value={campaign.verbal_mention ? (campaign.verbal_mention_text || 'Yes') : 'No'} /> : null}
+        <Field label="Call to action" value={campaign.call_to_action} />
+        <Field label="Promo code" value={campaign.promo_code} />
+        <Field label="Hashtags" value={campaign.hashtags} />
+        {has(campaign.brand_handle_tag) ? <Field label="Tag brand handle" value={yn(campaign.brand_handle_tag)} /> : null}
+        <Field label="Required phrases" value={campaign.required_phrases} />
+        <Field label="Required shots" value={campaign.required_shots} />
+      </Section>
+
+      {/* Section 4: Must-Avoid */}
+      {(avoidRules.length > 0 || has(campaign.avoid_text)) && (
+        <Section title="Must-Avoid">
+          {avoidRules.map((r, i) => <Field key={i} label="•" value={r} />)}
+          <Field label="Other" value={campaign.avoid_text} />
+        </Section>
+      )}
+
+      {/* Section 5: Style Guidance */}
+      <Section title="Style Guidance">
+        <Field label="Tones" value={campaign.tone_tags} />
+        <Field label="Pacing" value={campaign.pacing || campaign.tone_reference} />
+        <Field label="Music" value={campaign.music_preference} />
+        <Field label="Reference videos" value={campaign.reference_videos} />
+      </Section>
+
+      {/* Section 6: Usage Rights */}
+      <Section title="Usage Rights">
+        <Field label="Platforms" value={campaign.usage_platforms} />
+        <Field label="Rights duration" value={campaign.rights_duration} />
+        <Field label="Exclusivity" value={campaign.exclusivity} />
+        <Field label="Whitelisting" value={has(campaign.whitelisting) ? yn(campaign.whitelisting) : null} />
+        <Field label="Modification rights" value={campaign.modification_rights} />
+      </Section>
+
+      {/* Section 7: Timeline & Creator */}
+      <Section title="Timeline & Creator">
+        <Field label="Ship product by" value={campaign.product_shipping_by} />
+        <Field label="Draft delivery by" value={campaign.draft_delivery_by} />
+        <Field label="Final delivery by" value={campaign.final_delivery_by || campaign.due_date} />
+        <Field label="Free revisions" value={campaign.free_revisions ?? campaign.revision_limit} />
+        <Field label="Creator level" value={campaign.creator_level} />
+        <Field label="Quality tier" value={campaign.content_quality_tier} />
+        <Field label="Gender preference" value={campaign.gender_preference} />
+        <Field label="City" value={campaign.city_filter} />
+        <Field label="Niches" value={campaign.creator_niche_tags} />
+      </Section>
+
+      <style jsx>{`
+        .brief-structured-section .brief-fields { display: flex; flex-direction: column; gap: 8px; }
+        .brief-field { display: flex; gap: 10px; font-size: 14px; line-height: 1.5; }
+        .brief-field-label { min-width: 150px; color: #6b7280; font-weight: 600; flex-shrink: 0; }
+        .brief-field-value { color: #111827; white-space: pre-wrap; }
+        .brief-deliverables { display: flex; flex-direction: column; gap: 10px; }
+        .brief-deliverable-row { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; background: #f9fafb; border: 1px solid #eef0f3; border-radius: 8px; }
+        .brief-deliverable-row strong { font-size: 14px; color: #111827; }
+        .brief-deliverable-row span { font-size: 13px; color: #6b7280; }
+      `}</style>
+    </>
+  );
+}
+
 export default function CampaignDetails() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -215,6 +345,8 @@ export default function CampaignDetails() {
               <h3>Campaign Brief</h3>
               <p className="brief-text">{campaign.brief_text}</p>
             </div>
+
+            <BriefSections campaign={campaign} />
 
             <div className="campaign-section">
               <h3>Objectives</h3>

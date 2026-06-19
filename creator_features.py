@@ -113,21 +113,121 @@ def generate_creator_code() -> str:
 DEFAULT_CREATOR_LEVEL = "new"
 
 # level -> {label, min price floor (INR) for any offer involving the creator}
+# PRD Section 5.7: 5 levels with the following Custom Offer minimums.
 CREATOR_LEVELS: Dict[str, Dict[str, Any]] = {
-    "new":         {"label": "New",         "rank": 1, "price_floor": 1500},
-    "rising":      {"label": "Rising",      "rank": 2, "price_floor": 2500},
-    "established": {"label": "Established", "rank": 3, "price_floor": 4000},
-    "elite":       {"label": "Elite",       "rank": 4, "price_floor": 7500},
+    "new":      {"label": "New",         "rank": 1, "price_floor": 1500},
+    "verified": {"label": "Verified",    "rank": 2, "price_floor": 2500},
+    "l1":       {"label": "L1 (Rising)", "rank": 3, "price_floor": 4000},
+    "l2":       {"label": "L2 (Pro)",    "rank": 4, "price_floor": 7500},
+    "elite":    {"label": "Elite",       "rank": 5, "price_floor": 15000},
+}
+
+# Accept legacy / display spellings of the levels.
+LEVEL_ALIASES: Dict[str, str] = {
+    "rising": "l1",
+    "established": "l2",
+    "pro": "l2",
+    "l1 (rising)": "l1",
+    "l2 (pro)": "l2",
+    "1": "l1",
+    "2": "l2",
+}
+
+# PRD Section 5.7: quality-tier multiplier applied on top of the level floor.
+DEFAULT_QUALITY_TIER = "a"
+QUALITY_TIER_MULTIPLIERS: Dict[str, float] = {
+    "a": 1.0,
+    "a+": 1.25,
+    "a++": 1.6,
 }
 
 
 def normalize_level(level: Optional[str]) -> str:
     level = (level or "").strip().lower()
+    level = LEVEL_ALIASES.get(level, level)
     return level if level in CREATOR_LEVELS else DEFAULT_CREATOR_LEVEL
 
 
-def price_floor_for_level(level: Optional[str]) -> int:
-    return CREATOR_LEVELS[normalize_level(level)]["price_floor"]
+def normalize_quality_tier(tier: Optional[str]) -> str:
+    tier = (tier or "").strip().lower()
+    return tier if tier in QUALITY_TIER_MULTIPLIERS else DEFAULT_QUALITY_TIER
+
+
+def quality_multiplier(tier: Optional[str]) -> float:
+    return QUALITY_TIER_MULTIPLIERS[normalize_quality_tier(tier)]
+
+
+def price_floor_for_level(level: Optional[str], quality_tier: Optional[str] = None) -> int:
+    """Minimum offer price for a creator's level. When a quality tier is given,
+    the level floor is multiplied by the tier multiplier (A=1.0, A+=1.25, A++=1.6)."""
+    base = CREATOR_LEVELS[normalize_level(level)]["price_floor"]
+    if quality_tier is None:
+        return base
+    return int(round(base * quality_multiplier(quality_tier)))
+
+
+# ---------------------------------------------------------------------------
+# Payout schedule & TDS (PRD Section 8.7)
+# ---------------------------------------------------------------------------
+
+# Days after approval before payout releases, by level. (Elite = 48 hours.)
+PAYOUT_DELAY_DAYS_BY_LEVEL: Dict[str, int] = {
+    "new": 12,
+    "verified": 7,
+    "l1": 5,
+    "l2": 3,
+    "elite": 2,
+}
+
+
+def payout_delay_days(level: Optional[str]) -> int:
+    return PAYOUT_DELAY_DAYS_BY_LEVEL.get(normalize_level(level), 12)
+
+
+# TDS (Tax Deducted at Source): 10% on professional services under Indian law.
+TDS_RATE = 0.10
+
+
+def compute_tds(gross_amount: float, exempt: bool = False) -> float:
+    """TDS owed on a gross payout. `exempt` reflects the creator's declared tax
+    status (e.g. below-threshold / exempt). Returns rounded INR."""
+    if exempt or not gross_amount or gross_amount <= 0:
+        return 0.0
+    return round(float(gross_amount) * TDS_RATE, 2)
+
+
+# ---------------------------------------------------------------------------
+# Late-delivery penalties (PRD Section 8.8) — rolling 6-month window
+# ---------------------------------------------------------------------------
+
+LATE_PENALTY_WINDOW_DAYS = 182  # ~6 months
+
+# penalty % on the deal payout, by cumulative offense number in the window
+LATE_PENALTY_PCT_BY_OFFENSE = {1: 5, 2: 10, 3: 15, 4: 25, 5: 100}
+
+# Half of any penalty is credited to the affected brand as goodwill (PRD 8.8).
+LATE_PENALTY_BRAND_SHARE = 0.5
+
+
+def classify_lateness(hours_late: float) -> str:
+    """on_time / late (1-24h) / severely_late (24-72h) / failed (72h+)."""
+    if hours_late <= 0:
+        return "on_time"
+    if hours_late <= 24:
+        return "late"
+    if hours_late <= 72:
+        return "severely_late"
+    return "failed"
+
+
+def late_penalty_pct(offense_number: int, severity: str = "late") -> int:
+    """Penalty % for the Nth offense. A 'failed' delivery (72h+) is treated as at
+    least the 5th-offense tier (100% forfeit)."""
+    if severity == "failed":
+        return 100
+    if offense_number >= 5:
+        return 100
+    return LATE_PENALTY_PCT_BY_OFFENSE.get(max(1, offense_number), 100)
 
 
 # ---------------------------------------------------------------------------

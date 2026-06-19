@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { toast } from 'sonner';
@@ -8,6 +8,7 @@ import { useAuth } from '../App';
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 const DRAFT_KEY = 'ugcad-brand-brief-draft-v2';
+const DRAFT_ID_KEY = 'ugcad-brand-brief-draft-id-v2';
 const COMMISSION_RATE = 0.25;
 const LISTING_FEE = 500;
 
@@ -112,6 +113,14 @@ const initialForm = {
   nicheTags: []
 };
 
+const extractError = (error) => {
+  const detail = error?.response?.data?.detail;
+  if (!detail) return '';
+  if (typeof detail === 'string') return detail;
+  if (typeof detail === 'object') return detail.message || JSON.stringify(detail);
+  return String(detail);
+};
+
 const ToggleChip = ({ active, children, onClick }) => (
   <button type="button" className={`brief-chip ${active ? 'active' : ''}`} onClick={onClick}>
     {children}
@@ -142,6 +151,9 @@ export default function PostABrief() {
   const [showConfirm, setShowConfirm] = useState(false);
   const [publishMode, setPublishMode] = useState('matches');
   const [draftSavedAt, setDraftSavedAt] = useState('');
+  const [campaignId, setCampaignId] = useState(() => localStorage.getItem(DRAFT_ID_KEY) || null);
+  const persistRef = useRef(null);
+  const autosaveTimer = useRef(null);
 
   useEffect(() => {
     const saved = localStorage.getItem(DRAFT_KEY);
@@ -169,7 +181,16 @@ export default function PostABrief() {
 
   useEffect(() => {
     localStorage.setItem(DRAFT_KEY, JSON.stringify(form));
-    setDraftSavedAt(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+  }, [form]);
+
+  // Debounced server-side autosave: persists the draft to the backend a few
+  // seconds after the brand stops editing.
+  useEffect(() => {
+    if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
+    autosaveTimer.current = setTimeout(() => {
+      persistRef.current?.({ silent: true });
+    }, 4000);
+    return () => clearTimeout(autosaveTimer.current);
   }, [form]);
 
   const set = (field, value) => setForm(current => ({ ...current, [field]: value }));
@@ -257,7 +278,24 @@ export default function PostABrief() {
 
   const saveDraft = () => {
     localStorage.setItem(DRAFT_KEY, JSON.stringify(form));
-    toast.success('Draft saved');
+    persistDraft();
+  };
+
+  const handleMoodUpload = async (files) => {
+    const selected = Array.from(files || []).slice(0, 5);
+    if (selected.length === 0) return;
+    try {
+      const uploaded = await Promise.all(selected.map(async (file) => {
+        const fd = new FormData();
+        fd.append('file', file);
+        const res = await axios.post(`${API}/uploads`, fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+        return res.data?.file_url;
+      }));
+      set('moodImages', uploaded.filter(Boolean).slice(0, 5));
+      toast.success('Mood board images uploaded');
+    } catch (error) {
+      toast.error(extractError(error) || 'Failed to upload mood board images');
+    }
   };
 
   const handleHashtagsChange = (value) => {
@@ -294,12 +332,9 @@ export default function PostABrief() {
     ].join('\n');
   };
 
-  const publish = async () => {
-    try {
-      setSubmitting(true);
-      const primaryDeliverable = form.deliverables[0] || {};
-      const payload = {
-        status: 'pending_approval',
+  const buildPayload = () => {
+    const primaryDeliverable = form.deliverables[0] || {};
+    return {
         title: form.campaignName,
         brief_text: briefText(),
         budget_min: form.budgetMode === 'fixed' ? budget : Number(form.budgetMin || 0),
@@ -332,20 +367,121 @@ export default function PostABrief() {
         creator_niche_tags: form.nicheTags,
         per_video_budget: budget,
         total_budget: budget,
-        currency: 'INR'
-      };
-      const response = await axios.post(`${API}/campaigns`, payload);
+        currency: 'INR',
+
+        // --- Structured brief sections (full persistence, no data loss) ---
+        // Section 1: Campaign Basics (extra)
+        target_audience: form.targetAudience,
+        budget_visible: form.budgetVisible,
+
+        // Section 2: Deliverables (full structured list)
+        deliverable_items: form.deliverables.map(item => ({
+          type: item.type,
+          quantity: item.quantity,
+          duration: item.duration,
+          aspect_ratios: item.aspectRatios,
+          raw_required: item.rawRequired
+        })),
+
+        // Section 3: Must-Include
+        product_visible: form.productVisible,
+        product_visible_seconds: form.visibilitySeconds,
+        verbal_mention: form.verbalMention,
+        verbal_mention_text: form.productNames,
+        required_phrases: form.requiredPhrases.filter(Boolean),
+        required_shots: form.requiredShots.filter(Boolean),
+        call_to_action: form.callToAction,
+        promo_code: form.promoCode,
+        hashtags: form.hashtags,
+        brand_handle_tag: form.brandHandleTag,
+
+        // Section 4: Must-Avoid
+        no_competitors: form.noCompetitors,
+        competitors_text: form.competitors,
+        no_other_products: form.noOtherProducts,
+        no_profanity: form.noProfanity,
+        no_political: form.noPolitical,
+        avoid_filters: form.avoidFilters,
+        filter_types_text: form.filterTypes,
+        avoid_text: form.avoidText,
+
+        // Section 5: Style Guidance
+        pacing: form.pacing,
+        music_preference: form.musicPreference,
+        reference_videos: form.referenceVideos.filter(Boolean),
+        mood_images: form.moodImages,
+
+        // Section 6: Usage Rights
+        usage_platforms: form.platforms,
+        rights_duration: form.rightsDuration,
+        exclusivity: form.exclusivity,
+        whitelisting: form.whitelisting,
+        modification_rights: form.modificationRights,
+
+        // Section 7: Timeline & Budget (extra)
+        product_shipping_by: form.productShippingBy,
+        draft_delivery_by: form.draftDeliveryBy,
+        final_delivery_by: form.finalDeliveryBy,
+        budget_mode: form.budgetMode
+    };
+  };
+
+  // Persist a draft to the backend so it survives device switches and appears
+  // in the brand's dashboard. First save creates the campaign; later saves PATCH it.
+  const persistDraft = async ({ silent = false } = {}) => {
+    if (submitting) return;
+    // Don't create empty server drafts on autosave
+    if (!form.campaignName.trim() && !form.productName.trim()) return;
+    try {
+      const body = { ...buildPayload(), status: 'draft' };
+      if (campaignId) {
+        await axios.patch(`${API}/campaigns/${campaignId}`, body);
+      } else {
+        const res = await axios.post(`${API}/campaigns`, body);
+        const newId = res.data?.campaign_id;
+        if (newId) {
+          setCampaignId(newId);
+          localStorage.setItem(DRAFT_ID_KEY, newId);
+        }
+      }
+      setDraftSavedAt(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+      if (!silent) toast.success('Draft saved');
+    } catch (error) {
+      if (!silent) toast.error(extractError(error) || 'Failed to save draft');
+    }
+  };
+
+  const publish = async () => {
+    try {
+      setSubmitting(true);
+      // Path B (Request Matches) flags the brief for an ops-curated shortlist;
+      // Path A (Invite Creator) is a direct private invitation, no match request.
+      const matchRequested = publishMode === 'matches';
+      const body = { ...buildPayload(), match_requested: matchRequested };
+      let response;
+      if (campaignId) {
+        // Update the existing draft, then submit it for approval
+        await axios.patch(`${API}/campaigns/${campaignId}`, body);
+        response = await axios.post(`${API}/campaigns/${campaignId}/submit`);
+      } else {
+        response = await axios.post(`${API}/campaigns`, { ...body, status: 'pending_approval' });
+      }
       localStorage.removeItem(DRAFT_KEY);
+      localStorage.removeItem(DRAFT_ID_KEY);
+      setCampaignId(null);
       const submitted = response.data?.status === 'pending_approval';
       toast.success(submitted ? 'Brief submitted for admin approval' : 'Brief saved as draft');
       navigate(publishMode === 'invite' ? '/dashboard/business/pending-bids' : '/dashboard/business');
     } catch (error) {
-      toast.error(error.response?.data?.detail || 'Failed to publish brief');
+      toast.error(extractError(error) || 'Failed to publish brief');
     } finally {
       setSubmitting(false);
       setShowConfirm(false);
     }
   };
+
+  // Keep a live reference so the debounced autosave always calls the latest closure
+  persistRef.current = persistDraft;
 
   const renderTextList = (field, max, placeholder) => (
     <div className="brief-list-inputs">
@@ -408,7 +544,7 @@ export default function PostABrief() {
                 </div>
                 <div className="form-group"><label>Product description * (20+ characters)</label><textarea className="textarea-field" value={form.productDescription} onChange={e => set('productDescription', e.target.value)} placeholder="Describe the product, who it helps, and what creators should understand before filming." rows={3} /></div>
                 <div className="form-group"><label>Key message *</label><input className="input-field" value={form.keyMessage} onChange={e => set('keyMessage', e.target.value)} placeholder="The one message every video should communicate" /></div>
-                <div className="form-group"><label>Campaign objective *</label><div className="brief-chip-grid">{OBJECTIVES.map(item => <ToggleChip key={item} active={form.objectives.includes(item)} onClick={() => set('objectives', [item])}>{item}</ToggleChip>)}</div></div>
+                <div className="form-group"><label>Campaign objective * (multi-select)</label><div className="brief-chip-grid">{OBJECTIVES.map(item => <ToggleChip key={item} active={form.objectives.includes(item)} onClick={() => toggleArray('objectives', item)}>{item}</ToggleChip>)}</div></div>
                 <div className="form-group"><label>Target audience * (50-200 characters)</label><textarea className="textarea-field" value={form.targetAudience} onChange={e => set('targetAudience', e.target.value.slice(0, 200))} placeholder="Urban women 25-35 interested in clean skincare." rows={3} /><small>{form.targetAudience.length}/200 characters</small></div>
                 <div className="brief-switch-row"><div><strong>Budget visibility</strong><p>Show or hide budget from creators. Hidden budgets are flagged to admin.</p></div><button type="button" className={form.budgetVisible ? 'is-on' : ''} onClick={() => set('budgetVisible', !form.budgetVisible)}>{form.budgetVisible ? 'Show' : 'Hide'}</button></div>
               </>
@@ -466,7 +602,7 @@ export default function PostABrief() {
                 <div className="brief-note"><Info size={18} /> This section is guidance, not grounds for dispute. Creators are expected to interpret style flexibly.</div>
                 <div className="form-group"><label>Tone *</label><div className="brief-chip-grid">{TONES.map(item => <ToggleChip key={item} active={form.tones.includes(item)} onClick={() => toggleArray('tones', item)}>{item}</ToggleChip>)}</div></div>
                 <div className="form-row"><div className="form-group"><label>Pacing preference *</label><select className="input-field" value={form.pacing} onChange={e => set('pacing', e.target.value)}>{['Fast-cut', 'Medium', 'Slow & reflective', 'No preference'].map(item => <option key={item}>{item}</option>)}</select></div><div className="form-group"><label>Music preference</label><select className="input-field" value={form.musicPreference} onChange={e => set('musicPreference', e.target.value)}>{['Original creator audio', 'Trending sound', 'Brand-provided audio file', 'No preference'].map(item => <option key={item}>{item}</option>)}</select></div></div>
-                <div className="form-group"><label>Mood board images (up to 5)</label><label className="mini-upload"><Upload size={18} /> Upload references<input type="file" multiple accept="image/*" onChange={e => set('moodImages', Array.from(e.target.files || []).slice(0, 5).map(file => file.name))} /></label>{form.moodImages.length > 0 && <small>{form.moodImages.join(', ')}</small>}</div>
+                <div className="form-group"><label>Mood board images (up to 5)</label><label className="mini-upload"><Upload size={18} /> Upload references<input type="file" multiple accept="image/*" onChange={e => handleMoodUpload(e.target.files)} /></label>{form.moodImages.length > 0 && <small>{form.moodImages.length} image(s) uploaded</small>}</div>
                 <div className="form-group"><label>Reference videos (up to 3)</label>{renderTextList('referenceVideos', 3, 'Paste reference video link')}</div>
               </>
             )}
