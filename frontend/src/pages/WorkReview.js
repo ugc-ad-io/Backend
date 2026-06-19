@@ -105,18 +105,26 @@ export default function WorkReview() {
 
         <div className="work-section">
           <h3>Submitted Files</h3>
+          {work.watermark_protected && (
+            <p className="work-description" style={{ marginBottom: '12px' }}>
+              🔒 Watermarked preview shown until you approve. Raw files unlock automatically on approval.
+            </p>
+          )}
           <div className="files-grid">
-            {work.work_files.map((file, idx) => (
+            {(work.work_files || [work.preview_url || work.video_url].filter(Boolean)).map((file, idx) => (
               <div key={idx} className="file-preview" data-testid={`file-${idx}`}>
                 <div className="file-icon">
-                  {file.includes('video') ? '🎥' : '🖼️'}
+                  {String(file).includes('video') ? '🎥' : '🖼️'}
                 </div>
-                <p className="file-name">{file.split('/').pop()}</p>
-                <a href={file.startsWith('http') ? file : `${BACKEND_URL}${file}`} target="_blank" rel="noopener noreferrer" className="view-link">
-                  View File
+                <p className="file-name">{String(file).split('/').pop()}</p>
+                <a href={String(file).startsWith('http') ? file : `${BACKEND_URL}${file}`} target="_blank" rel="noopener noreferrer" className="view-link">
+                  {work.watermark_protected ? 'View Preview' : 'View File'}
                 </a>
               </div>
             ))}
+            {!(work.work_files || []).length && !(work.preview_url || work.video_url) && (
+              <p className="work-description">No files available to preview yet.</p>
+            )}
           </div>
         </div>
 
