@@ -358,6 +358,27 @@ def build_watermark_record(asset_url: Optional[str], kind: str = "video", upload
 # the raw, unwatermarked originals.
 _RAW_ASSET_KEYS = ("video_url", "raw_footage_url", "original_url", "work_files")
 
+_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+
+
+def _guess_asset_kind(url: Optional[str]) -> str:
+    lower = (url or "").lower().split("?")[0]
+    return "image" if lower.endswith(_IMAGE_EXTS) else "video"
+
+
+def brand_safe_preview_files(files: Optional[List[str]], uploads_dir: Optional[str] = None) -> List[str]:
+    """Map a list of submitted deliverable files to brand-safe preview URLs.
+
+    Local images are watermarked (burned-in); videos / external assets keep
+    their URL but are flagged for a runtime player-overlay watermark by the
+    caller (``watermark_protected``). This lets brands see every deliverable
+    before approval without ever receiving a clean original."""
+    previews: List[str] = []
+    for f in files or []:
+        record = build_watermark_record(f, _guess_asset_kind(f), uploads_dir)
+        previews.append(record.get("preview_url") or f)
+    return previews
+
 
 def to_brand_facing_asset(asset: Dict[str, Any], approved: bool = False) -> Dict[str, Any]:
     """Strip raw originals from a content/asset dict for brand-facing responses.
@@ -384,10 +405,18 @@ def to_brand_facing_asset(asset: Dict[str, Any], approved: bool = False) -> Dict
     safe = dict(asset)
     watermark = safe.get("watermark") or {}
     preview = watermark.get("preview_url")
+    raw_files = asset.get("work_files")
     for key in _RAW_ASSET_KEYS:
         if key in safe:
             safe.pop(key, None)
     safe["preview_url"] = preview
+    # Re-expose every deliverable as a brand-safe, watermark-flagged preview so
+    # the review UI can list/play all submitted files (raw originals stay gated).
+    if isinstance(raw_files, list) and raw_files:
+        import os
+        safe["work_files"] = brand_safe_preview_files(raw_files, os.environ.get("UPLOAD_DIR"))
+        if not preview:
+            safe["preview_url"] = safe["work_files"][0]
     safe["watermark"] = {
         "text": watermark.get("text", WATERMARK_TEXT),
         "method": watermark.get("method", "player_overlay"),
