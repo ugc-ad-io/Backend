@@ -86,10 +86,9 @@ export default function MyActiveWorkPage() {
               <button
                 type="button"
                 className="pcd-primary"
-                onClick={() => navigate(`/work/submit?campaign=${campaign.id}`)}
-                disabled={campaign.status === 'work_submitted'}
+                onClick={() => navigate('/my-deals')}
               >
-                <Upload size={16} /> {campaign.status === 'work_submitted' ? 'Work Submitted' : 'Submit Work'}
+                <Upload size={16} /> Open Deal Room
               </button>
               <button type="button" onClick={() => navigate(`/chat/${campaign.business_id}`)}>
                 <MessageSquare size={16} /> Message

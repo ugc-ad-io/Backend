@@ -247,7 +247,7 @@ def revision_fee_for(existing_revision_count: int) -> int:
 # Portfolio (PRD 2.7: 3-5 samples, per-item metadata)
 # ---------------------------------------------------------------------------
 
-PORTFOLIO_MIN = 3
+PORTFOLIO_MIN = 1
 PORTFOLIO_MAX = 5
 PORTFOLIO_ITEM_REQUIRED_FIELDS = ["title"]
 

@@ -8,6 +8,17 @@ import { ArrowLeft, CheckCircle, MessageCircle, Star } from 'lucide-react';
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
+// Gated deliverable videos require the auth token in the query string.
+const assetUrl = (file) => {
+  if (!file) return '';
+  if (String(file).startsWith('http')) return file;
+  const full = `${BACKEND_URL}${file}`;
+  const token = localStorage.getItem('token');
+  return token && String(file).startsWith('/uploads/')
+    ? `${full}${String(file).includes('?') ? '&' : '?'}token=${token}`
+    : full;
+};
+
 export default function WorkReview() {
   const { id: workId } = useParams();
   const navigate = useNavigate();
@@ -117,7 +128,7 @@ export default function WorkReview() {
                   {String(file).includes('video') ? '🎥' : '🖼️'}
                 </div>
                 <p className="file-name">{String(file).split('/').pop()}</p>
-                <a href={String(file).startsWith('http') ? file : `${BACKEND_URL}${file}`} target="_blank" rel="noopener noreferrer" className="view-link">
+                <a href={assetUrl(file)} target="_blank" rel="noopener noreferrer" className="view-link">
                   {work.watermark_protected ? 'View Preview' : 'View File'}
                 </a>
               </div>

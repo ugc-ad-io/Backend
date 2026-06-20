@@ -257,6 +257,14 @@ export default function BusinessDashboard({ page = 'overview' }) {
     }
   }, [user?.id]);
 
+  // Consolidation: the legacy "Work Review" tab is superseded by the full Deal
+  // Room (shipment → review → approval → scheduled payout). Redirect there.
+  useEffect(() => {
+    if (page === 'work-review') {
+      navigate('/dashboard/business/deal-room', { replace: true });
+    }
+  }, [page, navigate]);
+
   useEffect(() => {
     if (user?.approval_status === 'approved' && page === 'browse-creator') {
       fetchCreatorDirectory();

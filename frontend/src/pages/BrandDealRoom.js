@@ -92,7 +92,15 @@ function formatDate(value) {
 }
 function getAssetUrl(url) {
   if (!url) return '';
-  return url.startsWith('http') ? url : `${BACKEND_URL}${url}`;
+  if (url.startsWith('http')) return url;
+  const full = `${BACKEND_URL}${url}`;
+  // Gated deliverable videos need the auth token in the query so <video> tags
+  // (which don't send Authorization headers) can stream them.
+  const token = localStorage.getItem('token');
+  if (token && url.startsWith('/uploads/')) {
+    return `${full}${url.includes('?') ? '&' : '?'}token=${token}`;
+  }
+  return full;
 }
 
 function getPrimaryAction(deal) {
@@ -196,7 +204,7 @@ export default function BrandDealRoom() {
     act(async () => {
       await axios.post(`${API}/deals/${selectedDeal.deal_id}/approve`);
       setConfirmApprove(false);
-      toast.success('Content approved — payment released');
+      toast.success('Content approved — payout scheduled to the creator');
     });
 
   const handleRequestRevision = () =>

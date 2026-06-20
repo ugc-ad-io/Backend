@@ -170,7 +170,15 @@ function isState(dealOrState, state) {
 
 function getAssetUrl(url) {
   if (!url) return '';
-  return url.startsWith('http') ? url : `${BACKEND_URL}${url}`;
+  if (url.startsWith('http')) return url;
+  const full = `${BACKEND_URL}${url}`;
+  // Gated deliverable videos need the auth token in the query so <video> tags
+  // (which don't send Authorization headers) can stream them.
+  const token = localStorage.getItem('token');
+  if (token && url.startsWith('/uploads/')) {
+    return `${full}${url.includes('?') ? '&' : '?'}token=${token}`;
+  }
+  return full;
 }
 
 function canSubmitUploadedAssets(deal, uploads) {

@@ -63,7 +63,8 @@ const ACTION_CARD_FORM_FIELDS = {
     ['duration', 'Duration', 'text', '30 seconds'],
     ['price', 'Price', 'number', '5000'],
     ['timeline', 'Timeline', 'text', '7 days'],
-    ['usage_rights', 'Usage rights', 'text', 'Organic social']
+    ['usage_rights', 'Usage rights', 'text', 'Organic social'],
+    ['requires_shipment', 'Product shipped to creator?', 'select', 'no', ['No', 'Yes']]
   ],
   private_invitation: [
     ['campaign_name', 'Campaign name', 'text', 'Private campaign'],
@@ -71,14 +72,16 @@ const ACTION_CARD_FORM_FIELDS = {
     ['budget', 'Budget', 'number', '5000'],
     ['timeline', 'Timeline', 'text', '7 days'],
     ['usage_rights', 'Usage rights', 'text', 'Organic social'],
-    ['full_brief_link', 'Full brief link', 'url', 'https://ugcads.io']
+    ['full_brief_link', 'Full brief link', 'url', 'https://ugcads.io'],
+    ['requires_shipment', 'Product shipped to creator?', 'select', 'no', ['No', 'Yes']]
   ],
   counter_offer: [
     ['modified_price', 'Modified price', 'number', '5000'],
     ['revisions', 'Revisions', 'text', '1'],
     ['timeline', 'Timeline', 'text', '7 days'],
     ['usage_rights', 'Usage rights', 'text', 'Organic social'],
-    ['diff_vs_original', 'Diff vs original', 'textarea', 'Updated terms']
+    ['diff_vs_original', 'Diff vs original', 'textarea', 'Updated terms'],
+    ['requires_shipment', 'Product shipped to creator?', 'select', 'no', ['No', 'Yes']]
   ],
   revision_request: [
     ['revision_text', 'Revision item', 'textarea', 'Please revise the submitted content.']
@@ -429,7 +432,14 @@ export default function MessagesPage() {
 
   const respondToActionCard = async (cardId, action, extra = {}) => {
     try {
-      await axios.post(`${API}/chat/action-cards/${cardId}/respond`, { action, ...extra });
+      const res = await axios.post(`${API}/chat/action-cards/${cardId}/respond`, { action, ...extra });
+      // On accept, a deal is created — take the user into the Deal Room where the
+      // full lifecycle (shipment → content → review → payout) lives.
+      if (action === 'accept' && res.data?.deal) {
+        toast.success('Offer accepted — opening the deal room');
+        navigate(user?.role === 'business' ? '/dashboard/business/deal-room' : '/my-deals');
+        return;
+      }
       toast.success('Action card updated');
       fetchMessages(selectedId);
     } catch (err) {
@@ -533,6 +543,9 @@ export default function MessagesPage() {
     ['quantity', 'price', 'budget', 'modified_price'].forEach((key) => {
       if (fields[key] !== undefined) fields[key] = Number(fields[key]);
     });
+    if (fields.requires_shipment !== undefined) {
+      fields.requires_shipment = fields.requires_shipment === 'yes' || fields.requires_shipment === true;
+    }
     return fields;
   };
 

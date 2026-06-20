@@ -68,6 +68,7 @@ pyotp==2.9.0
 qrcode==8.2
 Pillow==11.0.0
 cashfree-pg==4.2.0
+cloudinary==1.41.0
 razorpay==1.4.1
 setuptools
 twilio==9.8.6

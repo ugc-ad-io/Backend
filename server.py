@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Query
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Query, Request
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
@@ -49,6 +49,7 @@ from applications import applications_router
 from categories import categories_router, seed_categories
 from gigs import gigs_router
 import creator_features as cf
+from storage import persist_file, cloudinary_enabled
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -606,9 +607,15 @@ def parse_iso(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace('Z', '+00:00'))
+        dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
     except (TypeError, ValueError):
         return None
+    # Date-only / naive strings (e.g. a "2026-06-21" deadline) parse without a
+    # timezone; normalize to UTC so comparisons with tz-aware timestamps don't
+    # raise "can't compare offset-naive and offset-aware datetimes".
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 def hours_until(value: Optional[str]) -> Optional[int]:
     target = parse_iso(value)
@@ -631,9 +638,9 @@ ACTION_CARDS_ONLY_DAYS = 14
 ROLLING_STRIKE_DAYS = 30
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
 PDF_MAX_BYTES = 25 * 1024 * 1024
-VIDEO_MAX_BYTES = 50 * 1024 * 1024
+VIDEO_MAX_BYTES = 150 * 1024 * 1024
 MAX_IMAGES_PER_CHAT_MESSAGE = 5
-MAX_VIDEO_SECONDS = 30
+MAX_VIDEO_SECONDS = 120
 
 IMAGE_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/gif"}
 PDF_CONTENT_TYPES = {"application/pdf"}
@@ -684,7 +691,7 @@ def validate_upload_payload(content_type: Optional[str], filename: str, size: in
         raise HTTPException(status_code=400, detail="Images must be 10 MB or smaller.")
     if kind == "pdf":
         raise HTTPException(status_code=400, detail="PDFs must be 25 MB or smaller.")
-    raise HTTPException(status_code=400, detail="Videos must be 50 MB or smaller and 30 seconds or shorter.")
+    raise HTTPException(status_code=400, detail="Videos must be 150 MB or smaller and 2 minutes or shorter.")
 
 def get_video_duration_seconds(_content: bytes, _filename: str, _content_type: Optional[str]) -> Optional[float]:
     """Placeholder for ffprobe/moviepy integration. None means duration could not be determined."""
@@ -1747,9 +1754,8 @@ async def settle_deal_lazily(campaign: dict) -> None:
             disputed = any(c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open' for c in cards)
             if not disputed:
                 await db.work_submissions.update_one({"id": work['id']}, {"$set": {"status": WorkStatus.APPROVED, "approved_at": now_iso(), "auto_approved": True}})
-                await schedule_payout_for_deal(campaign, work, source="auto_approval")
-                await db.campaigns.update_one({"id": cid}, {"$set": {"payout_status": "scheduled", "updated_at": now_iso()}})
-                await notify_user(work['creator_id'], "Your content was auto-approved", "The brand didn't review in time, so your content was auto-approved.", link="/my-deals")
+                await release_payout_now(campaign, work, source="auto_approval")
+                await notify_user(work['creator_id'], "Your content was auto-approved", "The brand didn't review in time, so your content was auto-approved and you've been paid.", link="/my-deals")
     # Release a due scheduled payout (PRD 8.7).
     escrow = await db.escrow.find_one({"campaign_id": cid, "payout_status": "scheduled"})
     if escrow:
@@ -2036,7 +2042,14 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
 
 @api_router.get("/auth/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
-    return {k: v for k, v in current_user.items() if k != 'password'}
+    me = {k: v for k, v in current_user.items() if k != 'password'}
+    # Back-compat: older creators had their signup portfolio stored only under
+    # `profile.portfolio`; surface it at the top level the Portfolio page reads.
+    if not me.get("portfolio"):
+        nested = (me.get("profile") or {}).get("portfolio")
+        if nested:
+            me["portfolio"] = nested
+    return me
 
 def normalize_handle(value: Optional[str]) -> str:
     handle = (value or "").strip()
@@ -2108,13 +2121,31 @@ async def creator_deliverables_completed(creator: dict) -> int:
         "status": CampaignStatus.COMPLETED,
     })
 
+def _portfolio_preview_url(item: Any) -> str:
+    """Pull a usable media URL out of a portfolio entry, which may be a plain
+    URL string or a rich item ({urls:[...]}, {url}, {video_url}, ...). Dead
+    blob: refs and bare filenames are ignored so the brand card can fall back to
+    its placeholder instead of rendering a broken asset."""
+    def usable(u: Any) -> bool:
+        return isinstance(u, str) and (u.startswith("http") or u.startswith("/"))
+    if usable(item):
+        return item
+    if isinstance(item, dict):
+        urls = item.get("urls")
+        if isinstance(urls, list):
+            for u in urls:
+                if usable(u):
+                    return u
+        for key in ("thumbnail_url", "url", "video_url", "videoUrl", "link", "image", "video"):
+            if usable(item.get(key)):
+                return item.get(key)
+    return ""
+
 def creator_directory_public_view(creator: dict, deliverables_completed: int) -> dict:
     profile = creator.get("profile") or {}
     portfolio = first_non_empty(creator.get("portfolio"), profile.get("portfolio")) or []
-    portfolio_preview = portfolio[0] if isinstance(portfolio, list) and portfolio else portfolio
-    # Brands only ever see the watermark-protected preview of a sample (PRD 2.7).
-    if isinstance(portfolio_preview, dict):
-        portfolio_preview = cf.to_brand_facing_asset(portfolio_preview, approved=False)
+    preview_source = portfolio[0] if isinstance(portfolio, list) and portfolio else portfolio
+    portfolio_preview = _portfolio_preview_url(preview_source)
     primary_category = first_non_empty(
         creator.get("primary_category"),
         creator.get("category"),
@@ -2733,15 +2764,18 @@ async def upload_business_settings_logo(
         raise HTTPException(status_code=400, detail="Only image files are allowed for logos")
 
     upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))) / "business_logos"
-    upload_dir.mkdir(parents=True, exist_ok=True)
     file_ext = Path(file.filename or "").suffix or ".png"
     unique_filename = f"logo_{current_user['id']}_{uuid.uuid4().hex}{file_ext}"
-    file_path = upload_dir / unique_filename
     content = await file.read()
-    with open(file_path, "wb") as f:
-        f.write(content)
 
-    logo_url = f"/uploads/business_logos/{unique_filename}"
+    logo_url = persist_file(
+        content,
+        unique_filename,
+        kind="image",
+        local_dir=upload_dir,
+        public_path=f"/uploads/business_logos/{unique_filename}",
+        cloud_folder="ugcad/logos",
+    )
     now = datetime.now(timezone.utc).isoformat()
     existing = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
     profile_data = business_profile_defaults(current_user, (existing or {}).get("profile"))
@@ -3071,6 +3105,13 @@ async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict 
         "updated_at": datetime.now(timezone.utc).isoformat()
     }
 
+    # Mirror the portfolio to the top-level field so the Portfolio page (and the
+    # creator directory) can read it — these read `user.portfolio`, while the
+    # rest of the profile lives nested under `profile`. Keeps signup-submitted
+    # samples consistent with the PATCH /profile/portfolio editor.
+    if submitted_portfolio:
+        update_fields["portfolio"] = submitted_portfolio
+
     if username:
         current_handle = current_user.get("username")
         # Handle is permanent once set: changing it requires admin review.
@@ -3178,16 +3219,19 @@ async def upload_profile_photo(file: UploadFile = File(...), current_user: dict 
     # Generate unique filename
     file_ext = Path(file.filename).suffix
     unique_filename = f"profile_{current_user['id']}{file_ext}"
-    file_path = upload_dir / unique_filename
-    
+
     # Save file
     try:
         content = await file.read()
-        with open(file_path, 'wb') as f:
-            f.write(content)
-        
         # Update user profile with photo URL
-        photo_url = f"/uploads/profiles/{unique_filename}"
+        photo_url = persist_file(
+            content,
+            unique_filename,
+            kind="image",
+            local_dir=upload_dir,
+            public_path=f"/uploads/profiles/{unique_filename}",
+            cloud_folder="ugcad/profiles",
+        )
         await db.users.update_one(
             {"id": current_user['id']},
             {"$set": {
@@ -3529,10 +3573,15 @@ async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(g
     # Moderate the free-text "things to avoid" field for contact info
     enforce_brief_contact_policy(campaign)
 
+    # No admin approval gate: a submitted brief goes live immediately so creators
+    # see it. Stamp approval metadata so admin tooling/reporting stays consistent.
+    now_iso_str = datetime.now(timezone.utc).isoformat()
     update_fields = {
-        "status": CampaignStatus.PENDING_APPROVAL,
-        "submitted_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat()
+        "status": CampaignStatus.ACTIVE,
+        "submitted_at": now_iso_str,
+        "approved_at": now_iso_str,
+        "approval_reason": "auto-published",
+        "updated_at": now_iso_str
     }
 
     # Flag to admin if the budget is hidden from creators
@@ -3550,16 +3599,20 @@ async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(g
             link="/admin/match-queue",
         )
 
-    # Update status to pending_approval
+    # Publish the brief
     await db.campaigns.update_one(
         {"id": campaign_id},
         {"$set": update_fields}
     )
 
+    # Keep the campaign manageable downstream (chat, ops) by assigning a manager,
+    # which previously happened only on admin approval.
+    await auto_assign_campaign_manager(campaign_id)
+
     return {
         "campaign_id": campaign_id,
-        "status": "pending_approval",
-        "message": "Campaign submitted for approval"
+        "status": CampaignStatus.ACTIVE.value,
+        "message": "Campaign published"
     }
 
 @api_router.post("/campaigns/{campaign_id}/upload-image")
@@ -3598,13 +3651,17 @@ async def upload_campaign_image(
     # Save file
     upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads")))
     img_dir = upload_dir / "campaigns" / image_type
-    img_dir.mkdir(parents=True, exist_ok=True)
     file_ext = Path(file.filename).suffix or '.jpg'
     filename = f"{uuid.uuid4()}{file_ext}"
-    with open(img_dir / filename, 'wb') as f:
-        f.write(content)
 
-    file_url = f"/uploads/campaigns/{image_type}/{filename}"
+    file_url = persist_file(
+        content,
+        filename,
+        kind="image",
+        local_dir=img_dir,
+        public_path=f"/uploads/campaigns/{image_type}/{filename}",
+        cloud_folder="ugcad/campaigns",
+    )
     db_field = field_map[image_type]
 
     # Update campaign
@@ -3631,23 +3688,29 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
     
     # Determine status: explicit drafts allow partial data. Publish requests must pass
     # validation and should never be silently converted to drafts.
+    # Briefs publish instantly (no admin approval gate) -> they go live as ACTIVE so
+    # creators see them immediately. Drafts stay drafts.
     status = campaign_data.pop('status', None)
     if status == 'draft':
+        is_publish = False
         final_status = CampaignStatus.DRAFT.value
     elif status == 'pending_approval':
         validate_campaign_for_submission(campaign_data)
-        final_status = CampaignStatus.PENDING_APPROVAL.value
+        is_publish = True
+        final_status = CampaignStatus.ACTIVE.value
     else:
-        final_status = CampaignStatus.PENDING_APPROVAL.value
+        is_publish = True
+        final_status = CampaignStatus.ACTIVE.value
         try:
             validate_campaign_for_submission(campaign_data)
         except HTTPException:
             if status is not None:
                 raise
+            is_publish = False
             final_status = CampaignStatus.DRAFT.value
 
     # Moderate the free-text "things to avoid" field for contact info on publish
-    if final_status == CampaignStatus.PENDING_APPROVAL.value:
+    if is_publish:
         enforce_brief_contact_policy(campaign_data)
 
     # Prepare campaign for storage
@@ -3673,8 +3736,13 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
 
-    if final_status == CampaignStatus.PENDING_APPROVAL.value:
-        campaign_doc['submitted_at'] = datetime.now(timezone.utc).isoformat()
+    if is_publish:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        campaign_doc['submitted_at'] = now_iso
+        # No admin approval gate: brief is live immediately. Stamp approval metadata
+        # so admin tooling / reporting that reads these fields stays consistent.
+        campaign_doc['approved_at'] = now_iso
+        campaign_doc['approval_reason'] = 'auto-published'
         # Flag to admin if the budget is hidden from creators
         await flag_hidden_budget_if_needed(campaign_doc)
         # PRD 5.2 Path B: brand requested an ops-curated shortlist
@@ -3688,7 +3756,12 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
 
     await db.campaigns.insert_one(campaign_doc)
 
-    message = "Campaign submitted for approval" if final_status == CampaignStatus.PENDING_APPROVAL.value else "Draft campaign created"
+    # Keep the campaign manageable downstream (chat, ops) by assigning a manager,
+    # which previously happened only on admin approval.
+    if is_publish:
+        await auto_assign_campaign_manager(campaign_id)
+
+    message = "Campaign published" if is_publish else "Draft campaign created"
     
     return {
         "campaign_id": campaign_id,
@@ -4502,6 +4575,12 @@ async def activate_deal_from_card(card: dict) -> Optional[dict]:
         if campaign.get("business_id") != brand["id"]:
             return None  # mismatched ownership; refuse to cross-wire
     else:
+        # A private invitation is product-based (PRD 5.5 → ships, then content),
+        # so it defaults to requiring shipment. A creator-initiated custom offer
+        # is a service by default (no shipment) unless it says otherwise.
+        req_ship = fields.get("requires_shipment")
+        if req_ship is None:
+            req_ship = card.get("type") == "private_invitation"
         campaign = {
             "id": str(uuid.uuid4()),
             "business_id": brand["id"],
@@ -4511,7 +4590,7 @@ async def activate_deal_from_card(card: dict) -> Optional[dict]:
             "objectives": [],
             "budget_min": amount,
             "budget_max": amount,
-            "requires_shipment": bool(fields.get("requires_shipment")),
+            "requires_shipment": bool(req_ship),
             "content_requirements": {},
             "status": CampaignStatus.DRAFT,
             "source": "chat_offer",
@@ -4855,6 +4934,26 @@ async def get_chat_for_admin(user1_id: str, user2_id: str, current_user: dict = 
     return messages
 
 # Work Submission Routes
+async def ensure_ready_for_content(campaign: dict):
+    """PRD 8.3: content can only be submitted once the deal has reached the
+    content stage. If the brief requires shipment, the product must be received
+    first; and no submissions while a dispute is open."""
+    await ensure_not_disputed(campaign['id'])
+    if campaign.get('requires_shipment'):
+        shipment = await db.shipments.find_one({"campaign_id": campaign['id']}, {"_id": 0})
+        receipt = await db.deal_receipts.find_one({"campaign_id": campaign['id']}, {"_id": 0})
+        received = bool(
+            (shipment or {}).get('received_at')
+            or (shipment or {}).get('status') == 'received'
+            or (receipt or {}).get('received_at')
+        )
+        if not received:
+            raise HTTPException(
+                status_code=409,
+                detail="You can submit content only after receiving the product. Confirm the shipment as received first.",
+            )
+
+
 @api_router.post("/work/submit")
 async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
@@ -4863,6 +4962,9 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
     campaign = await db.campaigns.find_one({"id": data.campaign_id}, {"_id": 0})
     if not campaign or campaign.get('selected_creator') != current_user['id']:
         raise HTTPException(status_code=403, detail="Not authorized")
+
+    # PRD 8.3: gate submission on shipment receipt (and pause during disputes).
+    await ensure_ready_for_content(campaign)
 
     uploads_dir = str(Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))))
     primary_file = data.work_files[0] if data.work_files else None
@@ -4935,34 +5037,64 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
     if campaign['business_id'] != current_user['id']:
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    # PRD 8.6: approval is final and irreversible.
-    if work.get('status') == WorkStatus.APPROVED:
-        raise HTTPException(status_code=400, detail="This content is already approved. Approval is final.")
     # PRD 9.3: no approval while a dispute is open.
     await ensure_not_disputed(work['campaign_id'])
 
     now = now_iso()
-    await db.work_submissions.update_one(
-        {"id": work_id},
-        {"$set": {"status": WorkStatus.APPROVED, "approved_at": now}}
+    already_approved = work.get('status') == WorkStatus.APPROVED
+
+    # PRD 8.6/8.7: approval is final. If the payout was already scheduled/released,
+    # re-approving is a graceful no-op (not an error). But if the work was somehow
+    # marked approved without the payout ever being scheduled, finish the job now
+    # so the deal can't get stuck with escrow held and the creator unpaid.
+    escrow = await db.escrow.find_one({"campaign_id": work['campaign_id']})
+    if already_approved and escrow and escrow.get('payout_status') == 'released':
+        return {
+            "message": "Content was already approved and the creator has been paid.",
+            "payout_status": "released",
+            "net_payable": escrow.get('net_payable', 0),
+        }
+    if already_approved and escrow and escrow.get('payout_status') == 'scheduled':
+        # Approved earlier but the payout is still held — release it to the creator now.
+        await release_scheduled_payout(escrow)
+        escrow = await db.escrow.find_one({"campaign_id": work['campaign_id']})
+        return {
+            "message": "Creator funded instantly.",
+            "payout_status": "released",
+            "net_payable": (escrow or {}).get('net_payable', 0),
+        }
+
+    if not already_approved:
+        await db.work_submissions.update_one(
+            {"id": work_id},
+            {"$set": {"status": WorkStatus.APPROVED, "approved_at": now}}
+        )
+
+    # Keep the creator's deal content view in sync — mark the submitted version approved.
+    await db.deal_content_submissions.update_many(
+        {"campaign_id": work['campaign_id'], "status": "submitted"},
+        {"$set": {"status": "approved", "approved_at": now}}
     )
 
-    payout_info = await schedule_payout_for_deal(campaign, work, source="approval")
+    # Content approved — fund the creator instantly (no hold period).
+    payout_info = await release_payout_now(campaign, work, source="approval")
 
-    # PRD 8.6: content is approved; payout is queued (not released yet).
+    if payout_info.get("released"):
+        # release_scheduled_payout already marks the deal complete and notifies the creator.
+        await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "content_approved",
+                                   f"Content approved. ₹{int(payout_info.get('net_payable', 0))} released to the creator.")
+        await insert_deal_system_message(campaign, "Content approved. The creator has been paid.")
+        return {"message": "Content approved. Creator funded instantly.", "payout_status": "released", **payout_info}
+
+    # Fallback: nothing to release (e.g. a legacy deal with no escrow). Still mark
+    # the campaign completed so it stops showing as "work submitted" / pending review.
     await db.campaigns.update_one(
         {"id": work['campaign_id']},
-        {"$set": {"payout_status": "scheduled", "approved_at": now, "updated_at": now}}
+        {"$set": {"status": CampaignStatus.COMPLETED, "payout_status": "approved", "approved_at": now, "updated_at": now}}
     )
-
-    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "content_approved",
-                               f"Content approved. Payment scheduled for {payout_info.get('payout_scheduled_at', 'the payout date')[:10]}.")
-    await insert_deal_system_message(campaign, "Content approved. The creator's payout has been scheduled.")
-    await notify_user(work['creator_id'], "Your content was approved",
-                      f"Payment of ₹{int(payout_info.get('net_payable', 0))} is scheduled for {payout_info.get('payout_scheduled_at', '')[:10]}.",
-                      link="/my-deals")
-
-    return {"message": "Content approved. Payout scheduled.", **payout_info}
+    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "content_approved", "Content approved.")
+    await notify_user(work['creator_id'], "Your content was approved", "Your content was approved.", link="/my-deals")
+    return {"message": "Content approved.", **payout_info}
 
 
 async def schedule_payout_for_deal(campaign: dict, work: dict, source: str = "approval") -> dict:
@@ -5011,6 +5143,20 @@ async def schedule_payout_for_deal(campaign: dict, work: dict, source: str = "ap
         "source": source,
     })
     return {"payout_scheduled_at": scheduled_at, "net_payable": net, "tds_amount": tds, "penalty_amount": penalty, "late": late}
+
+
+async def release_payout_now(campaign: dict, work: dict, source: str = "approval") -> dict:
+    """Instant funding: compute the payout (TDS/penalty/net + invoice) and release it
+    to the creator's wallet immediately — no hold period. Guards against paying twice."""
+    escrow = await db.escrow.find_one({"campaign_id": campaign['id']})
+    if escrow and escrow.get('payout_status') == 'released':
+        # Already paid — never re-schedule/re-release (would double-pay).
+        return {"released": False, "net_payable": escrow.get('net_payable', 0),
+                "payout_scheduled_at": escrow.get('payout_scheduled_at')}
+    payout_info = await schedule_payout_for_deal(campaign, work, source=source)
+    escrow = await db.escrow.find_one({"campaign_id": campaign['id']})
+    payout_info["released"] = bool(escrow and await release_scheduled_payout(escrow))
+    return payout_info
 
 
 async def release_scheduled_payout(escrow: dict) -> bool:
@@ -5084,10 +5230,9 @@ async def auto_approve_stale_submissions() -> int:
         if any(c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open' for c in cards):
             continue
         await db.work_submissions.update_one({"id": work['id']}, {"$set": {"status": WorkStatus.APPROVED, "approved_at": now_iso(), "auto_approved": True}})
-        await schedule_payout_for_deal(campaign, work, source="auto_approval")
-        await db.campaigns.update_one({"id": campaign['id']}, {"$set": {"payout_status": "scheduled", "updated_at": now_iso()}})
-        await insert_deal_system_message(campaign, f"Content auto-approved after {AUTO_APPROVE_DAYS} days with no brand review (PRD 8.4). Payout scheduled.")
-        await notify_user(work['creator_id'], "Your content was auto-approved", "The brand didn't review in time, so your content was auto-approved and payout scheduled.", link="/my-deals")
+        await release_payout_now(campaign, work, source="auto_approval")
+        await insert_deal_system_message(campaign, f"Content auto-approved after {AUTO_APPROVE_DAYS} days with no brand review (PRD 8.4). The creator has been paid.")
+        await notify_user(work['creator_id'], "Your content was auto-approved", "The brand didn't review in time, so your content was auto-approved and you've been paid.", link="/my-deals")
         approved += 1
     return approved
 
@@ -5350,6 +5495,18 @@ async def submit_deal_receipt(deal_id: str, data: DealReceiptSubmit, current_use
     if campaign.get('selected_creator') != current_user['id']:
         raise HTTPException(status_code=403, detail="Not authorized")
 
+    # A receipt can only be confirmed once the brand has actually shipped the
+    # product. Without this guard the creator could "Mark Received" before any
+    # shipment exists (PRD shipping flow).
+    if campaign.get('requires_shipment'):
+        shipment = context.get('shipment') or {}
+        ship_status = shipment.get('courier_status') or shipment.get('status')
+        if ship_status not in ('shipped', 'in_transit', 'delivered', 'received'):
+            raise HTTPException(
+                status_code=400,
+                detail="The brand hasn't shipped the product yet. You can mark it received once it's on the way.",
+            )
+
     received_at = data.received_at or now_iso()
     receipt_doc = {
         "id": str(uuid.uuid4()),
@@ -5411,8 +5568,8 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
     campaign = context['campaign']
     if campaign.get('selected_creator') != current_user['id']:
         raise HTTPException(status_code=403, detail="Not authorized")
-    # PRD 9.3: no content uploads while a dispute is open.
-    await ensure_not_disputed(campaign['id'])
+    # PRD 8.3/9.3: must have received the product (if required) and no open dispute.
+    await ensure_ready_for_content(campaign)
 
     required = get_required_assets(campaign)
     missing = []
@@ -6674,10 +6831,14 @@ async def upload_file(file: UploadFile = File(...), current_user: dict = Depends
             if not scan.get("safe", True):
                 await log_chat_violation(current_user, None, file.filename or "image_upload", scan.get("violations", []), "image_ocr")
                 raise HTTPException(status_code=400, detail=CONTACT_INFO_BLOCK_DETAIL)
-        with open(file_path, 'wb') as f:
-            f.write(content)
-        
-        file_url = f"/uploads/{unique_filename}"
+        file_url = persist_file(
+            content,
+            unique_filename,
+            kind=kind,
+            local_dir=upload_dir,
+            public_path=f"/uploads/{unique_filename}",
+            cloud_folder="ugcad/uploads",
+        )
         metadata = {
             "id": str(uuid.uuid4()),
             "file_url": file_url,
@@ -6778,23 +6939,27 @@ async def upload_campaign_file(file: UploadFile = File(...), current_user: dict 
 
     upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads")))
     campaigns_upload_dir = upload_dir / "campaigns"
-    campaigns_upload_dir.mkdir(parents=True, exist_ok=True)
 
     file_ext = Path(file.filename).suffix
     unique_filename = f"{uuid.uuid4()}{file_ext}"
-    file_path = campaigns_upload_dir / unique_filename
+    file_kind = "image" if file.content_type.startswith("image/") else "video" if file.content_type.startswith("video/") else "pdf"
 
     try:
-        with open(file_path, 'wb') as f:
-            f.write(content)
-        file_url = f"/uploads/campaigns/{unique_filename}"
+        file_url = persist_file(
+            content,
+            unique_filename,
+            kind=file_kind,
+            local_dir=campaigns_upload_dir,
+            public_path=f"/uploads/campaigns/{unique_filename}",
+            cloud_folder="ugcad/campaigns",
+        )
         file_doc = {
             "id": str(uuid.uuid4()),
             "file_url": file_url,
             "filename": file.filename,
             "content_type": file.content_type,
             "size": len(content),
-            "kind": "image" if file.content_type.startswith("image/") else "video" if file.content_type.startswith("video/") else "pdf",
+            "kind": file_kind,
             "uploaded_by": current_user['id'],
             "created_at": now_iso()
         }
@@ -7856,10 +8021,81 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files for uploads
+# Uploads serving. Public assets (logos, profile photos, campaign images, burned-in
+# watermarked previews) and images stay open. Flat video files that are protected
+# content deliverables are access-gated: only the creator (owner), the brand on the
+# deal, or an admin may fetch them — closing the "open the raw /uploads URL and get the
+# clean video" hole (PRD 6.9 / 8). Auth is via ?token=<jwt> (so <video> tags work) or a
+# bearer header. Non-deliverable videos (e.g. portfolio) remain open.
 upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads")))
 upload_dir.mkdir(exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=str(upload_dir)), name="uploads")
+
+_GATED_VIDEO_EXTS = (".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv")
+_PUBLIC_UPLOAD_PREFIXES = ("profiles/", "business_logos/", "campaigns/", "watermarked/")
+
+
+def _uploads_viewer(request: Request) -> Optional[dict]:
+    token = request.query_params.get("token")
+    if not token:
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            token = auth[7:]
+    if not token:
+        return None
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except Exception:
+        return None
+
+
+async def _protected_deliverable(rel_url: str) -> Optional[dict]:
+    """If rel_url (/uploads/<name>) is a content deliverable, return the participants;
+    else None (meaning: not gated)."""
+    rec = await db.deal_content_submissions.find_one(
+        {"$or": [{"video_url": rel_url}, {"raw_footage_url": rel_url}, {"original_url": rel_url}]},
+        {"_id": 0, "campaign_id": 1, "creator_id": 1},
+    )
+    if not rec:
+        rec = await db.work_submissions.find_one(
+            {"work_files": rel_url}, {"_id": 0, "campaign_id": 1, "creator_id": 1}
+        )
+    if not rec:
+        return None
+    campaign = await db.campaigns.find_one({"id": rec.get("campaign_id")}, {"_id": 0, "business_id": 1})
+    return {"creator_id": rec.get("creator_id"), "business_id": (campaign or {}).get("business_id")}
+
+
+@app.get("/uploads/{filepath:path}")
+async def serve_upload(filepath: str, request: Request):
+    rel = os.path.normpath(filepath).replace("\\", "/").lstrip("/")
+    if rel.startswith("../") or "/../" in rel or rel == "..":
+        raise HTTPException(status_code=404, detail="Not found")
+    file_path = upload_dir / rel
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    ext = os.path.splitext(rel)[1].lower()
+    # Public folders + any non-video file: serve openly (unchanged behavior).
+    if rel.startswith(_PUBLIC_UPLOAD_PREFIXES) or ext not in _GATED_VIDEO_EXTS:
+        return FileResponse(str(file_path))
+
+    # Flat video: only gate it if it is a protected content deliverable.
+    deliverable = await _protected_deliverable(f"/uploads/{rel}")
+    if not deliverable:
+        return FileResponse(str(file_path))
+
+    viewer = _uploads_viewer(request)
+    if not viewer:
+        raise HTTPException(status_code=403, detail="Sign in to view this deliverable.")
+    vid = viewer.get("user_id")
+    allowed = (
+        viewer.get("role") == "admin"
+        or vid == deliverable.get("creator_id")
+        or vid == deliverable.get("business_id")
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail="You are not a participant in this deal.")
+    return FileResponse(str(file_path))
 
 logging.basicConfig(
     level=logging.INFO,
