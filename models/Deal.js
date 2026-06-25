@@ -13,13 +13,25 @@ const briefSectionSchema = new mongoose.Schema(
 
 const shipmentSchema = new mongoose.Schema(
   {
+    required: { type: Boolean, default: false }, // does this deal involve a physical product to ship?
     tracking_id: { type: String, default: null },
     courier: { type: String, default: null },
     courier_status: { type: String, default: null },
     courier_tracking_url: { type: String, default: null },
     expected_delivery_at: { type: Date, default: null },
     shipped_at: { type: Date, default: null },
-    delivered_at: { type: Date, default: null }
+    delivered_at: { type: Date, default: null },
+
+    // Manual shipping-label queue (PRD 11.9). Populated by the brand at request
+    // time and by admin during manual Shiprocket label generation (V0.5).
+    requested_at: { type: Date, default: null },
+    product_summary: { type: String, default: null },
+    weight: { type: String, default: null },       // e.g. "0.8 kg"
+    dimensions: { type: String, default: null },    // e.g. "20×15×10"
+    pickup_address: { type: String, default: null }, // brand pickup (internal only)
+    ship_address: { type: String, default: null },   // creator shipping (internal only)
+    ship_city: { type: String, default: null },
+    label_url: { type: String, default: null }       // uploaded PDF in Deal Room
   },
   { _id: false }
 );

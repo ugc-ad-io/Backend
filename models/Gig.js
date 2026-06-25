@@ -84,7 +84,8 @@ const gigSchema = new mongoose.Schema(
     rejectionReason: {
       type: String,
       maxlength: [1000, 'Rejection reason cannot exceed 1000 characters']
-    }
+    },
+    wishlist: { type: [String], default: [] } // user ids who wishlisted this gig
   },
   {
     timestamps: true

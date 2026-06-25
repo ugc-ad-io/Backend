@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 
 const notificationSchema = new mongoose.Schema(
   {
-    user_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    user_id: { type: String, required: true, index: true }, // user ids may be UUID or ObjectId
     type: { type: String, required: true },
     channel: { type: String, default: 'in_app' }, // in_app | email | sms | whatsapp
     title: { type: String, default: '' },

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Query, Request
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Query, Request, Body
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
@@ -4160,12 +4160,25 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
         raise HTTPException(status_code=404, detail="Bid not found")
     
     escrow_id = str(uuid.uuid4())
+    deal_amount = float(selected_bid['amount'])
+    brand_fee = brand_commission(deal_amount)
+    brand_total = round(deal_amount + brand_fee, 2)
+    # Charge the brand the deal amount + brand-side commission. Best-effort debit:
+    # only deduct if the wallet can cover it (mirrors the chat-offer funding path).
+    debit = await db.users.update_one(
+        {"id": current_user['id'], "balance": {"$gte": brand_total}},
+        {"$inc": {"balance": -brand_total}},
+    )
     escrow_doc = {
         "id": escrow_id,
         "campaign_id": campaign_id,
         "business_id": current_user['id'],
         "creator_id": creator_id,
-        "amount": selected_bid['amount'],
+        "amount": deal_amount,
+        "brand_commission_amount": brand_fee,
+        "brand_commission_percent": BRAND_COMMISSION_PERCENT,
+        "brand_charged": brand_total,
+        "funded": debit.modified_count == 1,
         "status": "held",
         "created_at": datetime.now(timezone.utc).isoformat()
     }
@@ -4517,9 +4530,11 @@ async def enforce_brand_wallet_for_acceptance(card: dict) -> None:
     amount = _accepted_offer_amount(card)
     if amount <= 0:
         return
+    # The brand must cover the deal value PLUS the brand-side platform commission.
+    required = round(amount + brand_commission(amount), 2)
     balance = to_float(brand.get("balance"))
-    if balance < amount:
-        shortfall = round(amount - balance, 2)
+    if balance < required:
+        shortfall = round(required - balance, 2)
         deadline = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
         await db.chat_action_cards.update_one(
             {"id": card["id"]},
@@ -4528,7 +4543,7 @@ async def enforce_brand_wallet_for_acceptance(card: dict) -> None:
         await notify_user(
             brand["id"],
             "Top up to confirm this deal",
-            f"A creator accepted your offer for ₹{int(amount)} but your wallet holds ₹{int(balance)}. Add ₹{int(shortfall)} within 24 hours to confirm the deal.",
+            f"A creator accepted your offer for ₹{int(amount)} (+₹{int(brand_commission(amount))} platform fee) but your wallet holds ₹{int(balance)}. Add ₹{int(shortfall)} within 24 hours to confirm the deal.",
             link="/dashboard/business/wallet",
         )
         raise HTTPException(
@@ -4605,9 +4620,11 @@ async def activate_deal_from_card(card: dict) -> Optional[dict]:
     escrow = await db.escrow.find_one({"campaign_id": campaign["id"]}, {"_id": 0})
     if not escrow:
         escrow_id = str(uuid.uuid4())
+        brand_fee = brand_commission(amount)
+        brand_total = round(float(amount) + brand_fee, 2)
         debit = await db.users.update_one(
-            {"id": brand["id"], "balance": {"$gte": amount}},
-            {"$inc": {"balance": -amount}},
+            {"id": brand["id"], "balance": {"$gte": brand_total}},
+            {"$inc": {"balance": -brand_total}},
         )
         funded = debit.modified_count == 1
         await db.escrow.insert_one({
@@ -4616,6 +4633,9 @@ async def activate_deal_from_card(card: dict) -> Optional[dict]:
             "business_id": brand["id"],
             "creator_id": creator["id"],
             "amount": amount,
+            "brand_commission_amount": brand_fee,
+            "brand_commission_percent": BRAND_COMMISSION_PERCENT,
+            "brand_charged": brand_total,
             "status": "held",
             "wallet_funded": funded,
             "source": "chat_offer",
@@ -4868,13 +4888,24 @@ async def get_all_chats(current_user: dict = Depends(get_current_user)):
     # Enrich with user details
     conversations = []
     for user_pair, conv_data in conversations_dict.items():
-        user1 = await db.users.find_one({"id": conv_data['user1_id']}, {"_id": 0, "nickname": 1, "username": 1, "role": 1})
-        user2 = await db.users.find_one({"id": conv_data['user2_id']}, {"_id": 0, "nickname": 1, "username": 1, "role": 1})
+        user1 = await db.users.find_one({"id": conv_data['user1_id']}, {"_id": 0, "nickname": 1, "username": 1, "role": 1, "warning_count": 1})
+        user2 = await db.users.find_one({"id": conv_data['user2_id']}, {"_id": 0, "nickname": 1, "username": 1, "role": 1, "warning_count": 1})
+        pair_ids = [conv_data['user1_id'], conv_data['user2_id']]
 
         # Count violations for this conversation
         violation_count = await db.violations.count_documents({
-            "user_id": {"$in": [conv_data['user1_id'], conv_data['user2_id']]}
+            "user_id": {"$in": pair_ids}
         })
+
+        # Open user-reports against either participant (harassment / spam queue).
+        report_count = await db.user_reports.count_documents({
+            "reported_user_id": {"$in": pair_ids},
+            "status": "open"
+        })
+
+        # A user is "on strike watch" while they carry one or more active strikes.
+        u1_watch = bool((user1 or {}).get('warning_count', 0))
+        u2_watch = bool((user2 or {}).get('warning_count', 0))
 
         conversations.append({
             "conversation_id": f"{conv_data['user1_id']}_{conv_data['user2_id']}",
@@ -4882,18 +4913,24 @@ async def get_all_chats(current_user: dict = Depends(get_current_user)):
                 "id": conv_data['user1_id'],
                 "nickname": user1.get('nickname', 'Unknown') if user1 else 'Unknown',
                 "username": user1.get('username') if user1 else None,
-                "role": user1.get('role', '') if user1 else ''
+                "role": user1.get('role', '') if user1 else '',
+                "on_strike_watch": u1_watch
             },
             "user2": {
                 "id": conv_data['user2_id'],
                 "nickname": user2.get('nickname', 'Unknown') if user2 else 'Unknown',
                 "username": user2.get('username') if user2 else None,
-                "role": user2.get('role', '') if user2 else ''
+                "role": user2.get('role', '') if user2 else '',
+                "on_strike_watch": u2_watch
             },
             "last_message": conv_data['last_message'],
             "last_message_at": conv_data['last_message_at'],
             "has_violations": conv_data['has_filtered'],
-            "violation_count": violation_count
+            "violation_count": violation_count,
+            # New signals for the Chat Oversight queues:
+            "report_count": report_count,
+            "reported": report_count > 0,
+            "on_strike_watch": u1_watch or u2_watch
         })
     
     # Sort by last message time (most recent first)
@@ -4915,10 +4952,19 @@ async def get_chat_for_admin(user1_id: str, user2_id: str, current_user: dict = 
         ]
     }, {"_id": 0}).sort("timestamp", 1).to_list(1000)
 
+    # Senders with an open user-report (so admins can spot reported authors).
+    reported_user_ids = set(await db.user_reports.distinct("reported_user_id", {
+        "reported_user_id": {"$in": [user1_id, user2_id]},
+        "status": "open"
+    }))
+
     # Enrich each message with the sender's current nickname/username for admin display
     sender_cache: Dict[str, dict] = {}
     for msg in messages:
         sender_id = msg.get("sender_id")
+        # Flag messages from reported users so the "User reports" queue can surface them.
+        if sender_id in reported_user_ids and not msg.get("reported"):
+            msg["reported"] = True
         if not sender_id or sender_id == "system":
             msg["sender_username"] = None
             continue
@@ -4932,6 +4978,202 @@ async def get_chat_for_admin(user1_id: str, user2_id: str, current_user: dict = 
         msg["sender_username"] = sender.get("username")
 
     return messages
+
+
+# ---------------------------------------------------------------------------
+# Chat Oversight (PRD 11.12): per-message moderation + filter-rule management
+# ---------------------------------------------------------------------------
+
+class MessageModerationAction(BaseModel):
+    user1Id: str
+    user2Id: str
+    timestamp: str
+    sender: Optional[str] = None
+    action: str  # "approve" | "confirm" | "escalate"
+    escalation: Optional[str] = None  # for action == "escalate": "warn" | "suspend"
+
+
+class FilterRulePropose(BaseModel):
+    type: str  # "regex" | "keyword"
+    label: str
+    pattern: str
+
+
+async def _restore_strike_for_violation(violation: dict, reviewed_by: str) -> None:
+    """Approve a false positive: invalidate its strike and recompute the user's
+    active warning count (mirrors the false-positive-review endpoint)."""
+    reviewed_at = now_iso()
+    await db.violations.update_one(
+        {"id": violation["id"]},
+        {"$set": {"false_positive_status": "approved", "false_positive_reviewed_at": reviewed_at, "false_positive_reviewed_by": reviewed_by}}
+    )
+    await db.chat_strikes.update_many(
+        {"violation_id": violation["id"]},
+        {"$set": {"invalidated": True, "invalidated_at": reviewed_at, "invalidated_by": reviewed_by}}
+    )
+    active_strikes = await db.chat_strikes.count_documents({"user_id": violation["user_id"], "invalidated": {"$ne": True}})
+    await db.users.update_one(
+        {"id": violation["user_id"]},
+        {"$set": {"warning_count": active_strikes}, "$unset": {"action_cards_only_until": ""}}
+    )
+    await db.chat_pauses.update_many({"user_id": violation["user_id"]}, {"$set": {"invalidated": True, "paused_until": reviewed_at}})
+
+
+@api_router.post("/admin/message/moderate")
+async def moderate_chat_message(data: MessageModerationAction, current_user: dict = Depends(get_current_user)):
+    """Per-message oversight action: approve (false positive), confirm violation
+    (apply strike + notify), or escalate (warn / suspend the sender)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if data.action not in ["approve", "confirm", "escalate"]:
+        raise HTTPException(status_code=400, detail="action must be approve, confirm, or escalate")
+
+    # Locate the message between the two participants at the given timestamp.
+    message = await db.messages.find_one({
+        "timestamp": data.timestamp,
+        "$or": [
+            {"sender_id": data.user1Id, "recipient_id": data.user2Id},
+            {"sender_id": data.user2Id, "recipient_id": data.user1Id},
+        ],
+    }, {"_id": 0})
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    sender_id = message.get("sender_id")
+    recipient_id = message.get("recipient_id")
+    reviewed_at = now_iso()
+    result_message = ""
+
+    # Find the violation tied to this message (filtered messages create one).
+    violation = await db.violations.find_one({
+        "user_id": sender_id,
+        "$or": [{"original_message": message.get("message")}, {"timestamp": data.timestamp}],
+    }, {"_id": 0}, sort=[("timestamp", -1)])
+
+    if data.action == "approve":
+        # False positive: deliver the message and restore the strike if any.
+        await db.messages.update_one(
+            {"timestamp": data.timestamp, "sender_id": sender_id, "recipient_id": recipient_id},
+            {"$set": {"filtered": False, "moderation_status": "approved", "reported": False}}
+        )
+        if violation:
+            await _restore_strike_for_violation(violation, current_user["id"])
+        if sender_id:
+            await notify_user(sender_id, "Message cleared", "An admin reviewed a flagged message and cleared it. Any related strike has been removed.", ntype="info")
+        result_message = "Message approved as a false positive."
+
+    elif data.action == "confirm":
+        # Confirm the violation: ensure a strike exists and notify the sender.
+        if not violation:
+            logged = await log_chat_violation(
+                {"id": sender_id, "nickname": message.get("sender_nickname")},
+                recipient_id,
+                message.get("message", ""),
+                [{"type": "manual_review", "severity": "warning", "detail": "Confirmed by admin from chat oversight"}],
+                source="admin_confirm",
+            )
+            violation = logged["violation"]
+        else:
+            await db.violations.update_one({"id": violation["id"]}, {"$set": {"status": "confirmed", "confirmed_by": current_user["id"], "confirmed_at": reviewed_at}})
+        await db.messages.update_one(
+            {"timestamp": data.timestamp, "sender_id": sender_id, "recipient_id": recipient_id},
+            {"$set": {"moderation_status": "confirmed"}}
+        )
+        if sender_id:
+            await notify_user(sender_id, "Policy strike applied", "An admin confirmed that one of your messages violated platform policy. A strike has been applied to your account.", ntype="warning")
+        result_message = "Violation confirmed and strike applied."
+
+    else:  # escalate
+        escalation = data.escalation if data.escalation in ["warn", "suspend"] else "warn"
+        if escalation == "suspend":
+            await db.users.update_one(
+                {"id": sender_id},
+                {"$set": {"banned": True, "banned_reason": "Suspended by admin from chat oversight", "banned_at": reviewed_at}}
+            )
+            if sender_id:
+                await notify_user(sender_id, "Account suspended", "Your account has been suspended following a chat policy review. Contact support if you believe this is a mistake.", ntype="error")
+            result_message = "User suspended."
+        else:
+            if sender_id:
+                await notify_user(sender_id, "Warning issued", "An admin issued a warning regarding your recent chat activity. Continued violations may lead to suspension.", ntype="warning")
+            result_message = "Warning issued to user."
+        await db.messages.update_one(
+            {"timestamp": data.timestamp, "sender_id": sender_id, "recipient_id": recipient_id},
+            {"$set": {"moderation_status": f"escalated_{escalation}"}}
+        )
+
+    # Audit trail for the weekly edge-case review.
+    await db.chat_moderation_actions.insert_one({
+        "id": str(uuid.uuid4()),
+        "message_timestamp": data.timestamp,
+        "sender_id": sender_id,
+        "recipient_id": recipient_id,
+        "action": data.action,
+        "escalation": data.escalation,
+        "violation_id": (violation or {}).get("id"),
+        "moderated_by": current_user["id"],
+        "created_at": reviewed_at,
+    })
+
+    return {"message": result_message, "action": data.action}
+
+
+# Default filter rules seeded when the collection is empty, so admins always
+# see what the contact-info filter is enforcing.
+DEFAULT_FILTER_RULES = [
+    {"id": "r-phone", "type": "regex", "pattern": r"\b(?:\+?\d[ -]?){7,}\b", "label": "Phone numbers", "enabled": True, "status": "active"},
+    {"id": "r-email", "type": "regex", "pattern": r"[\w.+-]+@[\w-]+\.[\w.-]+", "label": "Email addresses", "enabled": True, "status": "active"},
+    {"id": "r-apps", "type": "keyword", "pattern": "whatsapp, telegram, signal, snapchat", "label": "Off-platform apps", "enabled": True, "status": "active"},
+    {"id": "r-callme", "type": "keyword", "pattern": "call me, text me, dm me, reach me at", "label": "Contact solicitations", "enabled": True, "status": "active"},
+]
+
+
+@api_router.get("/admin/filter-rules")
+async def list_filter_rules(current_user: dict = Depends(get_current_user)):
+    """List the contact-info filter rules (regex patterns and keyword lists)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    rules = await db.filter_rules.find({}, {"_id": 0}).sort("created_at", 1).to_list(500)
+    # Always include the built-in defaults so the panel is never empty.
+    existing_ids = {r.get("id") for r in rules}
+    seeded = [r for r in DEFAULT_FILTER_RULES if r["id"] not in existing_ids]
+    return seeded + rules
+
+
+@api_router.post("/admin/filter-rules/propose")
+async def propose_filter_rule(data: FilterRulePropose, current_user: dict = Depends(get_current_user)):
+    """Propose a new filter rule. Proposals stay disabled pending senior-admin
+    (ADMIN role) review before they go live."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if data.type not in ["regex", "keyword"]:
+        raise HTTPException(status_code=400, detail="type must be regex or keyword")
+    if not data.label.strip() or not data.pattern.strip():
+        raise HTTPException(status_code=400, detail="label and pattern are required")
+    # Validate regex patterns up front so we never seed an un-compilable rule.
+    if data.type == "regex":
+        try:
+            re.compile(data.pattern)
+        except re.error as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid regex: {exc}")
+    rule = {
+        "id": str(uuid.uuid4()),
+        "type": data.type,
+        "label": data.label.strip(),
+        "pattern": data.pattern.strip(),
+        "enabled": False,
+        "status": "pending_review",
+        "proposed_by": current_user["id"],
+        "proposed_by_nickname": current_user.get("nickname"),
+        "created_at": now_iso(),
+    }
+    await db.filter_rules.insert_one(rule)
+    await notify_admins(
+        "New filter rule proposed",
+        f"{current_user.get('nickname', current_user['id'])} proposed a {data.type} rule \"{data.label}\" — senior admin review required.",
+        link="/dashboard/admin/flagged-messages",
+    )
+    return {"message": "Rule proposed — sent for senior admin review.", "rule": {k: v for k, v in rule.items() if k != "_id"}}
 
 # Work Submission Routes
 async def ensure_ready_for_content(campaign: dict):
@@ -5110,7 +5352,9 @@ async def schedule_payout_for_deal(campaign: dict, work: dict, source: str = "ap
     tds = cf.compute_tds(gross, exempt=bool(creator.get('tds_exempt')))
     late = await assess_late_delivery(work['creator_id'], campaign, work)
     penalty = round(gross * late['penalty_pct'] / 100, 2) if late['is_late'] else 0.0
-    net = round(gross - tds - penalty, 2)
+    # Creator-side platform commission (deducted from the payout).
+    commission = creator_commission(gross)
+    net = round(gross - commission - tds - penalty, 2)
     await db.escrow.update_one(
         {"id": escrow['id']},
         {"$set": {
@@ -5122,11 +5366,17 @@ async def schedule_payout_for_deal(campaign: dict, work: dict, source: str = "ap
             "gross_amount": gross,
             "tds_amount": tds,
             "penalty_amount": penalty,
+            "commission_amount": commission,
+            "commission_percent": CREATOR_COMMISSION_PERCENT,
             "penalty_pct": late['penalty_pct'],
             "penalty_brand_credit": round(penalty * cf.LATE_PENALTY_BRAND_SHARE, 2),
             "late_severity": late['severity'],
             "net_payable": net,
-            "deductions": [{"label": "TDS", "amount": tds}, {"label": "Penalty", "amount": penalty}],
+            "deductions": [
+                {"label": "Commission", "amount": commission},
+                {"label": "TDS", "amount": tds},
+                {"label": "Penalty", "amount": penalty},
+            ],
             "creator_level": creator.get('level') or cf.DEFAULT_CREATOR_LEVEL,
         }}
     )
@@ -5138,6 +5388,7 @@ async def schedule_payout_for_deal(campaign: dict, work: dict, source: str = "ap
         "creator_id": work['creator_id'],
         "gross_amount": gross,
         "tds_amount": tds,
+        "commission_amount": commission,
         "net_to_creator": net,
         "created_at": now_iso(),
         "source": source,
@@ -5171,7 +5422,8 @@ async def release_scheduled_payout(escrow: dict) -> bool:
     gross = float(escrow.get('gross_amount') or escrow.get('amount') or 0)
     tds = float(escrow.get('tds_amount') or 0)
     penalty = float(escrow.get('penalty_amount') or 0)
-    net = float(escrow.get('net_payable') if escrow.get('net_payable') is not None else gross - tds - penalty)
+    commission = float(escrow.get('commission_amount') if escrow.get('commission_amount') is not None else creator_commission(gross))
+    net = float(escrow.get('net_payable') if escrow.get('net_payable') is not None else gross - commission - tds - penalty)
     now = now_iso()
 
     await db.escrow.update_one({"id": escrow['id']}, {"$set": {"status": "released", "payout_status": "released", "released_at": now}})
@@ -5187,6 +5439,14 @@ async def release_scheduled_payout(escrow: dict) -> bool:
         creator_id=creator_id, receipt_type="earning", gross_amount=gross,
         campaign_id=campaign['id'], reference_id=escrow.get('id'),
         note="Scheduled payout released", tds_amount=tds, penalty_amount=penalty,
+        commission_amount=commission,
+    )
+    # Record the platform's two-sided commission for this deal (brand fee + creator fee).
+    await record_platform_revenue(
+        campaign['id'], escrow.get('id'),
+        deal_amount=gross,
+        brand_fee=float(escrow.get('brand_commission_amount') or brand_commission(gross)),
+        creator_fee=commission,
     )
     await db.campaigns.update_one({"id": campaign['id']}, {"$set": {"status": CampaignStatus.COMPLETED, "payout_status": "released", "updated_at": now}})
     await insert_deal_activity(campaign, "system", "UGCAD.IO", "payment_released", f"Payout of ₹{int(net)} released to the creator.")
@@ -5942,6 +6202,17 @@ async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict 
     campaign = await db.campaigns.find_one({"id": dispute["campaign_id"]})
     escrow = await db.escrow.find_one({"campaign_id": dispute["campaign_id"]})
     held = float((escrow or {}).get("amount") or 0)
+
+    # PRD 11.3 role matrix: Ops (regular) can rule disputes up to ₹25K; the
+    # founder/admin has no limit. (No "senior ops" tier in V0.5, so the founder
+    # handles anything larger.)
+    OPS_DISPUTE_LIMIT = 25000
+    dispute_value = max(held, float(data.refund_amount or 0), float(data.creator_amount or 0))
+    if current_user["role"] != UserRole.ADMIN and dispute_value > OPS_DISPUTE_LIMIT:
+        raise HTTPException(
+            status_code=403,
+            detail=f"This dispute (₹{dispute_value:,.0f}) exceeds the ₹{OPS_DISPUTE_LIMIT:,} ops limit. Escalate to the founder/admin.",
+        )
     refund = round(float(data.refund_amount or 0), 2)
     creator_amt = round(float(data.creator_amount or 0), 2)
 
@@ -5960,7 +6231,7 @@ async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict 
         await db.users.update_one({"id": campaign["business_id"]}, {"$inc": {"balance": refund}})
     if creator_amt > 0 and dispute.get("creator_id"):
         await db.users.update_one({"id": dispute["creator_id"]}, {"$inc": {"balance": creator_amt}})
-        await create_payout_receipt(creator_id=dispute["creator_id"], receipt_type="earning", gross_amount=creator_amt, campaign_id=dispute["campaign_id"], reference_id=dispute_id, note=f"Dispute ruling ({data.ruling})")
+        await create_payout_receipt(creator_id=dispute["creator_id"], receipt_type="earning", gross_amount=creator_amt, campaign_id=dispute["campaign_id"], reference_id=dispute_id, note=f"Dispute ruling ({data.ruling})", commission_amount=0)
     if escrow:
         await db.escrow.update_one({"id": escrow["id"]}, {"$set": {"status": "released", "payout_status": "released", "released_at": now_iso(), "dispute_resolution": data.ruling}})
     if data.extension_days and campaign:
@@ -5982,6 +6253,9 @@ async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict 
             await notify_user(uid, "Your dispute has been resolved", f"Ruling: {data.ruling.replace('_',' ')}. {data.reasoning[:120]} You may appeal within 7 days.", link="/my-deals")
     if reserve_gap > 0:
         await notify_admins("Dispute ruling exceeded escrow", f"Dispute {dispute_id} needed ₹{reserve_gap} from reserve. Finance audit required.")
+    await log_admin_action(current_user, "dispute.ruling", target_type="dispute", target_id=dispute_id,
+                           after={"ruling": data.ruling, "refund": refund, "creator_amount": creator_amt},
+                           reason=data.reasoning)
     return {"message": "Dispute resolved", "ruling": data.ruling, "refund": refund, "creator_amount": creator_amt, "reserve_gap": reserve_gap}
 
 
@@ -6313,16 +6587,53 @@ async def get_shipment(campaign_id: str, current_user: dict = Depends(get_curren
     return shipment
 
 # Withdrawal Routes
-PLATFORM_COMMISSION_PERCENT = 25  # PRD Section 3: platform takes 25%.
+PLATFORM_COMMISSION_PERCENT = 25  # Legacy single-rate constant (kept for reporting).
+
+# Two-sided platform commission. The brand fee is charged ON TOP of the deal value
+# when the brand funds; the creator fee is DEDUCTED from the creator's payout.
+BRAND_COMMISSION_PERCENT = 20
+CREATOR_COMMISSION_PERCENT = 10
+
+
+def brand_commission(amount) -> float:
+    """Platform fee added on top of the deal value when the brand funds."""
+    return round(float(amount or 0) * BRAND_COMMISSION_PERCENT / 100, 2)
+
+
+def creator_commission(amount) -> float:
+    """Platform fee deducted from the creator's payout."""
+    return round(float(amount or 0) * CREATOR_COMMISSION_PERCENT / 100, 2)
+
+
+async def record_platform_revenue(campaign_id: str, escrow_id: str, *, deal_amount: float,
+                                  brand_fee: float, creator_fee: float) -> None:
+    """Persist the platform's earned commission for a completed deal (both sides)."""
+    await db.platform_revenue.insert_one({
+        "id": str(uuid.uuid4()),
+        "campaign_id": campaign_id,
+        "escrow_id": escrow_id,
+        "deal_amount": round(float(deal_amount or 0), 2),
+        "brand_commission_percent": BRAND_COMMISSION_PERCENT,
+        "creator_commission_percent": CREATOR_COMMISSION_PERCENT,
+        "brand_fee": round(float(brand_fee or 0), 2),
+        "creator_fee": round(float(creator_fee or 0), 2),
+        "total_commission": round(float(brand_fee or 0) + float(creator_fee or 0), 2),
+        "created_at": now_iso(),
+    })
+
 
 async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount: float,
                                 campaign_id: Optional[str] = None, reference_id: Optional[str] = None,
                                 note: Optional[str] = None, tds_amount: float = 0.0,
-                                penalty_amount: float = 0.0) -> dict:
+                                penalty_amount: float = 0.0, commission_amount: Optional[float] = None) -> dict:
     """Generate and persist a payout receipt for a creator. receipt_type is
     'earning' (escrow release) or 'withdrawal' (payout to bank/UPI). TDS and any
-    late-delivery penalty are recorded as deductions (PRD 8.7/8.8)."""
-    commission = round(gross_amount * PLATFORM_COMMISSION_PERCENT / 100, 2) if receipt_type == "earning" else 0.0
+    late-delivery penalty are recorded as deductions (PRD 8.7/8.8). The creator-side
+    platform commission is deducted from earnings."""
+    if commission_amount is not None:
+        commission = round(float(commission_amount), 2)
+    else:
+        commission = creator_commission(gross_amount) if receipt_type == "earning" else 0.0
     tds_amount = round(float(tds_amount or 0), 2)
     penalty_amount = round(float(penalty_amount or 0), 2)
     net_amount = round(gross_amount - commission - tds_amount - penalty_amount, 2)
@@ -6333,7 +6644,7 @@ async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount
         "creator_id": creator_id,
         "type": receipt_type,
         "gross_amount": gross_amount,
-        "commission_percent": PLATFORM_COMMISSION_PERCENT if receipt_type == "earning" else 0,
+        "commission_percent": CREATOR_COMMISSION_PERCENT if receipt_type == "earning" else 0,
         "commission_amount": commission,
         "tds_amount": tds_amount,
         "penalty_amount": penalty_amount,
@@ -6722,8 +7033,11 @@ async def ban_user(data: UserBanRequest, current_user: dict = Depends(get_curren
         {"id": data.user_id},
         {"$set": update_data}
     )
-    
+
     action = "banned" if data.banned else "unbanned"
+    await log_admin_action(current_user, f"user.{action}", target_type="user", target_id=data.user_id,
+                           before={"banned": bool(user.get("banned"))}, after={"banned": data.banned},
+                           reason=data.ban_reason)
     return {"message": f"User {action} successfully"}
 
 @api_router.get("/admin/withdrawals")
@@ -7991,6 +8305,759 @@ async def get_creator_financial_details(creator_id: str, current_user: dict = De
         "bank_details": user.get('bank_details', {}),
         "upi_id": user.get('upi_id', None)
     }
+
+# ===========================================================================
+# Admin Panel — Section 11 modules (Audit Log, Settings, Financials,
+# Shipping Queue, Deals admin). All sensitive actions write to the audit log.
+# ===========================================================================
+
+def _client_ip(request: Optional[Request]) -> Optional[str]:
+    if request is None:
+        return None
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+async def log_admin_action(admin: dict, action: str, *, target_type: Optional[str] = None,
+                           target_id: Optional[str] = None, before: Any = None, after: Any = None,
+                           reason: Optional[str] = None, request: Optional[Request] = None) -> dict:
+    """PRD 11.15: append-only audit trail of every admin action."""
+    entry = {
+        "id": str(uuid.uuid4()),
+        "admin_id": admin.get("id"),
+        "admin_nickname": admin.get("nickname"),
+        "admin_role": admin.get("role"),
+        "action": action,
+        "target_type": target_type,
+        "target_id": target_id,
+        "before": before,
+        "after": after,
+        "reason": reason,
+        "ip": _client_ip(request),
+        "created_at": now_iso(),
+    }
+    await db.admin_logs.insert_one(entry)
+    return {k: v for k, v in entry.items() if k != "_id"}
+
+
+# PRD 11.15: sensitive actions are founder-only when committed by peers and
+# trigger a founder email digest. Kept in sync with the frontend list.
+SENSITIVE_ACTIONS = [
+    "wallet.adjust", "dispute.ruling", "user.banned", "user.suspended",
+    "settings.update", "withdrawal.approved", "withdrawal.rejected", "deal.force_transition",
+]
+
+
+# Actions are namespaced (e.g. "wallet.adjust"); the prefix maps to a module so
+# the audit UI can group/filter without every call site passing one explicitly.
+_MODULE_BY_PREFIX = {
+    "wallet": "financials", "payout": "financials", "escrow": "financials",
+    "withdrawal": "financials", "export": "financials", "dispute": "disputes",
+    "user": "users", "settings": "settings", "shipping": "shipping", "deal": "deals",
+}
+
+
+def _module_for(action: Optional[str]) -> str:
+    return _MODULE_BY_PREFIX.get((action or "").split(".")[0], "")
+
+
+def _build_audit_query(current_user: dict, action: Optional[str], module: Optional[str],
+                       admin_id: Optional[str], target_id: Optional[str],
+                       date_from: Optional[str], date_to: Optional[str]) -> dict:
+    query: dict = {}
+    if action:
+        query["action"] = action
+    elif module:
+        # Module isn't stored per-row; match the action prefixes that map to it.
+        prefixes = [p for p, m in _MODULE_BY_PREFIX.items() if m == module]
+        if prefixes:
+            query["action"] = {"$regex": f"^({'|'.join(prefixes)})\\."}
+    if admin_id:
+        query["admin_id"] = admin_id
+    if target_id:
+        query["target_id"] = target_id
+    if date_from or date_to:
+        created = {}
+        if date_from:
+            created["$gte"] = date_from
+        if date_to:
+            created["$lte"] = f"{date_to}T23:59:59.999Z"
+        query["created_at"] = created
+    # Log review (PRD 11.15): the founder sees every entry; other admins see
+    # their own actions plus peers' routine (non-sensitive) actions.
+    if current_user["role"] != UserRole.ADMIN:
+        query["$or"] = [
+            {"admin_id": current_user["id"]},
+            {"action": {"$nin": SENSITIVE_ACTIONS}},
+        ]
+    return query
+
+
+def _map_audit(log: dict) -> dict:
+    return {**log, "module": log.get("module") or _module_for(log.get("action")),
+            "sensitive": log.get("action") in SENSITIVE_ACTIONS}
+
+
+@api_router.get("/admin/audit-logs")
+async def get_audit_logs(action: Optional[str] = None, module: Optional[str] = None,
+                         admin_id: Optional[str] = None, target_id: Optional[str] = None,
+                         date_from: Optional[str] = Query(None, alias="from"),
+                         date_to: Optional[str] = Query(None, alias="to"),
+                         limit: int = 500,
+                         current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view audit logs")
+    query = _build_audit_query(current_user, action, module, admin_id, target_id, date_from, date_to)
+    logs = await db.admin_logs.find(query, {"_id": 0}).sort("created_at", -1).to_list(min(max(limit, 1), 1000))
+    return {"logs": [_map_audit(l) for l in logs], "count": len(logs)}
+
+
+@api_router.get("/admin/audit-logs/export")
+async def export_audit_logs(action: Optional[str] = None, module: Optional[str] = None,
+                            admin_id: Optional[str] = None, target_id: Optional[str] = None,
+                            date_from: Optional[str] = Query(None, alias="from"),
+                            date_to: Optional[str] = Query(None, alias="to"),
+                            current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view audit logs")
+    query = _build_audit_query(current_user, action, module, admin_id, target_id, date_from, date_to)
+    logs = await db.admin_logs.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
+
+    import csv as _csv
+    import json as _json
+    from io import StringIO
+    from fastapi.responses import Response
+
+    output = StringIO()
+    writer = _csv.writer(output)
+    writer.writerow(["timestamp", "admin", "role", "action", "module", "target",
+                     "before", "after", "reason", "ip"])
+    for l in logs:
+        target = f"{l.get('target_type')}:{l.get('target_id')}" if l.get("target_type") else ""
+        writer.writerow([
+            l.get("created_at", ""), l.get("admin_nickname", ""), l.get("admin_role", ""),
+            l.get("action", ""), l.get("module") or _module_for(l.get("action")), target,
+            _json.dumps(l.get("before")), _json.dumps(l.get("after")),
+            l.get("reason", ""), l.get("ip", ""),
+        ])
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename=audit-log_{datetime.now().strftime("%Y%m%d")}.csv'},
+    )
+
+
+# --- Platform Settings (PRD 11.14, founder-only) ---------------------------
+DEFAULT_PLATFORM_SETTINGS = {
+    "commission_rate": 25,
+    "listing_fee": 500,
+    "revision_price": 500,
+    "auto_approval_days": 5,
+    "late_ship_fee_per_day": 200,
+    "late_ship_fee_cap": 1000,
+    "payout_delay_days": {"new": 12, "verified": 7, "l1": 5, "l2": 3, "elite": 2},
+    "restricted_categories": ["tobacco", "weapons", "adult", "gambling"],
+    "feature_flags": {"matching_v05": True, "instant_payout": True},
+}
+
+
+async def get_platform_settings() -> dict:
+    doc = await db.platform_settings.find_one({"id": "platform"}, {"_id": 0})
+    return {**DEFAULT_PLATFORM_SETTINGS, **((doc or {}).get("values") or {})}
+
+
+@api_router.get("/admin/settings")
+async def admin_get_settings(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view settings")
+    return {"settings": await get_platform_settings(), "defaults": DEFAULT_PLATFORM_SETTINGS}
+
+
+@api_router.put("/admin/settings")
+async def admin_update_settings(data: Dict[str, Any] = Body(...), request: Request = None,
+                                current_user: dict = Depends(get_current_user)):
+    # Founder-only (PRD 11.3 / 11.14).
+    if current_user["role"] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Only the founder/admin can change platform settings")
+    before = await get_platform_settings()
+    allowed = set(DEFAULT_PLATFORM_SETTINGS.keys())
+    overrides = {k: v for k, v in (data or {}).items() if k in allowed}
+    if not overrides:
+        raise HTTPException(status_code=400, detail="No valid settings provided")
+    merged = {**(before), **overrides}
+    await db.platform_settings.update_one(
+        {"id": "platform"}, {"$set": {"id": "platform", "values": merged, "updated_at": now_iso()}}, upsert=True
+    )
+    await log_admin_action(current_user, "settings.update", target_type="platform_settings", target_id="platform",
+                           before={k: before.get(k) for k in overrides}, after=overrides, request=request)
+    return {"settings": merged, "message": "Settings updated"}
+
+
+# --- Financials (PRD 11.11) -------------------------------------------------
+@api_router.get("/admin/financials/overview")
+async def admin_financials_overview(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view financials")
+    escrows = await db.escrow.find({}, {"_id": 0}).to_list(20000)
+    total_escrow_held = round(sum(to_float(e.get("amount")) for e in escrows if e.get("status") == "held"), 2)
+    brands = await db.users.find({"role": UserRole.BUSINESS}, {"_id": 0, "balance": 1}).to_list(20000)
+    total_wallet = round(sum(to_float(b.get("balance")) for b in brands), 2)
+    now = datetime.now(timezone.utc)
+    horizon = (now + timedelta(days=7)).isoformat()
+    scheduled = [e for e in escrows if e.get("payout_status") == "scheduled"]
+    next7 = [e for e in scheduled if (e.get("payout_scheduled_at") or "") <= horizon]
+    scheduled_total = round(sum(to_float(e.get("net_payable") or e.get("amount")) for e in next7), 2)
+    invoices = await db.invoices.find({}, {"_id": 0}).to_list(20000)
+    commission_earned = round(sum(to_float(i.get("gross_amount")) * 0.25 for i in invoices), 2)
+    return {
+        "total_escrow_held": total_escrow_held,
+        "total_wallet_balance": total_wallet,
+        "scheduled_payouts_next_7d": scheduled_total,
+        "scheduled_payouts_count": len(next7),
+        "open_escrows": len([e for e in escrows if e.get("status") == "held"]),
+        "commission_earned_est": commission_earned,
+    }
+
+
+@api_router.get("/admin/payouts")
+async def admin_payout_queue(status_filter: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view payouts")
+    query = {"payout_status": {"$in": ["scheduled", "released"]}}
+    if status_filter:
+        query["payout_status"] = status_filter
+    escrows = await db.escrow.find(query, {"_id": 0}).sort("payout_scheduled_at", 1).to_list(2000)
+    rows = []
+    for e in escrows:
+        creator = await db.users.find_one({"id": e.get("creator_id")}, {"_id": 0, "nickname": 1, "upi_id": 1}) or {}
+        campaign = await db.campaigns.find_one({"id": e.get("campaign_id")}, {"_id": 0, "title": 1}) or {}
+        rows.append({
+            "escrow_id": e.get("id"), "campaign_id": e.get("campaign_id"), "campaign_title": campaign.get("title"),
+            "creator_id": e.get("creator_id"), "creator_nickname": creator.get("nickname"),
+            "gross_amount": to_float(e.get("gross_amount") or e.get("amount")),
+            "tds_amount": to_float(e.get("tds_amount")), "net_payable": to_float(e.get("net_payable") or e.get("amount")),
+            "payout_status": e.get("payout_status"), "scheduled_at": e.get("payout_scheduled_at"),
+            "method": "UPI" if creator.get("upi_id") else "bank",
+        })
+    return {"payouts": rows, "count": len(rows)}
+
+
+@api_router.get("/admin/escrow")
+async def admin_escrow_list(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view escrow")
+    escrows = await db.escrow.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    rows = []
+    for e in escrows:
+        campaign = await db.campaigns.find_one({"id": e.get("campaign_id")}, {"_id": 0, "title": 1}) or {}
+        creator = await db.users.find_one({"id": e.get("creator_id")}, {"_id": 0, "nickname": 1}) or {}
+        rows.append({
+            "id": e.get("id"), "campaign_id": e.get("campaign_id"), "campaign_title": campaign.get("title"),
+            "creator": creator.get("nickname"), "amount": to_float(e.get("amount")),
+            "held_amount": to_float(e.get("amount")), "status": e.get("status"),
+            "payout_status": e.get("payout_status"), "created_at": e.get("created_at"),
+        })
+    return rows
+
+
+def _csv_response(rows: List[dict], fieldnames: List[str], filename: str):
+    import csv
+    from io import StringIO
+    from fastapi.responses import Response
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    return Response(content=output.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
+@api_router.get("/admin/financials/tds/export")
+async def export_tds(current_user: dict = Depends(get_current_user)):
+    """PRD 11.11: TDS certificate prep (Form 16A) — one row per creator earning."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin/finance can export tax docs")
+    invoices = await db.invoices.find({}, {"_id": 0}).to_list(20000)
+    rows = []
+    for inv in invoices:
+        creator = await db.users.find_one({"id": inv.get("creator_id")}, {"_id": 0, "nickname": 1, "email": 1}) or {}
+        rows.append({
+            "creator_id": inv.get("creator_id"), "creator": creator.get("nickname"), "email": creator.get("email"),
+            "campaign_id": inv.get("campaign_id"), "gross_amount": inv.get("gross_amount"),
+            "tds_amount": inv.get("tds_amount"), "net_to_creator": inv.get("net_to_creator"),
+            "date": (inv.get("created_at") or "")[:10],
+        })
+    await log_admin_action(current_user, "export.tds", target_type="report", reason="PII export")
+    return _csv_response(rows, ["creator_id", "creator", "email", "campaign_id", "gross_amount", "tds_amount", "net_to_creator", "date"], "tds_form16a.csv")
+
+
+@api_router.get("/admin/financials/gst/export")
+async def export_gst(current_user: dict = Depends(get_current_user)):
+    """PRD 11.11: GST-ready invoice export."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin/finance can export tax docs")
+    invoices = await db.invoices.find({}, {"_id": 0}).to_list(20000)
+    rows = []
+    for inv in invoices:
+        gross = to_float(inv.get("gross_amount"))
+        commission = round(gross * 0.25, 2)
+        gst = round(commission * 0.18, 2)
+        rows.append({
+            "invoice_id": inv.get("id"), "business_id": inv.get("business_id"), "campaign_id": inv.get("campaign_id"),
+            "gross_amount": gross, "platform_commission": commission, "gst_18pct": gst,
+            "date": (inv.get("created_at") or "")[:10],
+        })
+    await log_admin_action(current_user, "export.gst", target_type="report")
+    return _csv_response(rows, ["invoice_id", "business_id", "campaign_id", "gross_amount", "platform_commission", "gst_18pct", "date"], "gst_invoices.csv")
+
+
+@api_router.post("/admin/wallet/adjust")
+async def admin_wallet_adjust(data: Dict[str, Any] = Body(...), request: Request = None,
+                              current_user: dict = Depends(get_current_user)):
+    # Financial adjustment — founder/admin only, mandatory reason, audit-logged (PRD 11.11/11.16).
+    if current_user["role"] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Only the founder/admin can adjust wallet balances")
+    user_id = data.get("user_id")
+    amount = to_float(data.get("amount"))
+    reason = (data.get("reason") or "").strip()
+    if not user_id or amount == 0:
+        raise HTTPException(status_code=400, detail="user_id and a non-zero amount are required")
+    if not reason:
+        raise HTTPException(status_code=400, detail="A reason is required for any wallet adjustment")
+    target = await db.users.find_one({"id": user_id}, {"_id": 0, "balance": 1, "nickname": 1})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    before_balance = to_float(target.get("balance"))
+    await db.users.update_one({"id": user_id}, {"$inc": {"balance": amount}})
+    await db.wallet_ledger.insert_one({
+        "id": str(uuid.uuid4()), "user_id": user_id, "transaction_id": str(uuid.uuid4()),
+        "type": "admin_adjustment", "direction": "credit" if amount > 0 else "debit",
+        "amount": abs(amount), "status": "success", "note": f"Admin adjustment: {reason}",
+        "created_at": now_iso(), "date": now_iso(),
+    })
+    await log_admin_action(current_user, "wallet.adjust", target_type="user", target_id=user_id,
+                           before={"balance": before_balance}, after={"balance": round(before_balance + amount, 2)},
+                           reason=reason, request=request)
+    await notify_user(user_id, "Wallet adjusted", f"Your wallet was adjusted by ₹{amount:,.0f} by the platform team. Reason: {reason}")
+    return {"message": "Wallet adjusted", "new_balance": round(before_balance + amount, 2)}
+
+
+# --- Financials: wallet ledger, revenue, payout & escrow controls (PRD 11.11) ---
+
+def _period_cutoff_iso(period: Optional[str]) -> str:
+    """Rolling-window start for a revenue period: day=24h, week=7d, month=30d."""
+    days = {"day": 1, "week": 7, "month": 30}.get((period or "month").lower(), 30)
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+@api_router.get("/admin/wallet/{user_id}/transactions")
+async def admin_wallet_transactions(user_id: str, current_user: dict = Depends(get_current_user)):
+    """PRD 11.11: per-wallet transaction history for the admin wallet view."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view wallet history")
+    entries = await db.wallet_ledger.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).to_list(2000)
+    rows = []
+    for e in entries:
+        amt = to_float(e.get("amount"))
+        signed = amt if (e.get("direction") or "credit") == "credit" else -amt
+        rows.append({
+            "id": e.get("id"), "type": e.get("type"), "direction": e.get("direction"),
+            "amount": round(signed, 2), "reason": e.get("note") or e.get("description"),
+            "status": e.get("status"), "created_at": e.get("created_at") or e.get("date"),
+        })
+    return {"transactions": rows, "count": len(rows)}
+
+
+@api_router.get("/admin/financials/revenue")
+async def admin_financials_revenue(period: Optional[str] = "month", current_user: dict = Depends(get_current_user)):
+    """PRD 11.11 revenue tracking: commission, listing fees, refunded fees and
+    penalty collections over the selected rolling period."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view revenue")
+    cutoff = _period_cutoff_iso(period)
+
+    invoices = await db.invoices.find({"created_at": {"$gte": cutoff}}, {"_id": 0}).to_list(50000)
+    commission = round(sum(to_float(i.get("gross_amount")) * PLATFORM_COMMISSION_PERCENT / 100 for i in invoices), 2)
+
+    # Campaign listing fees and refunds — recorded as payment_transactions.
+    txns = await db.payment_transactions.find({"created_at": {"$gte": cutoff}}, {"_id": 0}).to_list(50000)
+    def _is_listing(t):
+        blob = f"{t.get('purpose','')} {t.get('type','')} {t.get('note','')}".lower()
+        return "listing" in blob or "campaign_fee" in blob
+    listing_fees = round(sum(to_float(t.get("amount")) for t in txns if _is_listing(t) and (t.get("status") in (None, "success", "completed")) and (t.get("direction") != "refund") and not t.get("refunded")), 2)
+    refunded_listing_fees = round(sum(to_float(t.get("amount")) for t in txns if _is_listing(t) and (t.get("direction") == "refund" or t.get("status") == "refunded" or t.get("refunded"))), 2)
+
+    # Penalty collections retained by the platform (penalty minus any brand goodwill share).
+    released_escrows = await db.escrow.find({"payout_status": "released", "released_at": {"$gte": cutoff}}, {"_id": 0}).to_list(50000)
+    penalties = round(sum(max(to_float(e.get("penalty_amount")) - to_float(e.get("penalty_brand_credit")), 0) for e in released_escrows), 2)
+    try:
+        brand_pens = await db.brand_penalties.find({"created_at": {"$gte": cutoff}}, {"_id": 0}).to_list(50000)
+        penalties = round(penalties + sum(to_float(p.get("amount")) for p in brand_pens), 2)
+    except Exception:
+        pass
+
+    return {
+        "period": (period or "month").lower(),
+        "commission": commission,
+        "listing_fees": listing_fees,
+        "refunded_listing_fees": refunded_listing_fees,
+        "penalties": penalties,
+        "net": round(commission + listing_fees - refunded_listing_fees + penalties, 2),
+    }
+
+
+async def _release_one_payout(escrow_id: str) -> bool:
+    """Release a single scheduled/held payout by its escrow id. Clears any hold
+    first, then runs the standard scheduled-payout release (money movement,
+    receipt, notifications). Returns True if a payout was actually released."""
+    escrow = await db.escrow.find_one({"id": escrow_id})
+    if not escrow:
+        return False
+    if escrow.get("payout_status") == "released":
+        return False
+    # A held payout is just a paused 'scheduled' one — un-hold before releasing.
+    if escrow.get("payout_status") == "held":
+        await db.escrow.update_one({"id": escrow_id}, {"$set": {"payout_status": "scheduled"}, "$unset": {"payout_hold_reason": ""}})
+        escrow = await db.escrow.find_one({"id": escrow_id})
+    return await release_scheduled_payout(escrow)
+
+
+@api_router.post("/admin/payouts/{escrow_id}/hold")
+async def admin_hold_payout(escrow_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
+                            current_user: dict = Depends(get_current_user)):
+    """PRD 11.11: hold a scheduled payout (fraud review / dispute-in-progress)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can hold payouts")
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="A reason is required to hold a payout")
+    escrow = await db.escrow.find_one({"id": escrow_id}, {"_id": 0})
+    if not escrow:
+        raise HTTPException(status_code=404, detail="Payout not found")
+    if escrow.get("payout_status") != "scheduled":
+        raise HTTPException(status_code=400, detail="Only scheduled payouts can be held")
+    await db.escrow.update_one({"id": escrow_id}, {"$set": {"payout_status": "held", "payout_hold_reason": reason, "payout_held_at": now_iso()}})
+    await log_admin_action(current_user, "payout.hold", target_type="escrow", target_id=escrow_id, reason=reason, request=request)
+    return {"message": "Payout held", "escrow_id": escrow_id}
+
+
+@api_router.post("/admin/payouts/{escrow_id}/release")
+async def admin_release_payout(escrow_id: str, request: Request = None, current_user: dict = Depends(get_current_user)):
+    """PRD 11.11: release a single scheduled or held payout immediately."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can release payouts")
+    if not await db.escrow.find_one({"id": escrow_id}, {"_id": 0}):
+        raise HTTPException(status_code=404, detail="Payout not found")
+    released = await _release_one_payout(escrow_id)
+    if not released:
+        raise HTTPException(status_code=400, detail="Payout could not be released (already paid or not payable)")
+    await log_admin_action(current_user, "payout.release", target_type="escrow", target_id=escrow_id, request=request)
+    return {"message": "Payout released", "escrow_id": escrow_id}
+
+
+@api_router.post("/admin/payouts/batch-release")
+async def admin_batch_release_payouts(data: Dict[str, Any] = Body(...), request: Request = None,
+                                      current_user: dict = Depends(get_current_user)):
+    """PRD 11.11: batch-release every payout scheduled for a date (or an explicit
+    list of escrow ids)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can release payouts")
+    ids = data.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400, detail="A non-empty list of payout ids is required")
+    released = 0
+    for escrow_id in ids:
+        try:
+            if await _release_one_payout(escrow_id):
+                released += 1
+        except Exception:
+            logger.exception("Batch release failed for escrow %s", escrow_id)
+    await log_admin_action(current_user, "payout.batch_release", target_type="report",
+                           after={"requested": len(ids), "released": released}, reason=data.get("date"), request=request)
+    return {"message": f"Released {released} of {len(ids)} payouts", "released": released, "requested": len(ids)}
+
+
+@api_router.post("/admin/escrow/{escrow_id}/release")
+async def admin_release_escrow(escrow_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
+                               current_user: dict = Depends(get_current_user)):
+    """PRD 11.11: release held escrow funds to the creator with a mandatory reason."""
+    if current_user["role"] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Only the founder/admin can move escrow funds")
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="A reason is required and will be logged")
+    escrow = await db.escrow.find_one({"id": escrow_id}, {"_id": 0})
+    if not escrow:
+        raise HTTPException(status_code=404, detail="Escrow not found")
+    if escrow.get("status") == "released" or escrow.get("payout_status") == "released":
+        raise HTTPException(status_code=400, detail="These funds have already been released")
+    if escrow.get("status") == "refunded":
+        raise HTTPException(status_code=400, detail="These funds were refunded to the brand")
+
+    # If a scheduled payout already exists, use the standard release path.
+    if escrow.get("payout_status") in ("scheduled", "held"):
+        await _release_one_payout(escrow_id)
+    else:
+        campaign = await db.campaigns.find_one({"id": escrow.get("campaign_id")}) or {}
+        creator_id = escrow.get("creator_id") or campaign.get("selected_creator")
+        gross = to_float(escrow.get("gross_amount") or escrow.get("amount"))
+        tds = to_float(escrow.get("tds_amount"))
+        net = to_float(escrow.get("net_payable")) if escrow.get("net_payable") is not None else round(gross - tds, 2)
+        now = now_iso()
+        await db.escrow.update_one({"id": escrow_id}, {"$set": {"status": "released", "payout_status": "released", "released_at": now, "released_reason": reason}})
+        if creator_id and net:
+            await db.users.update_one({"id": creator_id}, {"$inc": {"balance": net}})
+            await create_payout_receipt(creator_id=creator_id, receipt_type="earning", gross_amount=gross,
+                                        campaign_id=escrow.get("campaign_id"), reference_id=escrow_id,
+                                        note=f"Manual escrow release: {reason}", tds_amount=tds)
+            await notify_user(creator_id, "Payment released", f"₹{int(net)} has been released to your wallet.", link="/payouts")
+    await log_admin_action(current_user, "escrow.release", target_type="escrow", target_id=escrow_id, reason=reason, request=request)
+    return {"message": "Escrow released to creator", "escrow_id": escrow_id}
+
+
+@api_router.post("/admin/escrow/{escrow_id}/refund")
+async def admin_refund_escrow(escrow_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
+                              current_user: dict = Depends(get_current_user)):
+    """PRD 11.11: refund held escrow funds back to the brand with a mandatory reason."""
+    if current_user["role"] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Only the founder/admin can move escrow funds")
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="A reason is required and will be logged")
+    escrow = await db.escrow.find_one({"id": escrow_id}, {"_id": 0})
+    if not escrow:
+        raise HTTPException(status_code=404, detail="Escrow not found")
+    if escrow.get("status") in ("released", "refunded") or escrow.get("payout_status") == "released":
+        raise HTTPException(status_code=400, detail="These funds are no longer held and cannot be refunded")
+    campaign = await db.campaigns.find_one({"id": escrow.get("campaign_id")}) or {}
+    business_id = campaign.get("business_id") or escrow.get("business_id")
+    amount = to_float(escrow.get("gross_amount") or escrow.get("amount"))
+    await db.escrow.update_one({"id": escrow_id}, {"$set": {"status": "refunded", "payout_status": "refunded", "refunded_at": now_iso(), "refund_reason": reason}})
+    if business_id and amount:
+        await db.users.update_one({"id": business_id}, {"$inc": {"balance": amount}})
+        await db.wallet_ledger.insert_one({
+            "id": str(uuid.uuid4()), "user_id": business_id, "transaction_id": str(uuid.uuid4()),
+            "type": "escrow_refund", "direction": "credit", "amount": round(amount, 2),
+            "status": "success", "note": f"Escrow refund: {reason}", "created_at": now_iso(), "date": now_iso(),
+        })
+        await notify_user(business_id, "Escrow refunded", f"₹{int(amount)} held in escrow was refunded to your wallet. Reason: {reason}", link="/dashboard/business/wallet")
+    await log_admin_action(current_user, "escrow.refund", target_type="escrow", target_id=escrow_id,
+                           after={"amount": amount}, reason=reason, request=request)
+    return {"message": "Escrow refunded to brand", "escrow_id": escrow_id, "amount": amount}
+
+
+@api_router.get("/admin/financials/pnl/export")
+async def export_pnl(period: Optional[str] = "month", current_user: dict = Depends(get_current_user)):
+    """PRD 11.11: monthly P&L summary export."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin/finance can export financials")
+    cutoff = _period_cutoff_iso(period)
+    invoices = await db.invoices.find({"created_at": {"$gte": cutoff}}, {"_id": 0}).to_list(50000)
+    gross = round(sum(to_float(i.get("gross_amount")) for i in invoices), 2)
+    commission = round(gross * PLATFORM_COMMISSION_PERCENT / 100, 2)
+    tds = round(sum(to_float(i.get("tds_amount")) for i in invoices), 2)
+    creator_payouts = round(sum(to_float(i.get("net_to_creator")) for i in invoices), 2)
+    released = await db.escrow.find({"payout_status": "released", "released_at": {"$gte": cutoff}}, {"_id": 0}).to_list(50000)
+    penalties = round(sum(max(to_float(e.get("penalty_amount")) - to_float(e.get("penalty_brand_credit")), 0) for e in released), 2)
+    rows = [
+        {"line_item": "Gross deal volume", "amount": gross},
+        {"line_item": "Platform commission (revenue)", "amount": commission},
+        {"line_item": "Penalty collections (revenue)", "amount": penalties},
+        {"line_item": "TDS withheld (liability)", "amount": tds},
+        {"line_item": "Creator payouts (cost of goods)", "amount": creator_payouts},
+        {"line_item": "Net platform revenue", "amount": round(commission + penalties, 2)},
+    ]
+    await log_admin_action(current_user, "export.pnl", target_type="report", reason=(period or "month"))
+    return _csv_response(rows, ["line_item", "amount"], f"pnl_{(period or 'month')}.csv")
+
+
+@api_router.get("/admin/financials/reconciliation/export")
+async def export_reconciliation(current_user: dict = Depends(get_current_user)):
+    """PRD 11.11: reconciliation report (wallet + escrow + bank)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin/finance can export financials")
+    escrows = await db.escrow.find({}, {"_id": 0}).to_list(50000)
+    escrow_held = round(sum(to_float(e.get("amount")) for e in escrows if e.get("status") == "held"), 2)
+    users = await db.users.find({"balance": {"$gt": 0}}, {"_id": 0, "balance": 1}).to_list(50000)
+    wallet_liability = round(sum(to_float(u.get("balance")) for u in users), 2)
+    scheduled = [e for e in escrows if e.get("payout_status") == "scheduled"]
+    scheduled_total = round(sum(to_float(e.get("net_payable") or e.get("amount")) for e in scheduled), 2)
+    rows = [
+        {"account": "Wallet liabilities (held in user wallets)", "balance": wallet_liability},
+        {"account": "Escrow held (open deals)", "balance": escrow_held},
+        {"account": "Scheduled payouts (committed)", "balance": scheduled_total},
+        {"account": "Total platform obligations", "balance": round(wallet_liability + escrow_held, 2)},
+    ]
+    await log_admin_action(current_user, "export.reconciliation", target_type="report")
+    return _csv_response(rows, ["account", "balance"], "reconciliation.csv")
+
+
+# --- Shipping Queue (PRD 11.9) ---------------------------------------------
+@api_router.get("/admin/shipping/requests")
+async def admin_shipping_requests(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view the shipping queue")
+    campaigns = await db.campaigns.find(
+        {"requires_shipment": True, "selected_creator": {"$nin": [None, ""]},
+         "status": {"$in": ["in_progress", "active", "work_submitted", "completed"]}},
+        {"_id": 0},
+    ).to_list(2000)
+    rows = []
+    for c in campaigns:
+        sh = await db.shipments.find_one({"campaign_id": c["id"]}, {"_id": 0}) or {}
+        ship_status = sh.get("courier_status") or sh.get("status") or "pending"
+        brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "nickname": 1, "profile": 1}) or {}
+        creator = await db.users.find_one({"id": c.get("selected_creator")}, {"_id": 0, "nickname": 1, "profile": 1}) or {}
+        requested = c.get("work_started_at") or c.get("updated_at") or c.get("created_at")
+        rows.append({
+            "id": c["id"], "deal_id": c["id"], "campaign_title": c.get("title"),
+            "brand": brand.get("nickname"), "creator": creator.get("nickname"),
+            "product": c.get("product_name") or "—", "requested_at": requested, "created_at": requested,
+            "status": ship_status, "courier": sh.get("courier_name"), "tracking_number": sh.get("tracking_number"),
+            "has_label": bool(sh.get("label_url")), "label_url": sh.get("label_url"),
+            "pickup_address": (brand.get("profile") or {}).get("address"),
+            "shipping_address": (creator.get("profile") or {}).get("address"),
+        })
+    rows.sort(key=lambda r: r.get("requested_at") or "")
+    return rows
+
+
+@api_router.post("/admin/shipping/{campaign_id}/label")
+async def admin_upload_shipping_label(campaign_id: str, file: UploadFile = File(...),
+                                      current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can upload labels")
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    content = await file.read()
+    upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))) / "labels"
+    ext = Path(file.filename or "label.pdf").suffix or ".pdf"
+    fname = f"label_{campaign_id}_{uuid.uuid4().hex}{ext}"
+    file_url = persist_file(content, fname, kind="other", local_dir=upload_dir,
+                            public_path=f"/uploads/labels/{fname}", cloud_folder="ugcad/labels")
+    await db.shipments.update_one({"campaign_id": campaign_id},
+                                  {"$set": {"label_url": file_url, "updated_at": now_iso()}}, upsert=True)
+    await log_admin_action(current_user, "shipping.label_uploaded", target_type="deal", target_id=campaign_id,
+                           after={"label_url": file_url})
+    return {"file_url": file_url, "label_url": file_url, "message": "Label uploaded"}
+
+
+@api_router.post("/admin/shipping/{campaign_id}/ship")
+async def admin_mark_shipped(campaign_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
+                             current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can mark shipped")
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    update = {"courier_name": data.get("courier"), "courier_status": "shipped", "status": "shipped",
+              "tracking_number": data.get("tracking_number"), "updated_at": now_iso()}
+    if data.get("label_url"):
+        update["label_url"] = data["label_url"]
+    await db.shipments.update_one({"campaign_id": campaign_id}, {"$set": update}, upsert=True)
+    await log_admin_action(current_user, "shipping.marked_shipped", target_type="deal", target_id=campaign_id,
+                           after={"courier": data.get("courier"), "tracking_number": data.get("tracking_number")}, request=request)
+    if campaign.get("business_id"):
+        await notify_user(campaign["business_id"], "Product shipped", "Your product has been shipped to the creator.", link="/dashboard/business/shipments")
+    if campaign.get("selected_creator"):
+        await notify_user(campaign["selected_creator"], "Product on the way", "The brand's product has been shipped to you.", link="/my-deals")
+    await insert_deal_system_message(campaign, "Shipment dispatched by the platform team.")
+    return {"message": "Marked as shipped"}
+
+
+# --- Deals admin (PRD 11.7) -------------------------------------------------
+@api_router.get("/admin/deals")
+async def admin_list_deals(state: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view deals")
+    query = {"selected_creator": {"$nin": [None, ""]}}
+    if state:
+        query["status"] = state
+    campaigns = await db.campaigns.find(query, {"_id": 0}).sort("updated_at", -1).to_list(2000)
+    rows = []
+    for c in campaigns:
+        brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "nickname": 1}) or {}
+        creator = await db.users.find_one({"id": c.get("selected_creator")}, {"_id": 0, "nickname": 1}) or {}
+        escrow = await db.escrow.find_one({"campaign_id": c["id"]}, {"_id": 0, "amount": 1, "status": 1}) or {}
+        disputed = await db.disputes.count_documents({"campaign_id": c["id"], "status": {"$in": ["open", "info_requested", "appealed"]}})
+        rows.append({
+            "id": c["id"], "deal_id": c["id"], "campaign_title": c.get("title"), "campaign": c.get("title"),
+            "brand": brand.get("nickname"), "creator": creator.get("nickname"),
+            "current_state": c.get("status"), "state": c.get("status"),
+            "deadline": c.get("final_delivery_by") or c.get("due_date"),
+            "escrow": to_float(escrow.get("amount")), "escrow_status": escrow.get("status"),
+            "flagged": bool(disputed), "requires_shipment": bool(c.get("requires_shipment")),
+        })
+    return rows
+
+
+@api_router.get("/admin/deals/{campaign_id}")
+async def admin_deal_detail(campaign_id: str, current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view deals")
+    c = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "nickname": 1}) or {}
+    creator = await db.users.find_one({"id": c.get("selected_creator")}, {"_id": 0, "nickname": 1}) or {}
+    escrow = await db.escrow.find_one({"campaign_id": campaign_id}, {"_id": 0}) or {}
+    shipment = await db.shipments.find_one({"campaign_id": campaign_id}, {"_id": 0}) or {}
+    timeline = await db.deal_activity.find({"campaign_id": campaign_id}, {"_id": 0}).sort("timestamp", 1).to_list(500)
+    content = await db.deal_content_submissions.find({"campaign_id": campaign_id}, {"_id": 0}).sort("version", 1).to_list(50)
+    return {
+        "deal_id": campaign_id, "id": campaign_id, "campaign_title": c.get("title"),
+        "brand": brand.get("nickname"), "creator": creator.get("nickname"),
+        "brand_id": c.get("business_id"), "creator_id": c.get("selected_creator"),
+        "current_state": c.get("status"), "deadline": c.get("final_delivery_by") or c.get("due_date"),
+        "brief_text": c.get("brief_text"), "escrow": escrow, "shipment": shipment,
+        "timeline": timeline, "content_versions": content, "admin_notes": c.get("admin_notes") or [],
+    }
+
+
+@api_router.post("/admin/deals/{campaign_id}/force-transition")
+async def admin_force_transition(campaign_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
+                                 current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can force transitions")
+    new_status = (data.get("to_state") or data.get("new_status") or "").strip()
+    reason = (data.get("reason") or data.get("justification") or "").strip()
+    valid = {"active", "in_progress", "work_submitted", "completed", "cancelled", "rejected", "disputed"}
+    if new_status not in valid:
+        raise HTTPException(status_code=400, detail=f"Invalid target state. Allowed: {', '.join(sorted(valid))}")
+    if not reason:
+        raise HTTPException(status_code=400, detail="A reason is required to force a transition (elevated action)")
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    before_status = campaign.get("status")
+    await db.campaigns.update_one({"id": campaign_id}, {"$set": {"status": new_status, "updated_at": now_iso(),
+                                                                 "admin_forced": True, "admin_force_reason": reason}})
+    await log_admin_action(current_user, "deal.force_transition", target_type="deal", target_id=campaign_id,
+                           before={"status": before_status}, after={"status": new_status}, reason=reason, request=request)
+    msg = f"Admin intervened in this deal. Reason: {reason}. Contact support if you have questions."
+    await insert_deal_system_message(campaign, msg)
+    for uid in [campaign.get("business_id"), campaign.get("selected_creator")]:
+        if uid:
+            await notify_user(uid, "Admin intervened in your deal", msg, link="/my-deals")
+    return {"message": "State transition forced", "from": before_status, "to": new_status}
+
+
+@api_router.post("/admin/deals/{campaign_id}/notes")
+async def admin_add_deal_note(campaign_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
+                              current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can add notes")
+    note_text = (data.get("note") or "").strip()
+    if not note_text:
+        raise HTTPException(status_code=400, detail="Note text is required")
+    note = {"note": note_text, "author": current_user.get("nickname"), "author_id": current_user.get("id"), "created_at": now_iso()}
+    await db.campaigns.update_one({"id": campaign_id}, {"$push": {"admin_notes": note}})
+    await log_admin_action(current_user, "deal.note_added", target_type="deal", target_id=campaign_id, after={"note": note_text}, request=request)
+    return {"message": "Note added", "note": note}
+
 
 app.include_router(categories_router)
 app.include_router(applications_router)

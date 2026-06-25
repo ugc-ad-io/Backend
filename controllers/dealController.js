@@ -240,7 +240,8 @@ exports.submitReceipt = async (req, res, next) => {
     if (!ctx) return;
     const { deal, viewerParty } = ctx;
     if (viewerParty !== 'creator') return fail(res, 403, 'Only the creator can confirm receipt');
-    if (deal.current_state !== S.AWAITING_RECEIPT)
+    // Accept from In Transit too (no courier webhook marks "delivered").
+    if (![S.AWAITING_RECEIPT, S.IN_TRANSIT].includes(deal.current_state))
       return fail(res, 409, `Action not allowed in state: ${deal.current_state}`);
 
     const { unboxing_video_url, items_damaged, damage_report, received_at } = req.body;
@@ -315,6 +316,30 @@ exports.submitContent = async (req, res, next) => {
     systemChat(deal, `Creator submitted content v${nextVersion} at ${timeLabel}.`);
 
     await deal.save();
+
+    // Mirror the submission onto the linked campaign so the brand's existing
+    // Work Review queue (campaign-based) surfaces it. Non-blocking.
+    try {
+      if (deal.campaign_id) {
+        const Campaign = require('../models/Campaign');
+        const camp = await Campaign.findById(deal.campaign_id);
+        if (camp) {
+          camp.status = 'work_submitted';
+          camp.work_submission = {
+            creator_id: String(deal.creator_id),
+            work_files: [video_url, thumbnail_url, caption_url, raw_footage_url].filter(Boolean),
+            description: creator_note || '',
+            status: 'pending_review',
+            submitted_at: new Date(),
+            deal_id: deal.deal_id,
+            version: nextVersion
+          };
+          camp.markModified('work_submission');
+          await camp.save();
+        }
+      }
+    } catch (e) { /* mirror is best-effort */ }
+
     res.json(sm.serializeDeal(deal, viewerParty));
   } catch (err) {
     next(err);

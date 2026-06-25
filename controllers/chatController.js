@@ -420,16 +420,32 @@ exports.createActionCard = async (req, res, next) => {
   }
 };
 
+// Amounts come from free-text card fields (e.g. "Rs. 2,222", "₹5000") so strip
+// everything that isn't a digit before Number() — otherwise currency symbols,
+// thousands commas, and the "." in "Rs." produce NaN or wrong values like 0.2222.
+// Budgets on this platform are whole rupees, so digit-only parsing is correct.
+function parseAmount(...vals) {
+  for (const v of vals) {
+    if (v === undefined || v === null || v === '') continue;
+    const digits = String(v).replace(/[^0-9]/g, '');
+    if (digits) {
+      const n = Number(digits);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  }
+  return 0;
+}
+
 async function createDealFromCard(card, sender, responder) {
   // sender = card creator, responder = acceptor
   let brand, creator, amount;
   if (card.type === 'private_invitation') {
-    brand = sender; creator = responder; amount = Number(card.fields.budget || 0);
+    brand = sender; creator = responder; amount = parseAmount(card.fields.budget);
   } else {
     // custom_offer / counter_offer originate from creator (or whoever); brand is the business party
     brand = sender.role === 'business' ? sender : responder;
     creator = sender.role === 'business' ? responder : sender;
-    amount = Number(card.fields.price || card.fields.modified_price || card.fields.budget || 0);
+    amount = parseAmount(card.fields.price, card.fields.modified_price, card.fields.budget);
   }
 
   const deal_id = `UGC-${Date.now().toString().slice(-7)}`;
@@ -481,7 +497,10 @@ exports.respondActionCard = async (req, res, next) => {
     let systemText = '';
     if (action === 'accept') {
       card.card_status = 'accepted';
-      if (['custom_offer', 'private_invitation', 'counter_offer'].includes(card.type)) {
+      if (card.type === 'private_invitation') {
+        // No deal yet — the brand posts the full brief next, which creates the deal.
+        systemText = `${responder.nickname} accepted the private invitation. ${sender?.nickname || 'The brand'} can now post the brief to start the deal.`;
+      } else if (['custom_offer', 'counter_offer'].includes(card.type)) {
         const deal = await createDealFromCard(card, sender, responder);
         card.deal_id = deal.deal_id;
         systemText = `${responder.nickname} accepted the ${card.type.replace(/_/g, ' ')}. Deal ${deal.deal_id} created.`;

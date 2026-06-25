@@ -19,13 +19,53 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     password: { type: String, required: true, select: false },
     role: { type: String, enum: ['creator', 'business', 'admin'], default: 'creator' },
+    // Admin sub-role / RBAC tier (PRD 11 — Role structure). Only meaningful when
+    // role === 'admin'. null on legacy admins is treated as 'founder' (see toSelf).
+    admin_role: { type: String, enum: ['founder', 'ops_senior', 'ops_regular', 'finance', null], default: null },
+    // Work distribution — categories this admin handles (Ops Regular sees only
+    // applications in these). Empty = no category queue. Founder/Senior see all.
+    assigned_categories: { type: [String], default: [] },
 
     nickname: { type: String, default: '' },
     full_name: { type: String, default: '' },
     profile_photo: { type: String, default: null },
     profile_completed: { type: Boolean, default: false },
-    approval_status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'approved' },
+    approval_status: { type: String, enum: ['pending', 'more_info', 'approved', 'rejected'], default: 'approved' },
+    // Admin review trail: { reason_code, reason_details, more_info_message, more_info_items[], requested_at, decided_at }
+    review: { type: mongoose.Schema.Types.Mixed, default: {} },
+    submitted_at: { type: Date, default: null }, // when onboarding was submitted (for SLA / oldest-first)
     active: { type: Boolean, default: true }, // false => suspended/deactivated (10.9)
+
+    // Admin moderation state (spec 11.10 — Users module actions)
+    banned: { type: Boolean, default: false },
+    ban_reason: { type: String, default: '' },
+    suspended_until: { type: Date, default: null },
+    suspension_reason: { type: String, default: '' },
+    warnings: {
+      type: [new mongoose.Schema({
+        message: { type: String, default: '' },
+        at: { type: Date, default: Date.now },
+        by: { type: String, default: '' }
+      }, { _id: false })],
+      default: []
+    },
+    level: { type: Number, default: 1 }, // V0.5: every creator is level 1 ('New')
+    is_pro: { type: Boolean, default: false }, // brand Pro upgrade (V2)
+    commission_rate: { type: Number, default: null }, // null => use platform default
+    payout_schedule: { type: String, default: 'weekly' }, // weekly | biweekly | monthly | on_request
+
+    // Onboarding handle + the FULL profile submitted on the signup form.
+    // Mixed so every field the form sends (creator: bio, tags, languages,
+    // social_links, rate_card, intro video, …; business: business_name,
+    // website, gstin, logo, industry, …) is persisted verbatim and shown in
+    // admin review.
+    username: { type: String, default: null },
+    public_creator_id: { type: String, default: null },
+    profile: { type: mongoose.Schema.Types.Mixed, default: {} },
+    portfolio: { type: mongoose.Schema.Types.Mixed, default: [] },
+    reviews: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    average_rating: { type: Number, default: 0 },
+    total_reviews: { type: Number, default: 0 },
 
     // Brand wallet — gate for chat initiation (10.2)
     wallet_balance: { type: Number, default: 0 },
@@ -68,12 +108,23 @@ userSchema.methods.toPublic = function () {
     user_id: this._id,
     email: this.email,
     role: this.role,
+    // Admins always resolve to a concrete sub-role; legacy admins default to founder.
+    admin_role: this.role === 'admin' ? (this.admin_role || 'founder') : null,
     nickname: this.nickname || this.full_name || this.email?.split('@')[0],
     full_name: this.full_name,
     profile_photo: this.profile_photo,
     profile_completed: this.profile_completed,
     approval_status: this.approval_status,
-    active: this.active
+    active: this.active,
+    admin_role: this.admin_role,
+    assigned_categories: this.assigned_categories || [],
+    username: this.username,
+    public_creator_id: this.public_creator_id,
+    profile: this.profile || {},
+    portfolio: this.portfolio || [],
+    review: this.review || {},
+    submitted_at: this.submitted_at,
+    created_at: this.createdAt
   };
 };
 

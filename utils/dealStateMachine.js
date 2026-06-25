@@ -290,8 +290,11 @@ function serializeDeal(deal, viewerParty = 'creator') {
       created_at: c.created_at
     })),
 
-    // Affordance flags consumed by both Deal Rooms
-    can_mark_received: viewerParty === 'creator' && state === S.AWAITING_RECEIPT && !exception,
+    // Affordance flags consumed by both Deal Rooms.
+    // Allow receipt confirmation while in transit too — there is no courier
+    // webhook to flip "In Transit" -> "Awaiting Receipt", so the creator's
+    // unboxing confirmation is the delivery signal.
+    can_mark_received: viewerParty === 'creator' && (state === S.AWAITING_RECEIPT || state === S.IN_TRANSIT) && !exception,
     can_submit_content:
       viewerParty === 'creator' && (state === S.IN_PROGRESS || state === S.REVISION_REQUESTED) && !exception,
     can_upload_tracking: viewerParty === 'brand' && state === S.AWAITING_SHIPMENT && !exception,
