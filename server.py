@@ -1910,7 +1910,15 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
             })
 
     campaign_details = {key: value for key, value in campaign.items() if key != 'bids'}
-    can_mark_received = bool(campaign.get('requires_shipment')) and normalized_shipment.get('courier_status') in ['delivered', 'shipped', 'in_transit'] and not normalized_receipt.get('received_at')
+    # Enable "Mark Received" whenever a real shipment exists and is shipped — not
+    # only when the requires_shipment flag is set (some briefs carry shipment data
+    # without the flag, which previously left the button permanently disabled).
+    _has_shipment_record = bool(
+        normalized_shipment.get('tracking_id')
+        or normalized_shipment.get('courier_status')
+        or normalized_shipment.get('required')
+    )
+    can_mark_received = _has_shipment_record and normalized_shipment.get('courier_status') in ['delivered', 'shipped', 'in_transit'] and not normalized_receipt.get('received_at')
     can_submit_content = viewer.get('role') == UserRole.CREATOR and creator['id'] == viewer['id'] and state['active_party'] == 'creator' and state['current_state'] in [
         "Received — Content in Progress",
         "Revision Requested"
@@ -6777,7 +6785,7 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(get
 
 @api_router.get("/admin/pending-campaigns")
 async def get_pending_campaigns(current_user: dict = Depends(get_current_user)):
-    if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
+    if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     campaigns = await db.campaigns.find(
@@ -7039,6 +7047,29 @@ async def ban_user(data: UserBanRequest, current_user: dict = Depends(get_curren
                            before={"banned": bool(user.get("banned"))}, after={"banned": data.banned},
                            reason=data.ban_reason)
     return {"message": f"User {action} successfully"}
+
+@api_router.delete("/admin/user/{user_id}")
+async def delete_user(user_id: str, current_user: dict = Depends(get_current_user)):
+    """Permanently delete a user."""
+    if current_user['role'] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Same guards as ban: never delete yourself or another admin.
+    if user_id == current_user['id']:
+        raise HTTPException(status_code=400, detail="Cannot delete yourself")
+    if user.get('role') == UserRole.ADMIN:
+        raise HTTPException(status_code=400, detail="Cannot delete admin users")
+
+    await db.users.delete_one({"id": user_id})
+
+    await log_admin_action(current_user, "user.deleted", target_type="user", target_id=user_id,
+                           before={"email": user.get("email"), "nickname": user.get("nickname"),
+                                   "role": user.get("role")}, after=None)
+    return {"message": "User deleted successfully"}
 
 @api_router.get("/admin/withdrawals")
 async def get_all_withdrawals(status: Optional[str] = None, current_user: dict = Depends(get_current_user)):

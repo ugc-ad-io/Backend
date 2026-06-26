@@ -688,6 +688,20 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleDeleteUser = async (u) => {
+    if (!window.confirm(
+      `Permanently delete ${u.nickname || u.email}? This cannot be undone.`
+    )) return;
+
+    try {
+      await axios.delete(`${API}/admin/user/${u.id}`);
+      toast.success('User deleted successfully');
+      fetchAllUsers();
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to delete user');
+    }
+  };
+
   const handleCreateGateway = () => {
     setSelectedGateway(null);
     setGatewayFormData({
@@ -1159,6 +1173,15 @@ export default function AdminDashboard() {
                             >
                               {u.banned ? 'Unban' : 'Ban'}
                             </button>
+                            {u.role !== 'admin' && (
+                              <button
+                                className="btn-delete-small"
+                                onClick={() => handleDeleteUser(u)}
+                                title="Delete user"
+                              >
+                                Delete
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>
