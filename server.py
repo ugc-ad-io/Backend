@@ -2007,7 +2007,7 @@ async def signup(data: SignupRequest):
 @api_router.post("/auth/login")
 async def login(data: LoginRequest, totp_token: Optional[str] = None):
     user = await db.users.find_one({"email": data.email}, {"_id": 0})
-    if not user or not verify_password(data.password, user['password']):
+    if not user or not user.get('password') or not verify_password(data.password, user['password']):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
     # Check if user is banned
@@ -2034,15 +2034,15 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
         if not totp.verify(totp_token, valid_window=1):
             raise HTTPException(status_code=401, detail="Invalid 2FA code")
     
-    token = create_token(user['id'], user['email'], user['role'])
+    token = create_token(user['id'], user.get('email', data.email), user.get('role'))
     return {
         "token": token,
-        "user_id": user['id'],
-        "nickname": user['nickname'],
+        "user_id": user.get('id'),
+        "nickname": user.get('nickname') or user.get('full_name') or user.get('username') or (user.get('email') or '').split('@')[0],
         "username": user.get('username'),
         "creator_code": user.get('creator_code'),
         "level": user.get('level'),
-        "role": user['role'],
+        "role": user.get('role'),
         "profile_completed": user.get('profile_completed', False),
         "approval_status": user.get('approval_status', ApprovalStatus.PENDING),
         "profile_photo": user.get('profile_photo')
