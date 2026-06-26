@@ -9295,6 +9295,24 @@ def _json_safe(obj):
     return str(obj)  # ObjectId, Decimal128, UUID, and any other exotic type
 
 
+# Globally teach FastAPI's JSON encoder to serialize BSON types so ANY endpoint
+# returning raw Mongo documents stops raising "Object of type X is not JSON
+# serializable" -> unhandled 500. This fixes every tab (creator/business/admin)
+# at once, not just the few endpoints patched with _json_safe above.
+try:
+    from fastapi.encoders import ENCODERS_BY_TYPE as _ENCODERS_BY_TYPE
+    from bson import ObjectId as _ObjectId
+    _ENCODERS_BY_TYPE[_ObjectId] = str
+    try:
+        from bson.decimal128 import Decimal128 as _Decimal128
+        _ENCODERS_BY_TYPE[_Decimal128] = lambda d: float(d.to_decimal())
+    except Exception:
+        pass
+    logger.info("Registered BSON JSON encoders (ObjectId, Decimal128)")
+except Exception as _enc_err:  # pragma: no cover
+    logger.warning("Could not register BSON JSON encoders: %s", _enc_err)
+
+
 from fastapi.responses import JSONResponse as _JSONResponse
 import traceback as _traceback
 
