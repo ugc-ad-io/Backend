@@ -9180,10 +9180,17 @@ class UploadsCORSMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(UploadsCORSMiddleware)
 
+# Browsers reject `Access-Control-Allow-Origin: *` together with
+# `Access-Control-Allow-Credentials: true`. With an explicit origin list, Starlette
+# echoes the exact request origin (e.g. https://www.ugcad.io) instead of '*', which
+# browsers accept. Override/extend via the CORS_ORIGINS env var (comma-separated).
+_DEFAULT_CORS_ORIGINS = "https://www.ugcad.io,https://ugcad.io,http://localhost:3000"
+_cors_origins = [o.strip() for o in os.environ.get('CORS_ORIGINS', _DEFAULT_CORS_ORIGINS).split(',') if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=_cors_origins,
+    allow_origin_regex=r"https://.*\.ugcad\.io",
     allow_methods=["*"],
     allow_headers=["*"],
 )
