@@ -7048,9 +7048,44 @@ async def ban_user(data: UserBanRequest, current_user: dict = Depends(get_curren
                            reason=data.ban_reason)
     return {"message": f"User {action} successfully"}
 
+# Every field name across the DB that points at a user id. Used to cascade-delete
+# all of a user's data. Extra fields a given collection doesn't have are harmless
+# (they simply won't match), so one broad $or works for every collection.
+USER_REF_FIELDS = [
+    "user_id", "creator_id", "business_id", "brand_id",
+    "sender_id", "recipient_id", "other_user_id",
+    "user1_id", "user2_id", "reviewer_id", "reviewee_id",
+    "reported_user_id", "reporter_id", "target_user_id",
+    "member_id", "public_creator_id", "banned_by",
+]
+
+# Collections that hold per-user data. Global config (business_settings,
+# payment_gateways, payout_ranges, platform_settings, …) and the admin audit log
+# (admin_logs) are deliberately excluded.
+USER_DATA_COLLECTIONS = [
+    "campaigns", "escrow", "payment_transactions", "chat_action_cards",
+    "work_submissions", "messages", "shipments", "disputes", "withdrawals",
+    "violations", "in_app_notifications", "deal_action_cards",
+    "deal_content_submissions", "chat_strikes", "business_team_members",
+    "wallet_ledger", "invoices", "deal_messages", "reviews", "late_offenses",
+    "payout_receipts", "deal_activity", "chat_pauses", "user_reports",
+    "uploaded_files", "notification_logs", "deal_receipts", "user_sessions",
+    "private_invitations", "match_events", "deal_revision_responses",
+    "chat_typing", "chat_false_positive_reviews", "brand_penalties",
+    "campaign_views", "reviews",
+]
+
+# Collections keyed by campaign_id rather than directly by user. When a brand is
+# deleted we also remove the children of every campaign they own.
+CAMPAIGN_CHILD_COLLECTIONS = [
+    "escrow", "shipments", "work_submissions", "disputes", "deal_action_cards",
+    "deal_activity", "deal_receipts", "deal_content_submissions", "reviews",
+    "deal_messages", "campaign_views", "deal_revision_responses",
+]
+
 @api_router.delete("/admin/user/{user_id}")
 async def delete_user(user_id: str, current_user: dict = Depends(get_current_user)):
-    """Permanently delete a user."""
+    """Permanently delete a user and ALL of their data (cascade)."""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
 
@@ -7064,12 +7099,46 @@ async def delete_user(user_id: str, current_user: dict = Depends(get_current_use
     if user.get('role') == UserRole.ADMIN:
         raise HTTPException(status_code=400, detail="Cannot delete admin users")
 
+    deleted = {}
+
+    def _add(coll, count):
+        if count:
+            deleted[coll] = deleted.get(coll, 0) + count
+
+    # 1) Campaign ids this user owns (as a brand), so we can clean their children.
+    campaign_ids = [
+        c["id"] async for c in
+        db.campaigns.find({"business_id": user_id}, {"_id": 0, "id": 1})
+    ]
+
+    # 2) Delete everything that references the user directly.
+    user_query = {"$or": [{f: user_id} for f in USER_REF_FIELDS]}
+    for coll in set(USER_DATA_COLLECTIONS):
+        res = await db[coll].delete_many(user_query)
+        _add(coll, res.deleted_count)
+
+    # 3) Delete the children of any campaigns this user owned.
+    if campaign_ids:
+        child_query = {"campaign_id": {"$in": campaign_ids}}
+        for coll in set(CAMPAIGN_CHILD_COLLECTIONS):
+            res = await db[coll].delete_many(child_query)
+            _add(coll, res.deleted_count)
+
+    # 4) Pull the user's leftover bids out of OTHER brands' campaigns.
+    await db.campaigns.update_many(
+        {"bids.creator_id": user_id},
+        {"$pull": {"bids": {"creator_id": user_id}}}
+    )
+
+    # 5) Finally remove the user record itself.
     await db.users.delete_one({"id": user_id})
+    _add("users", 1)
 
     await log_admin_action(current_user, "user.deleted", target_type="user", target_id=user_id,
                            before={"email": user.get("email"), "nickname": user.get("nickname"),
-                                   "role": user.get("role")}, after=None)
-    return {"message": "User deleted successfully"}
+                                   "role": user.get("role")},
+                           after={"cascade_deleted": deleted})
+    return {"message": "User and all related data deleted successfully", "deleted": deleted}
 
 @api_router.get("/admin/withdrawals")
 async def get_all_withdrawals(status: Optional[str] = None, current_user: dict = Depends(get_current_user)):
