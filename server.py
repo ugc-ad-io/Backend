@@ -4063,7 +4063,7 @@ async def get_campaigns(
             normalized['completion_percentage'] = get_campaign_completion_percentage(normalized)
         normalized_campaigns.append(normalized)
     
-    return normalized_campaigns
+    return _json_safe(normalized_campaigns)
 
 @api_router.get("/campaigns/{campaign_id}")
 async def get_campaign(campaign_id: str, current_user: dict = Depends(get_current_user)):
@@ -6792,8 +6792,8 @@ async def get_pending_campaigns(current_user: dict = Depends(get_current_user)):
         {"status": CampaignStatus.PENDING_APPROVAL},
         {"_id": 0}
     ).to_list(1000)
-    
-    return campaigns
+
+    return _json_safe(campaigns)
 
 @api_router.post("/admin/approve-campaign")
 async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(get_current_user)):
@@ -6955,7 +6955,7 @@ async def get_all_users(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Admin access required")
     
     users = await db.users.find({}, {"_id": 0, "password": 0}).to_list(1000)
-    return users
+    return _json_safe(users)
 
 @api_router.get("/admin/user/{user_id}")
 async def get_user_details(user_id: str, current_user: dict = Depends(get_current_user)):
@@ -9276,6 +9276,24 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def _json_safe(obj):
+    """Recursively coerce Mongo/BSON values (ObjectId, Decimal128, datetime, bytes,
+    etc.) into JSON-serializable primitives so returning raw documents can't raise
+    'Object of type X is not JSON serializable' -> unhandled 500."""
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, bytes):
+        return obj.decode('utf-8', 'replace')
+    if hasattr(obj, 'isoformat'):  # datetime / date
+        return obj.isoformat()
+    return str(obj)  # ObjectId, Decimal128, UUID, and any other exotic type
+
 
 from fastapi.responses import JSONResponse as _JSONResponse
 import traceback as _traceback
