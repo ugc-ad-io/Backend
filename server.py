@@ -9277,6 +9277,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+from fastapi.responses import JSONResponse as _JSONResponse
+import traceback as _traceback
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    """Catch-all so unhandled errors (a) carry CORS headers — otherwise the browser
+    reports a misleading 'CORS policy' error instead of the real 500 — and (b) surface
+    the actual cause for debugging."""
+    try:
+        logger.error("Unhandled error on %s:\n%s", request.url.path, _traceback.format_exc())
+    except Exception:
+        pass
+    origin = request.headers.get("origin") or "*"
+    return _JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "error": str(exc),
+            "type": type(exc).__name__,
+            "path": str(request.url.path),
+        },
+        headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Vary": "Origin",
+        },
+    )
+
+
 @app.on_event("startup")
 async def startup_initialization():
     """Initialize default data collections."""
