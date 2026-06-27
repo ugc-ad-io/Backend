@@ -116,7 +116,38 @@ app.get('/api/business/creator-directory', auth, async (req, res) => {
   try {
     const User = require('./models/User');
     const creators = await User.find({ role: 'creator', approval_status: 'approved' }).lean();
-    res.json(creators.map(u => ({ id: u._id, nickname: u.nickname, email: u.email, profile_photo: u.profile_photo })));
+    // Pull the first usable media URL out of a portfolio (items may be strings or objects).
+    const pickMedia = (arr) => {
+      for (const it of (arr || [])) {
+        if (!it) continue;
+        if (typeof it === 'string') { if (/^https?:|^\//.test(it)) return it; continue; }
+        const u = it.url || it.video || it.videoUrl || it.link || (Array.isArray(it.urls) && it.urls[0]) || '';
+        if (u) return u;
+      }
+      return '';
+    };
+    res.json(creators.map(u => {
+      const p = u.profile || {};
+      const portfolio = (u.portfolio && u.portfolio.length ? u.portfolio : null) || p.portfolio_items || p.portfolio || [];
+      const preview = pickMedia(portfolio);
+      // Public website username/handle the admin assigns — never the creator's real name.
+      const resolvedName = (u.nickname || '').trim()
+        || (u.username ? `@${u.username}` : '')
+        || (u.public_creator_id || '') || 'Creator';
+      return {
+        id: u._id,
+        name: resolvedName,
+        nickname: u.nickname,
+        full_name: u.full_name || p.name || p.full_name || '',
+        username: u.username,
+        email: u.email,
+        public_creator_id: u.public_creator_id,
+        profile_photo: u.profile_photo,
+        primary_category: u.category || p.category || p.niche || '',
+        portfolio_preview: preview,
+        premium: Boolean(preview) && /\.(mp4|webm|mov|m4v)$/i.test(String(preview).split('?')[0]),
+      };
+    }));
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
