@@ -574,7 +574,7 @@ VIDEO_MAX_BYTES = 50 * 1024 * 1024
 MAX_IMAGES_PER_CHAT_MESSAGE = 5
 MAX_VIDEO_SECONDS = 30
 
-IMAGE_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/gif"}
+IMAGE_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"}
 PDF_CONTENT_TYPES = {"application/pdf"}
 VIDEO_CONTENT_TYPES = {"video/mp4", "video/quicktime", "video/webm", "video/x-msvideo", "video/mpeg", "video/3gpp", "video/x-matroska"}
 CONTACT_URL_DOMAINS = ["wa.me", "t.me", "telegram.me", "linktr.ee", "linktree", "about.me", "beacons.ai", "carrd.co"]
@@ -601,7 +601,7 @@ def thread_key_for(user_id: str, other_user_id: str) -> str:
 
 def get_attachment_kind(content_type: Optional[str], filename: str = "") -> str:
     lower_name = (filename or "").lower()
-    if content_type in IMAGE_CONTENT_TYPES or lower_name.endswith((".jpg", ".jpeg", ".png", ".gif")):
+    if content_type in IMAGE_CONTENT_TYPES or lower_name.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
         return "image"
     if content_type in PDF_CONTENT_TYPES or lower_name.endswith(".pdf"):
         return "pdf"
@@ -2798,6 +2798,39 @@ async def upload_profile_photo(file: UploadFile = File(...), current_user: dict 
         return {"photo_url": photo_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload photo: {str(e)}")
+
+
+@api_router.post("/profile/upload-banner")
+async def upload_profile_banner(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    """Upload the creator's profile banner. Mirrors /profile/upload-photo: validates,
+    saves the file, and stores the URL on the user in a single step."""
+    upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))) / "banners"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    allowed_types = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp', 'image/gif']
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Only image files are allowed for banners")
+
+    file_ext = Path(file.filename).suffix
+    unique_filename = f"banner_{current_user['id']}{file_ext}"
+    file_path = upload_dir / unique_filename
+
+    try:
+        content = await file.read()
+        with open(file_path, 'wb') as f:
+            f.write(content)
+
+        banner_url = f"/uploads/banners/{unique_filename}"
+        await db.users.update_one(
+            {"id": current_user['id']},
+            {"$set": {
+                "banner": banner_url,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+        return {"banner": banner_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload banner: {str(e)}")
 
 @api_router.put("/profile/update-info")
 async def update_profile_info(bio: Optional[str] = None, description: Optional[str] = None, current_user: dict = Depends(get_current_user)):

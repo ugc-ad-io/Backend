@@ -304,6 +304,17 @@ class ShipmentReceive(BaseModel):
     items_damaged: bool = False
     dispute_reason: Optional[str] = None
 
+class ShippingAddressSubmit(BaseModel):
+    campaign_id: Optional[str] = None  # when set, checks if both parties' addresses are in
+    full_name: str
+    phone: str
+    line1: str
+    line2: Optional[str] = ""
+    city: str
+    state: str
+    pincode: str
+    country: str = "India"
+
 class WithdrawalRequest(BaseModel):
     amount: float
     payment_method: str
@@ -642,7 +653,7 @@ VIDEO_MAX_BYTES = 150 * 1024 * 1024
 MAX_IMAGES_PER_CHAT_MESSAGE = 5
 MAX_VIDEO_SECONDS = 120
 
-IMAGE_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/gif"}
+IMAGE_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"}
 PDF_CONTENT_TYPES = {"application/pdf"}
 VIDEO_CONTENT_TYPES = {"video/mp4", "video/quicktime", "video/webm", "video/x-msvideo", "video/mpeg", "video/3gpp", "video/x-matroska"}
 CONTACT_URL_DOMAINS = ["wa.me", "t.me", "telegram.me", "linktr.ee", "linktree", "about.me", "beacons.ai", "carrd.co"]
@@ -669,7 +680,7 @@ def thread_key_for(user_id: str, other_user_id: str) -> str:
 
 def get_attachment_kind(content_type: Optional[str], filename: str = "") -> str:
     lower_name = (filename or "").lower()
-    if content_type in IMAGE_CONTENT_TYPES or lower_name.endswith((".jpg", ".jpeg", ".png", ".gif")):
+    if content_type in IMAGE_CONTENT_TYPES or lower_name.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
         return "image"
     if content_type in PDF_CONTENT_TYPES or lower_name.endswith(".pdf"):
         return "pdf"
@@ -1620,6 +1631,8 @@ def normalize_revision_tracker(work: Optional[dict], response: Optional[dict]) -
         "next_revision_fee": cf.revision_fee_for(used),
         "latest_feedback": latest.get('feedback'),
         "requested_changes": requested_changes or [],
+        "items": latest.get('items') or [],
+        "notes": latest.get('notes') or '',
         "new_deadline_at": latest.get('new_deadline_at'),
         "creator_response": (response or {}).get('response')
     }
@@ -2172,7 +2185,14 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
         "deliverables_completed": deliverables_completed,
         "portfolio_preview": portfolio_preview or "",
         "content_style": first_non_empty(creator.get("content_style"), profile.get("content_style")) or "",
-        "budget_range": first_non_empty(creator.get("budget_range"), profile.get("budget_range")) or "",
+        "budget_range": first_non_empty(
+            creator.get("budget_range"),
+            profile.get("budget_range"),
+            (profile.get("rate_card") or {}).get("expected_payout"),
+            profile.get("expectedPayout"),
+        ) or "",
+        "level": cf.normalize_level(creator.get("level")),
+        "level_label": cf.CREATOR_LEVELS[cf.normalize_level(creator.get("level"))]["label"],
     }
 
 def creator_matches_directory_filters(creator: dict, category: Optional[str], language: Optional[str], region: Optional[str], style: Optional[str], budget: Optional[str]) -> bool:
@@ -2957,7 +2977,7 @@ async def get_business_settings_billing(current_user: dict = Depends(get_current
     )
     return {
         "plan_name": billing.get("plan_name", "Pro"),
-        "commission_rate": billing.get("commission_rate", 10),
+        "commission_rate": billing.get("commission_rate", 20),
         "next_billing_date": billing.get("next_billing_date"),
         "monthly_budget_used": monthly_budget_used,
         "monthly_budget_limit": billing.get("monthly_budget_limit", 0),
@@ -3251,6 +3271,52 @@ async def upload_profile_photo(file: UploadFile = File(...), current_user: dict 
         return {"photo_url": photo_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload photo: {str(e)}")
+
+
+@api_router.post("/profile/upload-banner")
+async def upload_profile_banner(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    """Upload the creator's profile banner. Mirrors /profile/upload-photo: validates,
+    persists the file, and saves the URL on the user in a single step."""
+    upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))) / "banners"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    allowed_types = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp', 'image/gif']
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Only image files are allowed for banners")
+
+    file_ext = Path(file.filename).suffix
+    unique_filename = f"banner_{current_user['id']}{file_ext}"
+
+    try:
+        content = await file.read()
+        banner_url = persist_file(
+            content,
+            unique_filename,
+            kind="image",
+            local_dir=upload_dir,
+            public_path=f"/uploads/banners/{unique_filename}",
+            cloud_folder="ugcad/banners",
+        )
+        await db.users.update_one(
+            {"id": current_user['id']},
+            {"$set": {
+                "banner": banner_url,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+        return {"banner": banner_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload banner: {str(e)}")
+
+@api_router.patch("/profile/banner")
+async def update_profile_banner(payload: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+    """Set the creator's profile banner image URL. Does not affect approval status."""
+    banner = (payload or {}).get("banner") or ""
+    await db.users.update_one(
+        {"id": current_user['id']},
+        {"$set": {"banner": banner, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    return {"banner": banner}
 
 @api_router.put("/profile/update-info")
 async def update_profile_info(
@@ -4110,7 +4176,17 @@ async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Dep
         {"id": campaign_id},
         {"$push": {"bids": bid_doc}}
     )
-    
+
+    # Notify the brand that a creator has bid on their campaign.
+    if campaign.get("business_id"):
+        await notify_user(
+            campaign["business_id"],
+            "New bid on your campaign",
+            f"{current_user.get('nickname', 'A creator')} placed a bid of ₹{int(data.amount or 0):,} on '{campaign.get('title', 'your campaign')}'.",
+            link="/dashboard/business/pending-bids",
+            ntype="info",
+        )
+
     return {"message": "Bid submitted successfully"}
 
 @api_router.get("/bids/my")
@@ -4281,7 +4357,16 @@ You can now communicate directly with {creator['nickname']} to coordinate the wo
         "created_by": "system"
     }
     await db.in_app_notifications.insert_one(notification_doc)
-    
+
+    # Notify the brand that their payment is now held in escrow.
+    await notify_user(
+        current_user['id'],
+        "Payment held in escrow",
+        f"₹{int(deal_amount):,} for '{campaign['title']}' is now held in escrow. It's released to {creator['nickname']} once you approve their work.",
+        link="/dashboard/business/wallet",
+        ntype="success",
+    )
+
     return {
         "message": "Creator selected and payment held in escrow",
         "creator_id": creator_id,
@@ -5241,6 +5326,16 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
     await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", "Content was submitted for brand review.")
     await insert_deal_system_message(campaign, "Content was submitted and is awaiting brand review.")
 
+    # Notify the brand that content is ready for review.
+    if campaign.get("business_id"):
+        await notify_user(
+            campaign["business_id"],
+            "Content submitted for review",
+            f"{current_user.get('nickname', 'The creator')} submitted content for '{campaign.get('title', 'your campaign')}'. Review it to release payment.",
+            link="/dashboard/business/work-review",
+            ntype="info",
+        )
+
     return {"message": "Work submitted successfully"}
 
 def deal_deadline_iso(campaign: dict) -> Optional[str]:
@@ -5653,18 +5748,45 @@ async def apply_brand_penalty(data: BrandPenaltyApply, current_user: dict = Depe
     return {"message": "Penalty applied", "business_id": data.business_id, "penalty_type": data.penalty_type, "amount": amount}
 
 
+class RevisionItemIn(BaseModel):
+    description: str
+    severity: Optional[str] = "must-fix"     # must-fix | preference
+    brief_reference: Optional[str] = ""
+
+class RevisionRequestIn(BaseModel):
+    items: List[RevisionItemIn] = []
+    notes: Optional[str] = ""
+    deadline_at: Optional[str] = None
+    feedback: Optional[str] = ""             # legacy free-text fallback
+
 @api_router.post("/work/{work_id}/request-revision")
-async def request_revision(work_id: str, feedback: str, current_user: dict = Depends(get_current_user)):
+async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), current_user: dict = Depends(get_current_user)):
     work = await db.work_submissions.find_one({"id": work_id})
     if not work:
         raise HTTPException(status_code=404, detail="Work not found")
-    
+
     campaign = await db.campaigns.find_one({"id": work['campaign_id']})
     if campaign['business_id'] != current_user['id']:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     # PRD 9.3: no revision requests while a dispute is open.
     await ensure_not_disputed(work['campaign_id'])
+
+    # PRD 8.5: structured revision items (1-5), each with severity + optional brief ref.
+    # Fall back to legacy free-text feedback if no items were sent.
+    items = [it.dict() for it in (data.items or [])]
+    if items:
+        if not 1 <= len(items) <= 5:
+            raise HTTPException(status_code=400, detail="Provide 1 to 5 revision items.")
+        feedback = "\n".join(
+            f"[{(it.get('severity') or 'must-fix')}] {it.get('description', '')}"
+            + (f" (ref: {it['brief_reference']})" if it.get('brief_reference') else "")
+            for it in items
+        )
+    else:
+        feedback = (data.feedback or "").strip()
+        if not feedback:
+            raise HTTPException(status_code=400, detail="Add at least one revision item.")
 
     # PRD 8.5: hard maximum of 5 revisions per deliverable, then admin must step in.
     used = len(work.get('revisions') or [])
@@ -5699,6 +5821,10 @@ async def request_revision(work_id: str, feedback: str, current_user: dict = Dep
 
     revision = {
         "feedback": feedback,
+        "items": items,
+        "notes": (data.notes or "")[:500],
+        "requested_changes": [it.get("description", "") for it in items] if items else [l.strip() for l in feedback.splitlines() if l.strip()],
+        "new_deadline_at": data.deadline_at,
         "requested_at": datetime.now(timezone.utc).isoformat(),
         "index": used + 1,
         "paid": paid,
@@ -6594,13 +6720,58 @@ async def get_shipment(campaign_id: str, current_user: dict = Depends(get_curren
         raise HTTPException(status_code=404, detail="Shipment not found")
     return shipment
 
+
+@api_router.post("/shipping/address")
+async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict = Depends(get_current_user)):
+    """Brand (pickup) or creator (delivery) saves their address for a shipment.
+    Stored on the user's profile.address — the admin shipping queue reads it from there.
+    When both parties' addresses are present, the deal is flagged ready-to-dispatch
+    and the ops team is notified to print a label and ship it."""
+    address = {
+        "full_name": data.full_name, "phone": data.phone,
+        "line1": data.line1, "line2": data.line2 or "",
+        "city": data.city, "state": data.state, "pincode": data.pincode,
+        "country": data.country or "India", "updated_at": now_iso(),
+    }
+    await db.users.update_one({"id": current_user["id"]}, {"$set": {"profile.address": address}})
+
+    both_ready = False
+    if data.campaign_id:
+        campaign = await db.campaigns.find_one({"id": data.campaign_id}, {"_id": 0})
+        if campaign and campaign.get("requires_shipment"):
+            is_party = current_user["id"] in [campaign.get("business_id"), campaign.get("selected_creator")]
+            if not is_party:
+                raise HTTPException(status_code=403, detail="Not a party to this deal")
+            brand = await db.users.find_one({"id": campaign.get("business_id")}, {"_id": 0, "profile": 1}) or {}
+            creator = await db.users.find_one({"id": campaign.get("selected_creator")}, {"_id": 0, "profile": 1}) or {}
+            brand_addr = (brand.get("profile") or {}).get("address")
+            creator_addr = (creator.get("profile") or {}).get("address")
+            sh = await db.shipments.find_one({"campaign_id": data.campaign_id}, {"_id": 0}) or {}
+            in_flight = (sh.get("status") or sh.get("courier_status")) in ["shipped", "in_transit", "delivered", "received"]
+            both_ready = bool(brand_addr and creator_addr)
+            if both_ready and not in_flight:
+                await db.shipments.update_one(
+                    {"campaign_id": data.campaign_id},
+                    {"$set": {"status": "awaiting_dispatch", "courier_status": "awaiting_dispatch",
+                              "addresses_ready_at": now_iso(), "updated_at": now_iso()}},
+                    upsert=True,
+                )
+                await notify_admins(
+                    "Shipment ready to dispatch",
+                    f"Both addresses are in for '{campaign.get('title', 'a deal')}'. Print a label and ship it.",
+                    link="/dashboard/admin/shipping",
+                )
+                await insert_deal_system_message(campaign, "Both shipping addresses received. The platform team will dispatch the product shortly.")
+
+    return {"message": "Address saved", "address": address, "both_ready": both_ready}
+
 # Withdrawal Routes
-PLATFORM_COMMISSION_PERCENT = 25  # Legacy single-rate constant (kept for reporting).
+PLATFORM_COMMISSION_PERCENT = 20  # Legacy single-rate constant (kept for reporting).
 
 # Two-sided platform commission. The brand fee is charged ON TOP of the deal value
 # when the brand funds; the creator fee is DEDUCTED from the creator's payout.
 BRAND_COMMISSION_PERCENT = 20
-CREATOR_COMMISSION_PERCENT = 10
+CREATOR_COMMISSION_PERCENT = 20
 
 
 def brand_commission(amount) -> float:
@@ -9205,7 +9376,7 @@ upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads")))
 upload_dir.mkdir(exist_ok=True)
 
 _GATED_VIDEO_EXTS = (".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv")
-_PUBLIC_UPLOAD_PREFIXES = ("profiles/", "business_logos/", "campaigns/", "watermarked/")
+_PUBLIC_UPLOAD_PREFIXES = ("profiles/", "banners/", "business_logos/", "campaigns/", "watermarked/")
 
 
 def _uploads_viewer(request: Request) -> Optional[dict]:

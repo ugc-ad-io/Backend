@@ -1494,6 +1494,17 @@ app.post('/api/profile/upload-photo', auth, (req, res) => photoUpload(req, res, 
   } catch (e) { res.status(500).json({ detail: e.message }); }
 }));
 
+app.post('/api/profile/upload-banner', auth, (req, res) => photoUpload(req, res, async (err) => {
+  if (err) return res.status(400).json({ detail: err.message });
+  try {
+    const file = (req.files && req.files[0]) || null;
+    if (!file) return res.status(400).json({ detail: 'No file uploaded' });
+    const url = `/uploads/${file.filename}`;
+    await User.findByIdAndUpdate(req.user.id, { $set: { banner: url } });
+    res.json({ banner: url, file_url: url });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+}));
+
 app.get('/api/profile/2fa/status', auth, (req, res) => res.json({ enabled: false }));
 app.post('/api/profile/2fa/setup', auth, (req, res) => res.status(501).json({ detail: 'Two-factor auth is not available on this server yet' }));
 app.post('/api/profile/2fa/verify', auth, (req, res) => res.status(501).json({ detail: 'Two-factor auth is not available on this server yet' }));

@@ -29,6 +29,7 @@ const userSchema = new mongoose.Schema(
     nickname: { type: String, default: '' },
     full_name: { type: String, default: '' },
     profile_photo: { type: String, default: null },
+    banner: { type: String, default: null },
     profile_completed: { type: Boolean, default: false },
     approval_status: { type: String, enum: ['pending', 'more_info', 'approved', 'rejected'], default: 'approved' },
     // Admin review trail: { reason_code, reason_details, more_info_message, more_info_items[], requested_at, decided_at }
@@ -113,6 +114,7 @@ userSchema.methods.toPublic = function () {
     nickname: this.nickname || this.full_name || this.email?.split('@')[0],
     full_name: this.full_name,
     profile_photo: this.profile_photo,
+    banner: this.banner,
     profile_completed: this.profile_completed,
     approval_status: this.approval_status,
     active: this.active,
