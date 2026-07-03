@@ -143,7 +143,8 @@ app.get('/api/business/creator-directory', auth, async (req, res) => {
         email: u.email,
         public_creator_id: u.public_creator_id,
         profile_photo: u.profile_photo,
-        primary_category: u.category || p.category || p.niche || '',
+        primary_category: u.category || p.category || p.niche
+          || (Array.isArray(p.tags) && p.tags[0]) || (Array.isArray(p.skills) && p.skills[0]) || '',
         portfolio_preview: preview,
         premium: Boolean(preview) && /\.(mp4|webm|mov|m4v)$/i.test(String(preview).split('?')[0]),
       };

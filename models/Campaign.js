@@ -19,6 +19,13 @@ const campaignSchema = new mongoose.Schema({
   shipment: { type: mongoose.Schema.Types.Mixed, default: null },
   shortlist_invites: { type: [String], default: [] },
   due_date: { type: Date, default: null }
-}, { timestamps: true });
+}, {
+  timestamps: true,
+  // The "Post a Brief" wizard sends ~50 structured fields (product_description,
+  // campaign_hook, deliverable_items, usage_platforms, required_phrases, etc.).
+  // strict:false persists all of them so a brief can be duplicated 1:1 — without
+  // this, Mongoose silently drops every field not declared above.
+  strict: false,
+});
 
 module.exports = mongoose.model('Campaign', campaignSchema);
