@@ -3318,6 +3318,23 @@ async def update_profile_banner(payload: Dict[str, Any] = Body(...), current_use
     )
     return {"banner": banner}
 
+
+@api_router.post("/profile/deactivate")
+async def deactivate_profile(current_user: dict = Depends(get_current_user)):
+    """Self-deactivate: hide the account (active: False). Reactivated on next login."""
+    await db.users.update_one(
+        {"id": current_user['id']},
+        {"$set": {"active": False, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    return {"message": "Account deactivated"}
+
+
+@api_router.delete("/profile")
+async def delete_profile(current_user: dict = Depends(get_current_user)):
+    """Permanently delete the signed-in user's account."""
+    await db.users.delete_one({"id": current_user['id']})
+    return {"message": "Account deleted"}
+
 @api_router.put("/profile/update-info")
 async def update_profile_info(
     bio: Optional[str] = None,

@@ -1506,6 +1506,22 @@ app.post('/api/profile/upload-banner', auth, (req, res) => photoUpload(req, res,
   } catch (e) { res.status(500).json({ detail: e.message }); }
 }));
 
+// Deactivate: hide the account (active:false). Reactivated on next login.
+app.post('/api/profile/deactivate', auth, async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(req.user.id, { $set: { active: false } });
+    res.json({ message: 'Account deactivated' });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+// Delete: permanently remove the account.
+app.delete('/api/profile', auth, async (req, res) => {
+  try {
+    await User.findByIdAndDelete(req.user.id);
+    res.json({ message: 'Account deleted' });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
 app.get('/api/profile/2fa/status', auth, (req, res) => res.json({ enabled: false }));
 app.post('/api/profile/2fa/setup', auth, (req, res) => res.status(501).json({ detail: 'Two-factor auth is not available on this server yet' }));
 app.post('/api/profile/2fa/verify', auth, (req, res) => res.status(501).json({ detail: 'Two-factor auth is not available on this server yet' }));

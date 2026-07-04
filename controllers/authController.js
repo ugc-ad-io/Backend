@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const { MIN_CHAT_BALANCE } = require('../utils/chatPolicy');
 
@@ -6,6 +7,31 @@ const fail = (res, status, detail) => res.status(status).json({ detail });
 
 // Email that is always the platform founder (PRD 11 — Role structure).
 const FOUNDER_EMAIL = (process.env.FOUNDER_EMAIL || 'admin@gmail.com').toLowerCase();
+
+// Google Sign-In verifier. Client id must match the frontend's OAuth client.
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
+
+// Enforce ban / deactivation / suspension on an authenticated user (shared by
+// login + Google sign-in). Returns a failure response when blocked, else null.
+function enforceAccountState(res, user) {
+  if (process.env.ENFORCE_BANS !== 'true') return null;
+  if (user.banned) return fail(res, 403, user.ban_reason ? `Your account has been banned: ${user.ban_reason}` : 'Your account has been banned. Contact support.');
+  if (user.active === false) return fail(res, 403, 'Your account has been deactivated. Contact support.');
+  if (user.suspended_until && new Date(user.suspended_until) > new Date()) {
+    return fail(res, 403, `Your account is suspended until ${new Date(user.suspended_until).toLocaleDateString()}.`);
+  }
+  return null;
+}
+
+// The founder account is always admin + founder — self-heal on any login path.
+async function healFounder(user) {
+  if (user.email === FOUNDER_EMAIL && (user.role !== 'admin' || user.admin_role !== 'founder')) {
+    user.role = 'admin';
+    user.admin_role = 'founder';
+    await user.save();
+  }
+}
 
 function signToken(user) {
   return jwt.sign(
@@ -44,24 +70,74 @@ exports.login = async (req, res, next) => {
     const user = await User.findOne({ email: email.toLowerCase() }).select('+password');
     if (!user || !(await user.comparePassword(password))) return fail(res, 401, 'Invalid email or password');
 
-    // Block banned / deactivated / suspended accounts from logging in.
-    // Toggle: enforcement is OFF unless ENFORCE_BANS=true (temporarily disabled).
-    if (process.env.ENFORCE_BANS === 'true') {
-      if (user.banned) return fail(res, 403, user.ban_reason ? `Your account has been banned: ${user.ban_reason}` : 'Your account has been banned. Contact support.');
-      if (user.active === false) return fail(res, 403, 'Your account has been deactivated. Contact support.');
-      if (user.suspended_until && new Date(user.suspended_until) > new Date()) {
-        return fail(res, 403, `Your account is suspended until ${new Date(user.suspended_until).toLocaleDateString()}.`);
-      }
-    }
-
-    // The founder account is always admin + founder — self-heal on login.
-    if (user.email === FOUNDER_EMAIL && (user.role !== 'admin' || user.admin_role !== 'founder')) {
-      user.role = 'admin';
-      user.admin_role = 'founder';
+    // Self-deactivated accounts (active:false, not banned/suspended) reactivate on
+    // successful login — matches the "Reactivate anytime by logging in" promise.
+    if (user.active === false && !user.banned && (!user.suspended_until || new Date(user.suspended_until) <= new Date())) {
+      user.active = true;
       await user.save();
     }
 
+    // Block banned / deactivated / suspended accounts from logging in.
+    // Toggle: enforcement is OFF unless ENFORCE_BANS=true (temporarily disabled).
+    const blocked = enforceAccountState(res, user);
+    if (blocked) return blocked;
+
+    await healFounder(user);
+
     res.json({ token: signToken(user), ...user.toSelf() });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// POST /api/auth/google { credential, role? }
+// `credential` is the Google ID token (JWT) returned by Google Identity Services
+// on the client. We verify it with Google, then find-or-create the local user
+// and issue our own JWT — same shape as login/signup so the client is unchanged.
+exports.googleAuth = async (req, res, next) => {
+  try {
+    if (!GOOGLE_CLIENT_ID) return fail(res, 500, 'Google sign-in is not configured on the server');
+    const { credential, role } = req.body;
+    if (!credential) return fail(res, 400, 'Missing Google credential');
+
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_ID });
+      payload = ticket.getPayload();
+    } catch (e) {
+      return fail(res, 401, 'Invalid or expired Google credential');
+    }
+    if (!payload || !payload.email) return fail(res, 401, 'Google account has no email');
+    if (payload.email_verified === false) return fail(res, 403, 'Your Google email is not verified');
+
+    const email = payload.email.toLowerCase();
+    let user = await User.findOne({ email });
+    let created = false;
+
+    if (!user) {
+      // New account — role comes from the signup role selector (default creator).
+      user = await User.create({
+        email,
+        role: ['creator', 'business', 'admin'].includes(role) ? role : 'creator',
+        google_id: payload.sub,
+        auth_provider: 'google',
+        nickname: payload.name || email.split('@')[0],
+        full_name: payload.name || '',
+        profile_photo: payload.picture || null
+      });
+      created = true;
+    } else if (!user.google_id) {
+      // Existing local account with the same email — link the Google identity.
+      user.google_id = payload.sub;
+      if (!user.profile_photo && payload.picture) user.profile_photo = payload.picture;
+      await user.save();
+    }
+
+    await healFounder(user);
+    const blocked = enforceAccountState(res, user);
+    if (blocked) return blocked;
+
+    res.status(created ? 201 : 200).json({ token: signToken(user), ...user.toSelf() });
   } catch (err) {
     next(err);
   }

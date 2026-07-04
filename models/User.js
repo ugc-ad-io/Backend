@@ -17,7 +17,13 @@ const strikeSchema = new mongoose.Schema(
 const userSchema = new mongoose.Schema(
   {
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-    password: { type: String, required: true, select: false },
+    // Password is required for local (email/password) accounts only. Google
+    // accounts authenticate via `google_id` and never have a password.
+    password: { type: String, select: false, required: function () { return !this.google_id; } },
+    // Google Sign-In: the account's Google subject id ('sub' claim). Set when a
+    // user signs in with Google; used to link/find the account by Google identity.
+    google_id: { type: String, default: null },
+    auth_provider: { type: String, enum: ['local', 'google'], default: 'local' },
     role: { type: String, enum: ['creator', 'business', 'admin'], default: 'creator' },
     // Admin sub-role / RBAC tier (PRD 11 — Role structure). Only meaningful when
     // role === 'admin'. null on legacy admins is treated as 'founder' (see toSelf).
@@ -99,6 +105,7 @@ userSchema.pre('save', async function (next) {
 });
 
 userSchema.methods.comparePassword = function (candidate) {
+  if (!this.password) return Promise.resolve(false); // Google-only account — no local password
   return bcrypt.compare(candidate, this.password);
 };
 
