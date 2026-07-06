@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const { MIN_CHAT_BALANCE } = require('../utils/chatPolicy');
@@ -138,6 +139,80 @@ exports.googleAuth = async (req, res, next) => {
     if (blocked) return blocked;
 
     res.status(created ? 201 : 200).json({ token: signToken(user), ...user.toSelf() });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// SHA-256 hex of a reset code — we only ever store/compare the hash, never the
+// code itself.
+const hashCode = (code) => crypto.createHash('sha256').update(String(code)).digest('hex');
+
+// POST /api/auth/forgot-password { email }
+// Issues a 6-digit reset code (valid 15 min). Always responds with the same
+// generic message so it can't be used to probe which emails have accounts.
+// No SMTP is configured, so in non-production the code is returned as `dev_code`
+// (and always logged) — matches the app's existing dev OTP flow.
+exports.forgotPassword = async (req, res, next) => {
+  try {
+    const email = (req.body.email || '').toLowerCase().trim();
+    if (!email) return fail(res, 400, 'Email is required');
+
+    const generic = { message: 'If an account exists for that email, a reset code has been sent.' };
+
+    const user = await User.findOne({ email }).select('+password');
+    // Only a local (password) account can reset a password. Google-only accounts
+    // have nothing to reset — respond generically without issuing a code.
+    if (!user || (!user.password && user.google_id)) return res.json(generic);
+
+    const code = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+    user.reset_code = hashCode(code);
+    user.reset_code_expires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+    await user.save();
+
+    // TODO: email the code once SMTP is configured. For now surface it in dev.
+    console.log(`[forgot-password] reset code for ${email}: ${code}`);
+    if (process.env.NODE_ENV !== 'production') generic.dev_code = code;
+
+    res.json(generic);
+  } catch (err) {
+    next(err);
+  }
+};
+
+// POST /api/auth/reset-password { email, code, password }
+// Verifies the code, sets the new password, clears the code, and signs the user
+// straight in (same response shape as login).
+exports.resetPassword = async (req, res, next) => {
+  try {
+    const email = (req.body.email || '').toLowerCase().trim();
+    const code = (req.body.code || '').toString().trim();
+    const password = (req.body.password || '').toString();
+
+    if (!email || !code || !password) return fail(res, 400, 'Email, code and new password are required');
+    if (password.length < 6) return fail(res, 400, 'Password must be at least 6 characters');
+
+    const user = await User.findOne({ email }).select('+password +reset_code +reset_code_expires');
+    if (
+      !user ||
+      !user.reset_code ||
+      !user.reset_code_expires ||
+      user.reset_code_expires < new Date() ||
+      user.reset_code !== hashCode(code)
+    ) {
+      return fail(res, 400, 'Invalid or expired reset code');
+    }
+
+    user.password = password; // hashed by the pre-save hook
+    user.reset_code = null;
+    user.reset_code_expires = null;
+    await user.save();
+
+    await healFounder(user);
+    const blocked = enforceAccountState(res, user);
+    if (blocked) return blocked;
+
+    res.json({ token: signToken(user), ...user.toSelf() });
   } catch (err) {
     next(err);
   }

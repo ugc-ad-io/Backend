@@ -581,14 +581,20 @@ app.get('/api/admin/notification-logs', adminAuth, async (req, res) => res.json(
 
 app.get('/api/admin/applications/creators', adminAuth, async (req, res) => {
   try {
-    const users = await User.find({ role: 'creator', approval_status: 'pending', profile_completed: true }).lean();
+    let users = await User.find({ role: 'creator', approval_status: 'pending', profile_completed: true }).lean();
+    // Ops (Regular) only review applications in their assigned categories; other
+    // roles (founder / senior) see all. Keeps one admin's queue out of another's.
+    const cats = await opsAssignedCats(req);
+    if (cats) users = users.filter((u) => matchesAssigned(categoryOf(u), cats));
     res.json(users.map(u => ({ ...u, id: u._id })));
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
 app.get('/api/admin/applications/brands', adminAuth, async (req, res) => {
   try {
-    const users = await User.find({ role: 'business', approval_status: 'pending', profile_completed: true }).lean();
+    let users = await User.find({ role: 'business', approval_status: 'pending', profile_completed: true }).lean();
+    const cats = await opsAssignedCats(req);
+    if (cats) users = users.filter((u) => matchesAssigned(categoryOf(u), cats));
     res.json(users.map(u => ({ ...u, id: u._id })));
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });

@@ -24,6 +24,11 @@ const userSchema = new mongoose.Schema(
     // user signs in with Google; used to link/find the account by Google identity.
     google_id: { type: String, default: null },
     auth_provider: { type: String, enum: ['local', 'google'], default: 'local' },
+    // Password reset — a short-lived 6-digit code (stored as its SHA-256 hash,
+    // never in the clear) is issued by /auth/forgot-password and consumed by
+    // /auth/reset-password. Both hidden from normal reads via select:false.
+    reset_code: { type: String, select: false, default: null },
+    reset_code_expires: { type: Date, select: false, default: null },
     role: { type: String, enum: ['creator', 'business', 'admin'], default: 'creator' },
     // Admin sub-role / RBAC tier (PRD 11 — Role structure). Only meaningful when
     // role === 'admin'. null on legacy admins is treated as 'founder' (see toSelf).

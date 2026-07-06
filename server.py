@@ -2056,6 +2056,8 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
         "creator_code": user.get('creator_code'),
         "level": user.get('level'),
         "role": user.get('role'),
+        "admin_role": user.get('admin_role'),
+        "assigned_categories": user.get('assigned_categories', []),
         "profile_completed": user.get('profile_completed', False),
         "approval_status": user.get('approval_status', ApprovalStatus.PENDING),
         "profile_photo": user.get('profile_photo')
@@ -8382,14 +8384,24 @@ async def create_staff(data: StaffCreate, current_user: dict = Depends(get_curre
 
 @api_router.get("/admin/staff")
 async def get_all_staff(current_user: dict = Depends(get_current_user)):
-    """Get all staff members"""
+    """Get all staff members.
+
+    Returns both models so the two admin pages coexist:
+      - campaign_manager / support_staff  → the legacy Staff page (AdminDashboard)
+      - role='admin' with an `admin_role`  → the Roles page (AdminRoles, PRD 11)
+    Admins with no `admin_role` resolve to founder (legacy single-admin installs).
+    """
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
-    
+
     staff = await db.users.find(
-        {"role": {"$in": [UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]}},
+        {"role": {"$in": [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]}},
         {"_id": 0, "password": 0, "invite_token": 0}
-    ).to_list(1000)
+    ).sort("created_at", 1).to_list(1000)
+    for u in staff:
+        if u.get("role") == UserRole.ADMIN and not u.get("admin_role"):
+            u["admin_role"] = "founder"
+        u.setdefault("assigned_categories", [])
     return staff
 
 @api_router.patch("/admin/staff/permissions")
@@ -8409,8 +8421,169 @@ async def update_staff_permissions(data: PermissionUpdate, current_user: dict = 
         {"id": data.user_id},
         {"$set": {"permissions": data.permissions, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
-    
+
     return {"message": "Permissions updated successfully"}
+
+# ============================================================================
+# ADMIN ROLES — founder / ops sub-role model (PRD 11)
+# Powers the frontend AdminRoles page. Distinct from the campaign_manager /
+# support_staff "staff" model above: here an admin user (role == 'admin') carries
+# an `admin_role` sub-tier and optional `assigned_categories` for work
+# distribution. These endpoints were missing on this backend, which is why the
+# founder's "Grant access" / role-change actions returned 404.
+# ============================================================================
+
+ADMIN_SUB_ROLES = ["founder", "ops_senior", "ops_regular", "finance"]
+ADMIN_ROLE_LABELS = {
+    "founder": "Founder / Admin",
+    "ops_senior": "Ops (Senior)",
+    "ops_regular": "Ops (Regular)",
+    "finance": "Finance",
+}
+FOUNDER_EMAIL = (os.environ.get("FOUNDER_EMAIL") or "admin@gmail.com").lower()
+
+
+def _is_founder_admin(user: dict) -> bool:
+    """Only the founder may manage admin roles. Any admin whose sub-role is unset
+    is the legacy single founder-admin; explicit sub-roles (ops_*/finance) are not."""
+    return user.get("role") == UserRole.ADMIN and (user.get("admin_role") in (None, "founder"))
+
+
+def _map_staff_row(u: dict) -> dict:
+    """Shape an admin user for the Roles page (mirror of the Express mapStaffRow)."""
+    return {
+        "id": u.get("id"),
+        "email": u.get("email"),
+        "nickname": u.get("nickname"),
+        "admin_role": u.get("admin_role") or "founder",
+        "assigned_categories": u.get("assigned_categories") or [],
+    }
+
+
+@api_router.get("/admin/categories")
+async def admin_get_categories(current_user: dict = Depends(get_current_user)):
+    """Category options for the work-distribution assignment UI."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    cats = await db.categories.find(
+        {"active": True}, {"_id": 0, "name": 1}
+    ).sort("order", 1).to_list(500)
+    names = [c.get("name") for c in cats if c.get("name")]
+    return {"categories": names, "canonical": names}
+
+
+@api_router.post("/admin/staff/role")
+async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Request = None,
+                               current_user: dict = Depends(get_current_user)):
+    """Assign / change an admin's sub-role, or grant admin to a new email
+    (creating the account with a one-time temp password). Founder-only."""
+    if not _is_founder_admin(current_user):
+        raise HTTPException(status_code=403, detail="Only the founder can assign admin roles")
+
+    user_id = data.get("user_id")
+    email = (data.get("email") or "").strip().lower()
+    admin_role = data.get("admin_role")
+    if admin_role not in ADMIN_SUB_ROLES:
+        raise HTTPException(status_code=400, detail="Invalid role")
+
+    user = None
+    if user_id:
+        user = await db.users.find_one({"id": user_id})
+    elif email:
+        user = await db.users.find_one({"email": email})
+
+    temp_password = None
+    if not user:
+        # A user_id that resolves to nothing, or no email at all, is a real 404.
+        if user_id or not email:
+            raise HTTPException(status_code=404, detail="User not found")
+        # Grant-by-email on a brand-new address → create the admin account so the
+        # founder can onboard staff without them pre-registering.
+        temp_password = f"Adm-{uuid.uuid4().hex[:6]}-{random.randint(1000, 9999)}"
+        user = {
+            "id": str(uuid.uuid4()),
+            "email": email,
+            "nickname": email.split("@")[0],
+            "password": hash_password(temp_password),
+            "role": UserRole.ADMIN,
+            "admin_role": admin_role,
+            "approval_status": "approved",
+            "profile_completed": True,
+            "assigned_categories": [],
+            "balance": 0,
+            "banned": False,
+            "created_at": now_iso(),
+            "created_by": current_user["id"],
+        }
+        await db.users.insert_one(user)
+    else:
+        if (user.get("email") or "").lower() == FOUNDER_EMAIL and admin_role != "founder":
+            raise HTTPException(status_code=400, detail="The founder account cannot be demoted")
+        await db.users.update_one(
+            {"id": user["id"]},
+            {"$set": {
+                "role": UserRole.ADMIN,
+                "admin_role": admin_role,
+                "approval_status": "approved",
+                "profile_completed": True,
+                "updated_at": now_iso(),
+            }},
+        )
+        user = await db.users.find_one({"id": user["id"]})
+
+    await log_admin_action(
+        current_user,
+        "staff.created" if temp_password else "staff.role_changed",
+        target_type="user", target_id=user["id"],
+        after={"role": "admin", "admin_role": admin_role},
+        reason=f"{'Created' if temp_password else 'Set'} {user['email']} → {ADMIN_ROLE_LABELS[admin_role]}",
+        request=request,
+    )
+    return {
+        "success": True,
+        "created": bool(temp_password),
+        "temp_password": temp_password,
+        "staff": _map_staff_row(user),
+    }
+
+
+@api_router.post("/admin/staff/revoke")
+async def admin_revoke_staff(data: Dict[str, Any] = Body(...), request: Request = None,
+                             current_user: dict = Depends(get_current_user)):
+    """Revoke admin access entirely (demote back to a regular creator). Founder-only."""
+    if not _is_founder_admin(current_user):
+        raise HTTPException(status_code=403, detail="Only the founder can revoke admin roles")
+    user = await db.users.find_one({"id": data.get("user_id")})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if (user.get("email") or "").lower() == FOUNDER_EMAIL:
+        raise HTTPException(status_code=400, detail="The founder account cannot be revoked")
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"role": UserRole.CREATOR, "admin_role": None, "updated_at": now_iso()}},
+    )
+    await log_admin_action(current_user, "staff.revoked", target_type="user", target_id=user["id"],
+                           reason=f"Revoked admin from {user['email']}", request=request)
+    return {"success": True}
+
+
+@api_router.post("/admin/staff/categories")
+async def admin_set_staff_categories(data: Dict[str, Any] = Body(...),
+                                     current_user: dict = Depends(get_current_user)):
+    """Set the categories an ops admin is responsible for (work distribution). Founder-only."""
+    if not _is_founder_admin(current_user):
+        raise HTTPException(status_code=403, detail="Only the founder can assign categories")
+    categories = data.get("categories")
+    if not isinstance(categories, list):
+        raise HTTPException(status_code=400, detail="categories must be an array")
+    user = await db.users.find_one({"id": data.get("user_id")})
+    if not user:
+        raise HTTPException(status_code=404, detail="Admin not found")
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"assigned_categories": categories, "updated_at": now_iso()}},
+    )
+    return {"success": True, "assigned_categories": categories}
 
 # Payout Ranges Management
 @api_router.get("/admin/payout-ranges")
