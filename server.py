@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import asyncio
+import requests
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
@@ -62,6 +64,9 @@ security = HTTPBearer()
 
 JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key-change-in-production')
 JWT_ALGORITHM = 'HS256'
+
+# Google Sign-In — OAuth 2.0 Web client id (must match the frontend's).
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
 
 # Anti-Cheat Content Filtering
 EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
@@ -190,6 +195,10 @@ class SignupRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
+class GoogleAuthRequest(BaseModel):
+    credential: str                      # Google ID token (JWT) from GIS
+    role: Optional[UserRole] = None      # used only when creating a new account
 
 class CreatorProfileUpdate(BaseModel):
     username: Optional[str] = None
@@ -2068,6 +2077,108 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
         "approval_status": user.get('approval_status', ApprovalStatus.PENDING),
         "profile_photo": user.get('profile_photo')
     }
+
+def _verify_google_id_token(credential: str) -> Optional[dict]:
+    """Verify a Google ID token via Google's tokeninfo endpoint.
+    Returns the decoded claims dict, or None if invalid. Runs in a thread."""
+    try:
+        resp = requests.get(
+            "https://oauth2.googleapis.com/tokeninfo",
+            params={"id_token": credential},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
+@api_router.post("/auth/google")
+async def google_auth(data: GoogleAuthRequest):
+    """Sign in / sign up with Google. The client sends the ID token (credential)
+    from Google Identity Services; we verify it, find-or-create the user, then
+    issue our own JWT — same response shape as /auth/login."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Google sign-in is not configured on the server")
+
+    info = await asyncio.to_thread(_verify_google_id_token, data.credential)
+    if not info:
+        raise HTTPException(status_code=401, detail="Invalid or expired Google credential")
+
+    # Token must have been issued for THIS app.
+    if info.get("aud") != GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=401, detail="Google credential audience mismatch")
+
+    email = (info.get("email") or "").lower()
+    if not email:
+        raise HTTPException(status_code=401, detail="Google account has no email")
+    # tokeninfo returns email_verified as the string "true" (or bool true).
+    if info.get("email_verified") not in (True, "true"):
+        raise HTTPException(status_code=403, detail="Your Google email is not verified")
+
+    user = await db.users.find_one({"email": email}, {"_id": 0})
+
+    if not user:
+        # New account — role from the signup selector, defaulting to creator.
+        role = data.role.value if data.role else UserRole.CREATOR.value
+        if role not in [UserRole.CREATOR.value, UserRole.BUSINESS.value, UserRole.ADMIN.value]:
+            role = UserRole.CREATOR.value
+
+        user_id = str(uuid.uuid4())
+        nickname = await generate_nickname()
+        user_doc = {
+            "id": user_id,
+            "email": email,
+            "role": role,
+            "nickname": info.get("name") or nickname,
+            "full_name": info.get("name", ""),
+            "profile_photo": info.get("picture"),
+            "google_id": info.get("sub"),
+            "auth_provider": "google",
+            "profile_completed": False,
+            "curated_brand_visible": False,
+            "creator_directory_visible": False,
+            "approval_status": ApprovalStatus.PENDING if role in [UserRole.CREATOR.value, UserRole.BUSINESS.value] else ApprovalStatus.APPROVED,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "balance": 0.0,
+        }
+        if role == UserRole.CREATOR.value:
+            user_doc["creator_code"] = await generate_creator_code()
+            user_doc["level"] = cf.DEFAULT_CREATOR_LEVEL
+            user_doc["handle_locked"] = False
+
+        await db.users.insert_one(user_doc)
+        user = user_doc
+    else:
+        # Block banned accounts, mirroring /auth/login.
+        if user.get("banned", False):
+            raise HTTPException(status_code=403, detail=f"Account banned: {user.get('ban_reason', 'Account suspended')}")
+
+        # Link the Google identity to an existing (email/password) account.
+        if not user.get("google_id"):
+            link = {"google_id": info.get("sub")}
+            if not user.get("profile_photo") and info.get("picture"):
+                link["profile_photo"] = info.get("picture")
+            await db.users.update_one({"id": user["id"]}, {"$set": link})
+            user.update(link)
+
+    token = create_token(user["id"], user["email"], user.get("role"))
+    return {
+        "token": token,
+        "user_id": user.get("id"),
+        "nickname": user.get("nickname") or user.get("full_name") or user.get("username") or (user.get("email") or "").split("@")[0],
+        "username": user.get("username"),
+        "creator_code": user.get("creator_code"),
+        "level": user.get("level"),
+        "role": user.get("role"),
+        "admin_role": user.get("admin_role"),
+        "assigned_categories": user.get("assigned_categories", []),
+        "profile_completed": user.get("profile_completed", False),
+        "approval_status": user.get("approval_status", ApprovalStatus.PENDING),
+        "profile_photo": user.get("profile_photo"),
+    }
+
 
 @api_router.get("/auth/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
