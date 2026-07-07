@@ -32,10 +32,15 @@ const userSchema = new mongoose.Schema(
     role: { type: String, enum: ['creator', 'business', 'admin'], default: 'creator' },
     // Admin sub-role / RBAC tier (PRD 11 — Role structure). Only meaningful when
     // role === 'admin'. null on legacy admins is treated as 'founder' (see toSelf).
-    admin_role: { type: String, enum: ['founder', 'ops_senior', 'ops_regular', 'finance', null], default: null },
+    admin_role: { type: String, enum: ['founder', 'ops_senior', 'ops_regular', 'finance', 'custom', null], default: null },
     // Work distribution — categories this admin handles (Ops Regular sees only
     // applications in these). Empty = no category queue. Founder/Senior see all.
     assigned_categories: { type: [String], default: [] },
+    // Custom admin role: the exact capabilities this admin has (used only when
+    // admin_role === 'custom'), plus a data scope that limits which side of the
+    // marketplace they can see/act on. 'all' = both creators and brands.
+    admin_caps: { type: [String], default: [] },
+    admin_scope: { type: String, enum: ['all', 'creator', 'business'], default: 'all' },
 
     nickname: { type: String, default: '' },
     full_name: { type: String, default: '' },
@@ -123,6 +128,8 @@ userSchema.methods.toPublic = function () {
     role: this.role,
     // Admins always resolve to a concrete sub-role; legacy admins default to founder.
     admin_role: this.role === 'admin' ? (this.admin_role || 'founder') : null,
+    admin_caps: this.admin_caps || [],
+    admin_scope: this.admin_scope || 'all',
     nickname: this.nickname || this.full_name || this.email?.split('@')[0],
     full_name: this.full_name,
     profile_photo: this.profile_photo,

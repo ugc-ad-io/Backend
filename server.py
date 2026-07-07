@@ -157,6 +157,7 @@ class UserRole(str, Enum):
 
 class ApprovalStatus(str, Enum):
     PENDING = "pending"
+    MORE_INFO = "more_info"
     APPROVED = "approved"
     REJECTED = "rejected"
 
@@ -339,8 +340,13 @@ class UserBanRequest(BaseModel):
 
 class ApprovalAction(BaseModel):
     item_id: str
-    action: str  # approve or reject
+    action: str  # approve | reject | request_info
     reason: Optional[str] = None
+    # Reject → structured reason; request_info → message + checklist items.
+    reason_code: Optional[str] = None
+    reason_details: Optional[str] = None
+    message: Optional[str] = None
+    items: Optional[List[str]] = None
 
 class PaymentGatewayConfig(BaseModel):
     gateway_name: str  # razorpay or cashfree
@@ -6923,15 +6929,26 @@ async def get_payout_ranges(current_user: dict = Depends(get_current_user)):
 
 # Admin Routes
 @api_router.get("/admin/pending-profiles")
-async def get_pending_profiles(current_user: dict = Depends(get_current_user)):
+async def get_pending_profiles(status: Optional[str] = None,
+                               current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
-    
+
+    # `status=all` → every completed application (pending / more_info / approved /
+    # rejected) so the reviews list can filter by State and a rejected candidate's
+    # data stays visible instead of disappearing. A specific `status` filters to
+    # that state. No param → pending only (back-compat for the older admin pages).
+    query = {"profile_completed": True}
+    if not status:
+        query["approval_status"] = ApprovalStatus.PENDING
+    elif status != "all":
+        query["approval_status"] = status
+
     profiles = await db.users.find(
-        {"approval_status": ApprovalStatus.PENDING, "profile_completed": True},
+        query,
         {"_id": 0, "password": 0}
-    ).to_list(1000)
-    
+    ).sort("submitted_at", 1).to_list(2000)
+
     return profiles
 
 @api_router.post("/admin/approve-profile")
@@ -6939,14 +6956,37 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(get
     if current_user['role'] not in [UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    status = ApprovalStatus.APPROVED if data.action == "approve" else ApprovalStatus.REJECTED
+    now_stamp = datetime.now(timezone.utc).isoformat()
+    # Build a structured `review` object the admin UI reads back (rejection reason,
+    # more-info request, etc.) so a rejected/held candidate still shows WHY.
+    if data.action == "approve":
+        status = ApprovalStatus.APPROVED
+        review = {"decided_at": now_stamp, "decided_by": current_user["id"]}
+    elif data.action == "request_info":
+        status = ApprovalStatus.MORE_INFO
+        review = {
+            "more_info_message": data.message or "",
+            "more_info_items": data.items or [],
+            "requested_at": now_stamp,
+            "requested_by": current_user["id"],
+        }
+    else:  # reject
+        status = ApprovalStatus.REJECTED
+        review = {
+            "reason_code": data.reason_code or data.reason or "other",
+            "reason_details": data.reason_details or "",
+            "decided_at": now_stamp,
+            "decided_by": current_user["id"],
+        }
+
     user = await db.users.find_one({"id": data.item_id}, {"_id": 0, "role": 1, "public_creator_id": 1})
     if not user:
         raise HTTPException(status_code=404, detail="Profile not found")
     update_data = {
         "approval_status": status,
-        "approval_reason": data.reason,
-        "approved_at": datetime.now(timezone.utc).isoformat()
+        "review": review,
+        "approval_reason": data.reason_details or data.reason or "",
+        "approved_at": now_stamp
     }
     if user.get("role") == UserRole.CREATOR:
         is_approved = status == ApprovalStatus.APPROVED
@@ -6971,7 +7011,7 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(get
         {"$set": update_data}
     )
 
-    return {"message": f"Profile {data.action}d"}
+    return {"success": True, "message": "Profile updated", "approval_status": status}
 
 @api_router.get("/admin/pending-campaigns")
 async def get_pending_campaigns(current_user: dict = Depends(get_current_user)):

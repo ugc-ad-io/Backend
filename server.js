@@ -154,23 +154,31 @@ app.get('/api/business/creator-directory', auth, async (req, res) => {
 
 // ── Admin routes ────────────────────────────────────────────────────────────
 const User = require('./models/User');
-const { can, disputeCap, normalizeRole, ROLE_LABELS, ADMIN_ROLES } = require('./utils/adminRoles');
+const { can, disputeCap, normalizeRole, ROLE_LABELS, ADMIN_ROLES, ALL_CAPS, userScopeFilter, inScope } = require('./utils/adminRoles');
 
-// Gate: must be an admin. Resolves the admin sub-role (founder/ops_*/finance)
-// from the JWT, falling back to a DB lookup for tokens issued before RBAC.
+// Gate: must be an admin. Resolves the admin sub-role (founder/ops_*/finance/
+// custom) from the JWT, falling back to a DB lookup for tokens issued before
+// RBAC. For custom admins it also loads the granted caps + data scope.
 const adminAuth = [auth, async (req, res, next) => {
   if (req.user.role !== 'admin') return res.status(403).json({ detail: 'Forbidden' });
   let role = req.user.admin_role;
-  if (!role) {
-    try { role = (await User.findById(req.user.id).select('admin_role').lean())?.admin_role; } catch (e) { /* ignore */ }
-  }
+  // Always load the custom-role fields (they aren't in the JWT).
+  try {
+    const doc = await User.findById(req.user.id).select('admin_role admin_caps admin_scope').lean();
+    if (doc) {
+      if (!role) role = doc.admin_role;
+      req.user.admin_caps = doc.admin_caps || [];
+      req.user.admin_scope = doc.admin_scope || 'all';
+    }
+  } catch (e) { /* ignore */ }
   req.user.admin_role = normalizeRole(role); // null/legacy → founder
   next();
 }];
 
-// Helper: 403 unless the current admin has `capability`.
+// Helper: 403 unless the current admin has `capability`. Passes the whole
+// req.user so custom admins are checked against their own admin_caps.
 const requireCap = (capability) => (req, res, next) =>
-  can(req.user.admin_role, capability)
+  can(req.user, capability)
     ? next()
     : res.status(403).json({ detail: `Your role (${ROLE_LABELS[req.user.admin_role] || req.user.admin_role}) cannot perform this action` });
 
@@ -307,7 +315,8 @@ const DEMO = {
 
 app.get('/api/admin/users', adminAuth, async (req, res) => {
   try {
-    const users = await User.find().lean();
+    // Custom admins scoped to creators/brands only see that side of the marketplace.
+    const users = await User.find(userScopeFilter(req.user)).lean();
     res.json(users.map(u => ({ ...u, id: u._id, balance: u.wallet_balance || 0 })));
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
@@ -317,7 +326,7 @@ app.get('/api/admin/pending-profiles', adminAuth, async (req, res) => {
     // All completed applications across every state (pending / more_info /
     // approved / rejected) so the admin list can filter by State. Incomplete
     // accounts (no submitted data) are still excluded. Oldest first.
-    let users = await User.find({ profile_completed: true })
+    let users = await User.find({ profile_completed: true, ...userScopeFilter(req.user) })
       .sort({ submitted_at: 1, createdAt: 1 })
       .lean();
     // Work distribution: Ops (Regular) only see applications in their assigned
@@ -385,6 +394,8 @@ const mapStaffRow = (u, founderEmail) => ({
   role_label: ROLE_LABELS[u.email === founderEmail ? 'founder' : (u.admin_role || 'founder')],
   active: u.active !== false,
   assigned_categories: u.assigned_categories || [],
+  admin_caps: u.admin_caps || [],
+  admin_scope: u.admin_scope || 'all',
   created_at: u.createdAt
 });
 
@@ -523,35 +534,56 @@ app.get('/api/admin/my-assigned', adminAuth, async (req, res) => {
 // Assign / change an admin's sub-role. Founder-only (manage_roles).
 app.post('/api/admin/staff/role', adminAuth, requireCap('manage_roles'), async (req, res) => {
   try {
-    const { user_id, email, admin_role } = req.body;
+    const { user_id, email, admin_role, password, admin_caps, admin_scope } = req.body;
     if (!ADMIN_ROLES.includes(admin_role)) return res.status(400).json({ detail: 'Invalid role' });
+
+    // Optional password the founder can set for the admin (create or reset).
+    const wantsPassword = (typeof password === 'string' && password.trim().length >= 6) ? password.trim() : null;
+    if (typeof password === 'string' && password.trim() && password.trim().length < 6) {
+      return res.status(400).json({ detail: 'Password must be at least 6 characters' });
+    }
 
     let u = await User.findOne(user_id ? { _id: user_id } : { email: String(email || '').toLowerCase() });
 
     // Grant-by-email on a brand-new address → create the admin account so the
-    // founder can onboard staff without the user pre-registering. A temporary
-    // password is generated and returned once for the founder to hand over.
+    // founder can onboard staff without the user pre-registering. Use the password
+    // the founder set, or generate a temporary one to hand over (returned once).
     let tempPassword = null;
+    let passwordSet = false;
     if (!u) {
       if (user_id || !email) return res.status(404).json({ detail: 'User not found' });
-      tempPassword = `Adm-${Math.random().toString(36).slice(2, 8)}-${Math.floor(Math.random() * 9000 + 1000)}`;
+      const initialPassword = wantsPassword || (tempPassword = `Adm-${Math.random().toString(36).slice(2, 8)}-${Math.floor(Math.random() * 9000 + 1000)}`);
+      if (wantsPassword) passwordSet = true;
       u = new User({
         email: String(email).toLowerCase(),
-        password: tempPassword, // hashed by the User pre-save hook
+        password: initialPassword, // hashed by the User pre-save hook
         nickname: String(email).split('@')[0],
         active: true
       });
+    } else if (wantsPassword) {
+      // Existing account → reset the password to the one the founder provided.
+      u.password = wantsPassword; // hashed by the User pre-save hook
+      passwordSet = true;
     }
 
     if (u.email === FOUNDER_EMAIL && admin_role !== 'founder') return res.status(400).json({ detail: 'The founder account cannot be demoted' });
     const before = { role: u.role, admin_role: u.admin_role };
     u.role = 'admin';
     u.admin_role = admin_role;
+    // Custom admins carry their own capability list + data scope; other roles
+    // use the fixed matrix, so clear any leftover custom config.
+    if (admin_role === 'custom') {
+      u.admin_caps = Array.isArray(admin_caps) ? admin_caps.filter((c) => ALL_CAPS.includes(c)) : [];
+      u.admin_scope = ['all', 'creator', 'business'].includes(admin_scope) ? admin_scope : 'all';
+    } else {
+      u.admin_caps = [];
+      u.admin_scope = 'all';
+    }
     u.approval_status = 'approved';
     u.profile_completed = true;
     await u.save();
-    await writeAdminLog(req, { action: tempPassword ? 'staff.created' : 'staff.role_changed', module: 'settings', target_type: 'user', target_id: String(u._id), before, after: { role: 'admin', admin_role }, reason_text: `${tempPassword ? 'Created' : 'Set'} ${u.email} → ${ROLE_LABELS[admin_role]}` });
-    res.json({ success: true, created: !!tempPassword, temp_password: tempPassword, staff: mapStaffRow(u.toObject(), FOUNDER_EMAIL) });
+    await writeAdminLog(req, { action: tempPassword || passwordSet ? 'staff.created' : 'staff.role_changed', module: 'settings', target_type: 'user', target_id: String(u._id), before, after: { role: 'admin', admin_role }, reason_text: `${tempPassword || passwordSet ? 'Created/updated' : 'Set'} ${u.email} → ${ROLE_LABELS[admin_role]}${passwordSet ? ' (password set)' : ''}` });
+    res.json({ success: true, created: !!tempPassword, password_set: passwordSet, temp_password: tempPassword, staff: mapStaffRow(u.toObject(), FOUNDER_EMAIL) });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
@@ -601,13 +633,15 @@ app.get('/api/admin/applications/brands', adminAuth, async (req, res) => {
 
 app.post('/api/admin/user/update', adminAuth, async (req, res) => {
   try {
-    const { user_id, nickname, full_name, email, role, balance } = req.body;
+    const { user_id, nickname, full_name, email, role, balance, username, public_creator_id } = req.body;
     const $set = {};
     if (nickname !== undefined) $set.nickname = nickname;
     if (full_name !== undefined) $set.full_name = full_name;
     if (email !== undefined) $set.email = email;
     if (role !== undefined) $set.role = role;
     if (balance !== undefined) $set.wallet_balance = balance;
+    if (username !== undefined) $set.username = (username || '').trim().replace(/^@/, '') || null;
+    if (public_creator_id !== undefined) $set.public_creator_id = (public_creator_id || '').trim().replace(/^#/, '') || null;
     await User.findByIdAndUpdate(user_id, { $set });
     res.json({ success: true });
   } catch (e) { res.status(500).json({ detail: e.message }); }
