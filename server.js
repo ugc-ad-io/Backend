@@ -13,6 +13,8 @@ const chatRoutes = require('./routes/chatRoutes');
 const profileRoutes = require('./routes/profileRoutes');
 const { auth } = require('./middleware/auth');
 const authCtrl = require('./controllers/authController');
+const { sendEmail } = require('./services/emailService');
+const applicationEmails = require('./services/emailTemplates');
 
 const app = express();
 
@@ -358,8 +360,25 @@ app.post('/api/admin/approve-profile', adminAuth, async (req, res) => {
       update.approval_status = 'rejected';
       update['review'] = { reason_code: reason_code || 'other', reason_details: reason_details || '', decided_at: now, decided_by: req.user.id };
     }
-    await User.findByIdAndUpdate(item_id, { $set: update });
+    const user = await User.findByIdAndUpdate(item_id, { $set: update }, { new: true });
     res.json({ success: true });
+
+    // Notify the applicant by email (fire-and-forget — never block/fail the
+    // review action on an email hiccup).
+    if (user?.email) {
+      const name = user.nickname || user.full_name || '';
+      const frontendUrl = process.env.FRONTEND_URL;
+      let mail = null;
+      if (action === 'approve') {
+        mail = applicationEmails.applicationApproved({ name, role: user.role, frontendUrl });
+      } else if (action === 'request_info') {
+        mail = applicationEmails.applicationRevision({ name, role: user.role, message, items, frontendUrl });
+      } else {
+        mail = applicationEmails.applicationRejected({ name, reasonCode: reason_code, reasonDetails: reason_details, frontendUrl });
+      }
+      sendEmail({ to: user.email, subject: mail.subject, html: mail.html })
+        .catch((err) => console.error('[approve-profile] email failed:', err.message));
+    }
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
