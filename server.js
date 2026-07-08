@@ -315,7 +315,7 @@ const DEMO = {
   ]
 };
 
-app.get('/api/admin/users', adminAuth, async (req, res) => {
+app.get('/api/admin/users', adminAuth, requireCap('user_management'), async (req, res) => {
   try {
     // Custom admins scoped to creators/brands only see that side of the marketplace.
     const users = await User.find(userScopeFilter(req.user)).lean();
@@ -323,7 +323,7 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.get('/api/admin/pending-profiles', adminAuth, async (req, res) => {
+app.get('/api/admin/pending-profiles', adminAuth, requireCap('review_applications'), async (req, res) => {
   try {
     // All completed applications across every state (pending / more_info /
     // approved / rejected) so the admin list can filter by State. Incomplete
@@ -342,7 +342,7 @@ app.get('/api/admin/pending-profiles', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/approve-profile', adminAuth, async (req, res) => {
+app.post('/api/admin/approve-profile', adminAuth, requireCap('review_applications'), async (req, res) => {
   try {
     // action: 'approve' | 'reject' | 'request_info'
     // reject  → reason_code, reason_details
@@ -382,7 +382,7 @@ app.post('/api/admin/approve-profile', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.get('/api/admin/pending-campaigns', adminAuth, async (req, res) => {
+app.get('/api/admin/pending-campaigns', adminAuth, requireCap('review_applications'), async (req, res) => {
   try {
     let campaigns = await Campaign.find({ status: 'pending_approval' }).lean();
     const cats = await opsAssignedCats(req);
@@ -391,7 +391,7 @@ app.get('/api/admin/pending-campaigns', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/approve-campaign', adminAuth, async (req, res) => {
+app.post('/api/admin/approve-campaign', adminAuth, requireCap('review_applications'), async (req, res) => {
   try {
     const { item_id, action } = req.body;
     await Campaign.findByIdAndUpdate(item_id, { status: action === 'approve' ? 'active' : 'rejected' });
@@ -399,11 +399,11 @@ app.post('/api/admin/approve-campaign', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.get('/api/admin/withdrawals', adminAuth, async (req, res) => {
+app.get('/api/admin/withdrawals', adminAuth, requireCap('view_financials'), async (req, res) => {
   const list = req.query.status ? DEMO.withdrawals.filter((w) => w.status === req.query.status) : DEMO.withdrawals;
   res.json(list);
 });
-app.get('/api/admin/campaign-assignments', adminAuth, async (req, res) => res.json(DEMO.assignments));
+app.get('/api/admin/campaign-assignments', adminAuth, requireCap('review_applications'), async (req, res) => res.json(DEMO.assignments));
 // ---------- STAFF / ROLE STRUCTURE (PRD 11) ----------
 const mapStaffRow = (u, founderEmail) => ({
   id: String(u._id),
@@ -535,7 +535,7 @@ app.post('/api/admin/staff/categories', adminAuth, requireCap('manage_roles'), a
 
 // The creators / brands this admin is responsible for (their category roster).
 // Ops (Regular) → only their assigned categories. Founder / Senior → everyone.
-app.get('/api/admin/my-assigned', adminAuth, async (req, res) => {
+app.get('/api/admin/my-assigned', adminAuth, requireCap('review_applications'), async (req, res) => {
   try {
     let users = await User.find({ profile_completed: true, role: { $in: ['creator', 'business'] } })
       .sort({ submitted_at: -1, createdAt: -1 })
@@ -620,18 +620,18 @@ app.post('/api/admin/staff/revoke', adminAuth, requireCap('manage_roles'), async
     res.json({ success: true });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
-app.get('/api/admin/chats', adminAuth, async (req, res) => res.json(DEMO.chats));
-app.get('/api/admin/chat/:u1/:u2', adminAuth, async (req, res) => {
+app.get('/api/admin/chats', adminAuth, requireCap('content_moderation'), async (req, res) => res.json(DEMO.chats));
+app.get('/api/admin/chat/:u1/:u2', adminAuth, requireCap('content_moderation'), async (req, res) => {
   const ids = [req.params.u1, req.params.u2];
   const chat = DEMO.chats.find((c) => ids.includes(c.user1.id) || ids.includes(c.user2.id)) || DEMO.chats[0];
   res.json(chat.messages); // the page expects an array of messages
 });
-app.get('/api/admin/payment-gateways', adminAuth, async (req, res) => res.json(DEMO.paymentGateways));
-app.get('/api/admin/payment-transactions', adminAuth, async (req, res) => res.json(DEMO.paymentTransactions));
-app.get('/api/admin/notification-gateways', adminAuth, async (req, res) => res.json(DEMO.notificationGateways));
-app.get('/api/admin/notification-logs', adminAuth, async (req, res) => res.json(DEMO.notificationLogs));
+app.get('/api/admin/payment-gateways', adminAuth, requireCap('edit_settings'), async (req, res) => res.json(DEMO.paymentGateways));
+app.get('/api/admin/payment-transactions', adminAuth, requireCap('view_financials'), async (req, res) => res.json(DEMO.paymentTransactions));
+app.get('/api/admin/notification-gateways', adminAuth, requireCap('edit_settings'), async (req, res) => res.json(DEMO.notificationGateways));
+app.get('/api/admin/notification-logs', adminAuth, requireCap('edit_settings'), async (req, res) => res.json(DEMO.notificationLogs));
 
-app.get('/api/admin/applications/creators', adminAuth, async (req, res) => {
+app.get('/api/admin/applications/creators', adminAuth, requireCap('review_applications'), async (req, res) => {
   try {
     let users = await User.find({ role: 'creator', approval_status: 'pending', profile_completed: true }).lean();
     // Ops (Regular) only review applications in their assigned categories; other
@@ -642,7 +642,7 @@ app.get('/api/admin/applications/creators', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.get('/api/admin/applications/brands', adminAuth, async (req, res) => {
+app.get('/api/admin/applications/brands', adminAuth, requireCap('review_applications'), async (req, res) => {
   try {
     let users = await User.find({ role: 'business', approval_status: 'pending', profile_completed: true }).lean();
     const cats = await opsAssignedCats(req);
@@ -651,7 +651,7 @@ app.get('/api/admin/applications/brands', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/user/update', adminAuth, async (req, res) => {
+app.post('/api/admin/user/update', adminAuth, requireCap('user_management'), async (req, res) => {
   try {
     const { user_id, nickname, full_name, email, role, balance, username, public_creator_id } = req.body;
     const $set = {};
@@ -688,7 +688,22 @@ const notifyUser = async (user_id, type, title, body) => {
   try { await require('./models/Notification').create({ user_id, type, title, body }); } catch (e) { /* non-blocking */ }
 };
 
-app.post('/api/admin/user/warn', adminAuth, async (req, res) => {
+// Permanently delete a user (spec 11.10 — Users module "Delete Permanently").
+app.delete('/api/admin/user/:id', adminAuth, requireCap('ban_users'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    // Guard against an admin deleting their own account.
+    if (String(id) === String(req.user.id)) {
+      return res.status(400).json({ detail: 'You cannot delete your own account' });
+    }
+    const user = await User.findByIdAndDelete(id);
+    if (!user) return res.status(404).json({ detail: 'User not found' });
+    await writeAdminLog(req, { action: 'user.delete', module: 'users', target_type: 'user', target_id: String(id), detail: user.email || '' });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+app.post('/api/admin/user/warn', adminAuth, requireCap('warn_suspend_users'), async (req, res) => {
   try {
     const { user_id, message } = req.body;
     if (!message || !String(message).trim()) return res.status(400).json({ detail: 'Message is required' });
@@ -699,7 +714,7 @@ app.post('/api/admin/user/warn', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/user/suspend', adminAuth, async (req, res) => {
+app.post('/api/admin/user/suspend', adminAuth, requireCap('warn_suspend_users'), async (req, res) => {
   try {
     const { user_id, reason, duration_days } = req.body;
     if (!reason || !String(reason).trim()) return res.status(400).json({ detail: 'Reason is required' });
@@ -712,7 +727,7 @@ app.post('/api/admin/user/suspend', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/user/message', adminAuth, async (req, res) => {
+app.post('/api/admin/user/message', adminAuth, requireCap('user_management'), async (req, res) => {
   try {
     const { user_id, message } = req.body;
     if (!message || !String(message).trim()) return res.status(400).json({ detail: 'Message is required' });
@@ -722,7 +737,7 @@ app.post('/api/admin/user/message', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/user/level', adminAuth, async (req, res) => {
+app.post('/api/admin/user/level', adminAuth, requireCap('user_management'), async (req, res) => {
   try {
     const { user_id, direction } = req.body;
     const u = await User.findById(user_id);
@@ -735,7 +750,7 @@ app.post('/api/admin/user/level', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/user/payout-schedule', adminAuth, async (req, res) => {
+app.post('/api/admin/user/payout-schedule', adminAuth, requireCap('user_management'), async (req, res) => {
   try {
     const { user_id, schedule } = req.body;
     const allowed = ['weekly', 'biweekly', 'monthly', 'on_request'];
@@ -746,7 +761,7 @@ app.post('/api/admin/user/payout-schedule', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/user/commission', adminAuth, async (req, res) => {
+app.post('/api/admin/user/commission', adminAuth, requireCap('user_management'), async (req, res) => {
   try {
     const { user_id, commission_rate } = req.body;
     const rate = Number(commission_rate);
@@ -757,7 +772,7 @@ app.post('/api/admin/user/commission', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/user/convert-pro', adminAuth, async (req, res) => {
+app.post('/api/admin/user/convert-pro', adminAuth, requireCap('user_management'), async (req, res) => {
   try {
     const { user_id } = req.body;
     await User.findByIdAndUpdate(user_id, { is_pro: true });
@@ -786,7 +801,7 @@ app.get('/api/work/pending-review', auth, async (req, res) => {
     res.json(out);
   } catch (e) { res.json([]); }
 });
-app.post('/api/admin/broadcast-notification', adminAuth, async (req, res) => {
+app.post('/api/admin/broadcast-notification', adminAuth, requireCap('user_management'), async (req, res) => {
   try {
     const { user_ids, message, title } = req.body || {};
     if (Array.isArray(user_ids) && user_ids.length && message) {
@@ -797,10 +812,10 @@ app.post('/api/admin/broadcast-notification', adminAuth, async (req, res) => {
     res.json({ message: 'Broadcast sent' });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
-app.post('/api/admin/staff/create', adminAuth, async (req, res) => res.json({ message: 'Staff created' }));
-app.get('/api/admin/withdrawals/export', adminAuth, async (req, res) => res.json([]));
-app.post('/api/admin/payment-gateway', adminAuth, async (req, res) => res.json({ success: true }));
-app.post('/api/admin/notification-gateway', adminAuth, async (req, res) => res.json({ success: true }));
+app.post('/api/admin/staff/create', adminAuth, requireCap('manage_roles'), async (req, res) => res.json({ message: 'Staff created' }));
+app.get('/api/admin/withdrawals/export', adminAuth, requireCap('view_financials'), async (req, res) => res.json([]));
+app.post('/api/admin/payment-gateway', adminAuth, requireCap('edit_settings'), async (req, res) => res.json({ success: true }));
+app.post('/api/admin/notification-gateway', adminAuth, requireCap('edit_settings'), async (req, res) => res.json({ success: true }));
 
 // ============================================================
 //  Admin: Deals, Disputes, Shipping, Escrow, Financials,
@@ -929,7 +944,7 @@ const mapDealDetail = (d) => {
 };
 
 // ---------- DEALS ----------
-app.get('/api/admin/deals', adminAuth, async (req, res) => {
+app.get('/api/admin/deals', adminAuth, requireCap('manage_deals'), async (req, res) => {
   try {
     let deals = await Deal.find().sort({ updatedAt: -1 }).lean();
     deals = await scopeDealsByCategory(req, deals);
@@ -937,7 +952,7 @@ app.get('/api/admin/deals', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.get('/api/admin/deals/:id', adminAuth, async (req, res) => {
+app.get('/api/admin/deals/:id', adminAuth, requireCap('manage_deals'), async (req, res) => {
   try {
     const d = await Deal.findOne({ deal_id: req.params.id }).lean();
     if (!d) return res.status(404).json({ detail: 'Deal not found' });
@@ -946,7 +961,30 @@ app.get('/api/admin/deals/:id', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/deals/:id/force-transition', adminAuth, async (req, res) => {
+// Read-only brand profile for the deal room (ops/admin). Same field shape the
+// brand sees on their own Settings page, fetched by user id.
+app.get('/api/admin/business/:id/profile', adminAuth, requireCap('manage_deals'), async (req, res) => {
+  try {
+    const id = req.params.id;
+    let u = null;
+    try { u = await User.findById(id).lean(); } catch (e) { /* not a valid ObjectId */ }
+    if (!u) u = await User.findOne({ $or: [{ username: id }, { public_id: id }] }).lean();
+    if (!u) return res.status(404).json({ detail: 'Business not found' });
+    const p = u.profile || {};
+    res.json({
+      brand_name: p.business_name || u.nickname || u.full_name || '',
+      contact_person: p.contact_person || u.full_name || u.nickname || '',
+      work_email: p.business_email || u.email || '',
+      phone_number: p.phone || u.phone || '',
+      website_url: p.website || '',
+      logo_url: p.logo || u.profile_photo || '',
+      username: u.username || '',
+      role: u.role || 'business',
+    });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+app.post('/api/admin/deals/:id/force-transition', adminAuth, requireCap('manage_deals'), async (req, res) => {
   try {
     const { to_state, reason, reason_code, notify_parties } = req.body;
     if (!to_state) return res.status(400).json({ detail: 'to_state is required' });
@@ -967,7 +1005,7 @@ app.post('/api/admin/deals/:id/force-transition', adminAuth, async (req, res) =>
 });
 
 // Release escrow to the creator early (credits their wallet, closes the deal).
-app.post('/api/admin/deals/:id/release-payment', adminAuth, async (req, res) => {
+app.post('/api/admin/deals/:id/release-payment', adminAuth, requireCap('release_payouts'), async (req, res) => {
   try {
     const d = await Deal.findOne({ deal_id: req.params.id });
     if (!d) return res.status(404).json({ detail: 'Deal not found' });
@@ -991,7 +1029,7 @@ app.post('/api/admin/deals/:id/release-payment', adminAuth, async (req, res) => 
 });
 
 // Refund the escrow to the brand and close the deal.
-app.post('/api/admin/deals/:id/refund', adminAuth, async (req, res) => {
+app.post('/api/admin/deals/:id/refund', adminAuth, requireCap('manage_deals'), async (req, res) => {
   try {
     const d = await Deal.findOne({ deal_id: req.params.id });
     if (!d) return res.status(404).json({ detail: 'Deal not found' });
@@ -1011,7 +1049,7 @@ app.post('/api/admin/deals/:id/refund', adminAuth, async (req, res) => {
 });
 
 // Open a dispute on behalf of the parties (admin-initiated).
-app.post('/api/admin/deals/:id/raise-dispute', adminAuth, async (req, res) => {
+app.post('/api/admin/deals/:id/raise-dispute', adminAuth, requireCap('manage_deals'), async (req, res) => {
   try {
     const reason = (req.body.reason || '').trim();
     if (!reason) return res.status(400).json({ detail: 'A reason is required' });
@@ -1031,7 +1069,7 @@ app.post('/api/admin/deals/:id/raise-dispute', adminAuth, async (req, res) => {
 });
 
 // Post an admin "intervention" message into the deal room.
-app.post('/api/admin/deals/:id/message', adminAuth, async (req, res) => {
+app.post('/api/admin/deals/:id/message', adminAuth, requireCap('manage_deals'), async (req, res) => {
   try {
     const message = (req.body.message || '').trim();
     if (!message) return res.status(400).json({ detail: 'A message is required' });
@@ -1046,7 +1084,7 @@ app.post('/api/admin/deals/:id/message', adminAuth, async (req, res) => {
 });
 
 // Send a notification to one or both parties from the admin console.
-app.post('/api/admin/deals/:id/notify', adminAuth, async (req, res) => {
+app.post('/api/admin/deals/:id/notify', adminAuth, requireCap('manage_deals'), async (req, res) => {
   try {
     const message = (req.body.message || '').trim();
     const party = ['brand', 'creator', 'both'].includes(req.body.party) ? req.body.party : 'both';
@@ -1059,7 +1097,7 @@ app.post('/api/admin/deals/:id/notify', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/deals/:id/notes', adminAuth, async (req, res) => {
+app.post('/api/admin/deals/:id/notes', adminAuth, requireCap('manage_deals'), async (req, res) => {
   try {
     await writeAdminLog(req, { action: 'note_added', module: 'deals', target_type: 'deal', target_id: req.params.id, detail: req.body.note || '' });
     res.json({ success: true });
@@ -1110,7 +1148,7 @@ const mergeMeta = (row, m) => ({
   peer_review_status: (m && m.peer_review_status) || null
 });
 
-app.get('/api/admin/disputes', adminAuth, async (req, res) => {
+app.get('/api/admin/disputes', adminAuth, requireCap('rule_disputes'), async (req, res) => {
   try {
     const query = { $or: [{ 'dispute.status': { $ne: null } }, { current_state: { $in: EXCEPTION_STATES } }] };
     let deals = await Deal.find(query).sort({ updatedAt: -1 }).lean();
@@ -1125,7 +1163,7 @@ app.get('/api/admin/disputes', adminAuth, async (req, res) => {
 });
 
 // NOTE: must precede '/:id' so 'appeals' is not captured as an id param
-app.get('/api/admin/disputes/appeals', adminAuth, async (req, res) => {
+app.get('/api/admin/disputes/appeals', adminAuth, requireCap('rule_disputes'), async (req, res) => {
   try {
     const metas = await DisputeMeta.find({ appeal_status: 'open' }).lean();
     const ids = metas.map((m) => m.deal_id);
@@ -1136,7 +1174,7 @@ app.get('/api/admin/disputes/appeals', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.get('/api/admin/disputes/:id', adminAuth, async (req, res) => {
+app.get('/api/admin/disputes/:id', adminAuth, requireCap('rule_disputes'), async (req, res) => {
   try {
     const d = await Deal.findOne({ deal_id: req.params.id }).lean();
     if (!d) return res.status(404).json({ detail: 'Dispute not found' });
@@ -1197,7 +1235,7 @@ app.post('/api/admin/disputes/:id/rule', adminAuth, requireCap('rule_disputes'),
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/disputes/:id/assign', adminAuth, async (req, res) => {
+app.post('/api/admin/disputes/:id/assign', adminAuth, requireCap('rule_disputes'), async (req, res) => {
   try {
     const m = await getMeta(req.params.id);
     m.assigned_to = String(req.user.id);
@@ -1208,7 +1246,7 @@ app.post('/api/admin/disputes/:id/assign', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/disputes/:id/ruling-draft', adminAuth, async (req, res) => {
+app.post('/api/admin/disputes/:id/ruling-draft', adminAuth, requireCap('rule_disputes'), async (req, res) => {
   try {
     const m = await getMeta(req.params.id);
     m.ruling_draft = req.body;
@@ -1217,7 +1255,7 @@ app.post('/api/admin/disputes/:id/ruling-draft', adminAuth, async (req, res) => 
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/disputes/:id/request-review', adminAuth, async (req, res) => {
+app.post('/api/admin/disputes/:id/request-review', adminAuth, requireCap('rule_disputes'), async (req, res) => {
   try {
     const m = await getMeta(req.params.id);
     m.peer_review_status = 'requested';
@@ -1228,7 +1266,7 @@ app.post('/api/admin/disputes/:id/request-review', adminAuth, async (req, res) =
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/disputes/:id/request-info', adminAuth, async (req, res) => {
+app.post('/api/admin/disputes/:id/request-info', adminAuth, requireCap('rule_disputes'), async (req, res) => {
   try {
     const { party, message } = req.body;
     const d = await Deal.findOne({ deal_id: req.params.id });
@@ -1257,7 +1295,7 @@ const shippingUpload = multer({
   limits: { fileSize: 25 * 1024 * 1024 } // 25MB — labels are small PDFs/images
 });
 
-app.get('/api/admin/shipping/requests', adminAuth, async (req, res) => {
+app.get('/api/admin/shipping/requests', adminAuth, requireCap('manage_shipping'), async (req, res) => {
   try {
     let deals = await Deal.find({ current_state: { $regex: /awaiting shipment|shipped|in transit/i } }).sort({ state_started_at: 1 }).lean();
     deals = await scopeDealsByCategory(req, deals);
@@ -1321,7 +1359,7 @@ app.post('/api/admin/shipping/:id/ship', adminAuth, requireCap('manage_shipping'
 });
 
 // ---------- ESCROW ----------
-app.get('/api/admin/escrow', adminAuth, async (req, res) => {
+app.get('/api/admin/escrow', adminAuth, requireCap('view_financials'), async (req, res) => {
   try {
     const deals = await Deal.find({ 'escrow.held_amount': { $gt: 0 } }).lean();
     res.json(deals.map((d) => ({
@@ -1351,11 +1389,11 @@ app.post('/api/admin/wallet/adjust', adminAuth, requireCap('adjust_wallet'), asy
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/admin/withdrawals/:id/approve', adminAuth, async (req, res) => {
+app.post('/api/admin/withdrawals/:id/approve', adminAuth, requireCap('release_payouts'), async (req, res) => {
   await writeAdminLog(req, { action: 'withdrawal.approved', module: 'financials', target_type: 'withdrawal', target_id: req.params.id });
   res.json({ success: true });
 });
-app.post('/api/admin/withdrawals/:id/reject', adminAuth, async (req, res) => {
+app.post('/api/admin/withdrawals/:id/reject', adminAuth, requireCap('release_payouts'), async (req, res) => {
   await writeAdminLog(req, { action: 'withdrawal.rejected', module: 'financials', target_type: 'withdrawal', target_id: req.params.id, reason_text: req.query.reason || '' });
   res.json({ success: true });
 });
@@ -1407,14 +1445,14 @@ const mapAuditRow = (l) => ({
   sensitive: SENSITIVE_ACTIONS.includes(l.action)
 });
 
-app.get('/api/admin/audit-logs', adminAuth, async (req, res) => {
+app.get('/api/admin/audit-logs', adminAuth, requireCap('view_audit'), async (req, res) => {
   try {
     const logs = await AdminLog.find(buildAuditFilter(req)).sort({ createdAt: -1 }).limit(500).lean();
     res.json({ logs: logs.map(mapAuditRow) });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.get('/api/admin/audit-logs/export', adminAuth, async (req, res) => {
+app.get('/api/admin/audit-logs/export', adminAuth, requireCap('view_audit'), async (req, res) => {
   try {
     const logs = await AdminLog.find(buildAuditFilter(req)).sort({ createdAt: -1 }).limit(5000).lean();
     sendCsv(res, `audit-log_${new Date().toISOString().split('T')[0]}.csv`,
@@ -1429,7 +1467,7 @@ app.get('/api/admin/audit-logs/export', adminAuth, async (req, res) => {
 });
 
 // ---------- SETTINGS ----------
-app.get('/api/admin/settings', adminAuth, async (req, res) => {
+app.get('/api/admin/settings', adminAuth, requireCap('edit_settings'), async (req, res) => {
   try {
     let s = await Settings.findOne({ key: 'platform' });
     if (!s) s = await Settings.create({ key: 'platform' });
@@ -1455,7 +1493,7 @@ const sendCsv = (res, name, header, rows) => {
   res.send(csv);
 };
 
-app.get('/api/admin/deals/export', adminAuth, async (req, res) => {
+app.get('/api/admin/deals/export', adminAuth, requireCap('manage_deals'), async (req, res) => {
   try {
     const deals = await Deal.find().lean();
     sendCsv(res, 'deals.csv', ['deal_id', 'campaign', 'brand', 'creator', 'state', 'amount'],
@@ -1463,7 +1501,7 @@ app.get('/api/admin/deals/export', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.get('/api/admin/users/export', adminAuth, async (req, res) => {
+app.get('/api/admin/users/export', adminAuth, requireCap('user_management'), async (req, res) => {
   try {
     const users = await User.find().lean();
     sendCsv(res, 'users.csv', ['id', 'nickname', 'email', 'role', 'status', 'balance'],
@@ -1471,10 +1509,10 @@ app.get('/api/admin/users/export', adminAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.get('/api/admin/payment-transactions/export', adminAuth, async (req, res) => sendCsv(res, 'transactions.csv', ['id', 'amount', 'status'], []));
-app.get('/api/admin/reports/digest', adminAuth, async (req, res) => sendCsv(res, 'digest.csv', ['metric', 'value'], [['period', req.query.period || 'daily'], ['generated_at', new Date().toISOString()]]));
-app.get('/api/admin/financials/tds/export', adminAuth, async (req, res) => sendCsv(res, 'tds.csv', ['creator', 'gross', 'tds', 'net'], []));
-app.get('/api/admin/financials/gst/export', adminAuth, async (req, res) => sendCsv(res, 'gst.csv', ['invoice', 'taxable', 'gst'], []));
+app.get('/api/admin/payment-transactions/export', adminAuth, requireCap('view_financials'), async (req, res) => sendCsv(res, 'transactions.csv', ['id', 'amount', 'status'], []));
+app.get('/api/admin/reports/digest', adminAuth, requireCap('generate_reports'), async (req, res) => sendCsv(res, 'digest.csv', ['metric', 'value'], [['period', req.query.period || 'daily'], ['generated_at', new Date().toISOString()]]));
+app.get('/api/admin/financials/tds/export', adminAuth, requireCap('export_tax'), async (req, res) => sendCsv(res, 'tds.csv', ['creator', 'gross', 'tds', 'net'], []));
+app.get('/api/admin/financials/gst/export', adminAuth, requireCap('export_tax'), async (req, res) => sendCsv(res, 'gst.csv', ['invoice', 'taxable', 'gst'], []));
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -1815,8 +1853,15 @@ app.post('/api/work/:id/request-revision', auth, async (req, res) => {
 
 // ── Shipment (tied to a campaign) ────────────────────────────────────────────
 app.get('/api/shipment/:id', auth, async (req, res) => {
-  try { const c = await Campaign.findById(req.params.id).lean(); res.json(c ? { ...c, id: c._id } : {}); }
-  catch (e) { res.status(500).json({ detail: e.message }); }
+  try {
+    const c = await Campaign.findById(req.params.id).lean();
+    if (!c) return res.json({});
+    const s = c.shipment || {};
+    // Flatten the embedded shipment onto the campaign so the client can read
+    // status/tracking/label directly. NEVER expose the creator's delivery address.
+    const { delivery_address, ...safe } = s;
+    res.json({ ...c, ...safe, id: c._id });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 app.post('/api/shipment/update', auth, async (req, res) => {
   try {
@@ -1828,8 +1873,90 @@ app.post('/api/shipment/update', auth, async (req, res) => {
 app.post('/api/shipment/receive', auth, async (req, res) => {
   try {
     const { campaign_id } = req.body;
-    if (campaign_id) { const c = await Campaign.findById(campaign_id); if (c) { c.shipment = { ...(c.shipment || {}), ...req.body, received: true, received_at: new Date() }; c.markModified('shipment'); await c.save(); } }
+    if (campaign_id) { const c = await Campaign.findById(campaign_id); if (c) { c.shipment = { ...(c.shipment || {}), ...req.body, received: true, received_at: new Date(), status: 'received', courier_status: 'delivered', updated_at: new Date() }; c.markModified('shipment'); await c.save(); } }
     res.json({ success: true });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+// Build a Shiprocket-ready delivery address from a creator's saved profile.
+// Defensive: handles a structured profile.address object OR the flat signup fields.
+function creatorDeliveryAddress(u) {
+  if (!u) return null;
+  const p = u.profile || {};
+  const addr = p.address;
+  const obj = (addr && typeof addr === 'object') ? addr : {};
+  const built = {
+    full_name: p.fullName || p.full_name || u.full_name || u.nickname || '',
+    phone: obj.phone || p.phone || u.phone || '',
+    line1: obj.line1 || (typeof addr === 'string' ? addr : '') || '',
+    line2: obj.line2 || '',
+    city: obj.city || p.city || '',
+    state: obj.state || p.state || '',
+    pincode: obj.pincode || p.pincode || '',
+    country: obj.country || p.country || 'India',
+  };
+  if (!built.line1 || !built.pincode) return null;   // not enough to ship
+  return built;
+}
+
+// Brand: generate a pre-paid shipping label. The creator's delivery address is
+// pulled server-side and passed to the courier — it is NEVER returned to the brand.
+// PHASE 1: label + tracking are MOCKED. Swap the marked block for a real Shiprocket
+// "create order + generate label" call when the API is wired in.
+app.post('/api/deals/:id/ship-label', auth, async (req, res) => {
+  try {
+    const c = await Campaign.findById(req.params.id);
+    if (!c) return res.status(404).json({ detail: 'Deal not found' });
+    if (String(c.business_id) !== String(req.user.id)) return res.status(403).json({ detail: 'Not authorized for this deal' });
+    if (!c.requires_shipment) return res.status(400).json({ detail: 'This deal does not require a shipment' });
+
+    let creator = null;
+    try { creator = await User.findById(c.selected_creator).lean(); } catch (e) { /* uuid id */ }
+    if (!creator && c.selected_creator) creator = await User.findOne({ $or: [{ public_id: c.selected_creator }, { username: c.selected_creator }] }).lean();
+    const delivery = creatorDeliveryAddress(creator);
+    if (!delivery) return res.status(400).json({ detail: "The creator hasn't set a complete delivery address yet. Ask them to add it in their profile." });
+
+    const { description, weight, dimensions, pickup_address } = req.body;
+
+    // ─── MOCK SHIPROCKET (Phase 1) ───────────────────────────────────────────
+    const short = Math.random().toString(36).slice(2, 12).toUpperCase();
+    const tracking_number = `MOCK${short}`;
+    const label_url = `/mock-labels/${c._id}.pdf`;
+    const courier_name = 'Shiprocket (mock)';
+    // ─────────────────────────────────────────────────────────────────────────
+
+    c.shipment = {
+      ...(c.shipment || {}),
+      product: { description, weight, dimensions: dimensions || {} },
+      pickup_address: pickup_address || {},
+      delivery_address: delivery,          // internal only — stripped from GET responses
+      tracking_number, tracking_id: tracking_number,
+      courier_name, courier: courier_name,
+      label_url,
+      courier_status: 'label_generated',
+      status: 'awaiting_pickup',
+      label_generated_at: new Date(),
+      updated_at: new Date(),
+    };
+    c.markModified('shipment');
+    await c.save();
+
+    res.json({ message: 'Label generated', tracking_number, courier_name, label_url, status: 'awaiting_pickup' });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+// Brand confirms courier pickup → shipment is in transit.
+// PHASE 2: this transition will be driven by the Shiprocket pickup webhook.
+app.post('/api/deals/:id/mark-picked-up', auth, async (req, res) => {
+  try {
+    const c = await Campaign.findById(req.params.id);
+    if (!c) return res.status(404).json({ detail: 'Deal not found' });
+    if (String(c.business_id) !== String(req.user.id)) return res.status(403).json({ detail: 'Not authorized for this deal' });
+    if (!c.shipment) return res.status(404).json({ detail: 'No shipment/label found for this deal yet' });
+    c.shipment = { ...(c.shipment || {}), courier_status: 'shipped', status: 'shipped', shipped_at: new Date(), updated_at: new Date() };
+    c.markModified('shipment');
+    await c.save();
+    res.json({ message: 'Marked as shipped' });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
@@ -2034,14 +2161,14 @@ app.post('/api/gigs/:id/wishlist', auth, async (req, res) => {
 });
 
 // ── Admin: gateway edit/delete, wallet txns, escrow & payout actions ─────────
-app.patch('/api/admin/notification-gateway/:id', adminAuth, (req, res) => res.json({ success: true }));
-app.delete('/api/admin/notification-gateway/:id', adminAuth, (req, res) => res.json({ success: true }));
-app.patch('/api/admin/payment-gateway/:id', adminAuth, (req, res) => res.json({ success: true }));
-app.delete('/api/admin/payment-gateway/:id', adminAuth, (req, res) => res.json({ success: true }));
-app.get('/api/admin/wallet/:id/transactions', adminAuth, (req, res) => res.json([]));
-app.post('/api/admin/escrow/:id/:action', adminAuth, (req, res) => res.json({ success: true }));
-app.post('/api/admin/payouts/:id/hold', adminAuth, (req, res) => res.json({ success: true }));
-app.post('/api/admin/payouts/:id/release', adminAuth, (req, res) => res.json({ success: true }));
+app.patch('/api/admin/notification-gateway/:id', adminAuth, requireCap('edit_settings'), (req, res) => res.json({ success: true }));
+app.delete('/api/admin/notification-gateway/:id', adminAuth, requireCap('edit_settings'), (req, res) => res.json({ success: true }));
+app.patch('/api/admin/payment-gateway/:id', adminAuth, requireCap('edit_settings'), (req, res) => res.json({ success: true }));
+app.delete('/api/admin/payment-gateway/:id', adminAuth, requireCap('edit_settings'), (req, res) => res.json({ success: true }));
+app.get('/api/admin/wallet/:id/transactions', adminAuth, requireCap('view_financials'), (req, res) => res.json([]));
+app.post('/api/admin/escrow/:id/:action', adminAuth, requireCap('release_payouts'), (req, res) => res.json({ success: true }));
+app.post('/api/admin/payouts/:id/hold', adminAuth, requireCap('release_payouts'), (req, res) => res.json({ success: true }));
+app.post('/api/admin/payouts/:id/release', adminAuth, requireCap('release_payouts'), (req, res) => res.json({ success: true }));
 
 // ---- Withdrawals / payouts ----
 app.get('/api/withdrawal/history', auth, (req, res) => res.json([]));
@@ -2113,23 +2240,23 @@ app.delete('/api/business/settings/logo', auth, async (req, res) => {
 });
 
 // ---- Admin endpoints still referenced by the panel (safe placeholders) ----
-app.post('/api/admin/assign-campaign', adminAuth, (req, res) => res.json({ success: true }));
-app.get('/api/admin/payouts', adminAuth, (req, res) => res.json(DEMO.payouts));
-app.post('/api/admin/payouts/batch-release', adminAuth, (req, res) => res.json({ success: true }));
-app.get('/api/admin/financials/revenue', adminAuth, (req, res) => res.json({
+app.post('/api/admin/assign-campaign', adminAuth, requireCap('review_applications'), (req, res) => res.json({ success: true }));
+app.get('/api/admin/payouts', adminAuth, requireCap('view_financials'), (req, res) => res.json(DEMO.payouts));
+app.post('/api/admin/payouts/batch-release', adminAuth, requireCap('release_payouts'), (req, res) => res.json({ success: true }));
+app.get('/api/admin/financials/revenue', adminAuth, requireCap('view_financials'), (req, res) => res.json({
   revenue: 196000, commission: 39200, escrow: 47000,
   series: [
     { label: 'Mon', value: 18000 }, { label: 'Tue', value: 24000 }, { label: 'Wed', value: 15000 },
     { label: 'Thu', value: 31000 }, { label: 'Fri', value: 42000 }, { label: 'Sat', value: 38000 }, { label: 'Sun', value: 28000 }
   ]
 }));
-app.get('/api/admin/financials/overview', adminAuth, (req, res) => res.json({
+app.get('/api/admin/financials/overview', adminAuth, requireCap('view_financials'), (req, res) => res.json({
   gross_revenue: 196000, platform_commission: 39200, creator_payouts: 156800,
   in_escrow: 47000, pending_withdrawals: 15500, tds_collected: 7840, gst_collected: 35280
 }));
-app.get('/api/admin/filter-rules', adminAuth, (req, res) => res.json(DEMO.filterRules));
-app.post('/api/admin/filter-rules/propose', adminAuth, (req, res) => res.json({ success: true }));
-app.post('/api/admin/message/moderate', adminAuth, (req, res) => res.json({ success: true }));
+app.get('/api/admin/filter-rules', adminAuth, requireCap('content_moderation'), (req, res) => res.json(DEMO.filterRules));
+app.post('/api/admin/filter-rules/propose', adminAuth, requireCap('content_moderation'), (req, res) => res.json({ success: true }));
+app.post('/api/admin/message/moderate', adminAuth, requireCap('content_moderation'), (req, res) => res.json({ success: true }));
 
 // 404 handler
 app.use((req, res) => {

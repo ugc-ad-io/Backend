@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const { MIN_CHAT_BALANCE } = require('../utils/chatPolicy');
+const { sendEmail, baseTemplate } = require('../services/emailService');
 
 const fail = (res, status, detail) => res.status(status).json({ detail });
 
@@ -170,8 +171,31 @@ exports.forgotPassword = async (req, res, next) => {
     user.reset_code_expires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
     await user.save();
 
-    // TODO: email the code once SMTP is configured. For now surface it in dev.
     console.log(`[forgot-password] reset code for ${email}: ${code}`);
+
+    // Email the code. Non-blocking: if delivery fails the user still gets the
+    // generic response (and, outside production, the dev_code fallback).
+    try {
+      await sendEmail({
+        to: email,
+        subject: 'Your UGCad.io password reset code',
+        html: baseTemplate({
+          title: 'Password reset',
+          content: `
+            <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Reset your password</h1>
+            <p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#4a4f74;">
+              Use the code below to reset your password. It expires in 15 minutes.
+            </p>
+            <div style="font-size:32px;font-weight:800;letter-spacing:8px;color:#5b6bff;background:#f4f5fb;border-radius:12px;padding:18px 0;text-align:center;">${code}</div>
+            <p style="margin:20px 0 0;font-size:13px;line-height:1.6;color:#9296ba;">
+              If you didn't request this, you can safely ignore this email.
+            </p>`,
+        }),
+      });
+    } catch (mailErr) {
+      console.error('[forgot-password] email send failed:', mailErr.message);
+    }
+
     if (process.env.NODE_ENV !== 'production') generic.dev_code = code;
 
     res.json(generic);

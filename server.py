@@ -42,6 +42,7 @@ from campaign_helpers import (
     get_campaign_completion_percentage,
     map_legacy_to_new_fields
 )
+import admin_caps
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -619,6 +620,22 @@ async def get_current_business_user(current_user: dict = Depends(get_current_use
         raise HTTPException(status_code=403, detail="Only business users can access these settings")
     return current_user
 
+
+def require_cap(capability: str):
+    """FastAPI dependency factory: ensures the caller is an admin AND holds
+    `capability` (per admin_caps.can). Mirrors the Express requireCap middleware
+    so both backends enforce the same RBAC matrix. Returns current_user so routes
+    can keep `current_user: dict = Depends(require_cap("..."))`."""
+    async def _dep(current_user: dict = Depends(get_current_user)) -> dict:
+        if current_user.get("role") != UserRole.ADMIN:
+            raise HTTPException(status_code=403, detail="Admin access required")
+        if not admin_caps.can(current_user, capability):
+            role = admin_caps.normalize_role(current_user.get("admin_role"))
+            label = admin_caps.ROLE_LABELS.get(role, role)
+            raise HTTPException(status_code=403, detail=f"Your role ({label}) cannot perform this action")
+        return current_user
+    return _dep
+
 async def get_approved_business_user(current_user: dict = Depends(get_current_user)):
     if current_user.get("role") != UserRole.BUSINESS:
         raise HTTPException(status_code=403, detail="Only business users can access this resource")
@@ -831,6 +848,19 @@ async def notify_user(user_id: str, title: str, message: str, link: Optional[str
         "created_at": now_iso(),
         "created_by": "system",
     })
+
+async def enforce_suspension(user: dict):
+    """Block login for a suspended account, or auto-lift the suspension once its
+    window has passed. ISO-8601 UTC timestamps compare correctly as strings."""
+    if not user or not user.get("suspended"):
+        return
+    until = user.get("suspended_until")
+    if until and now_iso() >= until:
+        q = {"id": user["id"]} if user.get("id") else {"email": user.get("email")}
+        await db.users.update_one(q, {"$set": {"suspended": False, "status": "active", "suspended_until": None}})
+        return
+    when = f" until {str(until)[:10]}" if until else ""
+    raise HTTPException(status_code=403, detail=f"Account suspended{when}. Reason: {user.get('suspended_reason') or 'policy violation'}")
 
 async def record_match_event(event_type: str, brand_id: Optional[str], creator_id: Optional[str], card_id: Optional[str] = None, campaign_id: Optional[str] = None, extra: Optional[dict] = None):
     """PRD 5.8: capture match-interaction events for later analysis (not shown
@@ -2042,7 +2072,10 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
     if user.get('banned', False):
         ban_reason = user.get('ban_reason', 'Account suspended')
         raise HTTPException(status_code=403, detail=f"Account banned: {ban_reason}")
-    
+
+    # Block a suspended account (auto-lifts once the suspension window passes).
+    await enforce_suspension(user)
+
     # Check if 2FA is enabled
     if user.get('two_factor_enabled'):
         if not totp_token:
@@ -2072,6 +2105,8 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
         "level": user.get('level'),
         "role": user.get('role'),
         "admin_role": user.get('admin_role'),
+        "admin_caps": user.get('admin_caps', []),
+        "admin_scope": user.get('admin_scope', 'all'),
         "assigned_categories": user.get('assigned_categories', []),
         "profile_completed": user.get('profile_completed', False),
         "approval_status": user.get('approval_status', ApprovalStatus.PENDING),
@@ -2154,6 +2189,7 @@ async def google_auth(data: GoogleAuthRequest):
         # Block banned accounts, mirroring /auth/login.
         if user.get("banned", False):
             raise HTTPException(status_code=403, detail=f"Account banned: {user.get('ban_reason', 'Account suspended')}")
+        await enforce_suspension(user)
 
         # Backfill/link fields on the existing account. Match by email (always
         # present + unique) since a legacy account may have no "id" field.
@@ -2180,6 +2216,8 @@ async def google_auth(data: GoogleAuthRequest):
         "level": user.get("level"),
         "role": user.get("role"),
         "admin_role": user.get("admin_role"),
+        "admin_caps": user.get("admin_caps", []),
+        "admin_scope": user.get("admin_scope", "all"),
         "assigned_categories": user.get("assigned_categories", []),
         "profile_completed": user.get("profile_completed", False),
         "approval_status": user.get("approval_status", ApprovalStatus.PENDING),
@@ -4006,7 +4044,7 @@ def shortlist_candidate_public(candidate: dict, creator: Optional[dict], deliver
 
 
 @api_router.get("/admin/match-queue")
-async def get_match_queue(current_user: dict = Depends(get_current_user)):
+async def get_match_queue(current_user: dict = Depends(require_cap("review_applications"))):
     """Ops view: briefs that requested matches and await a shortlist."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view the match queue")
@@ -4018,7 +4056,7 @@ async def get_match_queue(current_user: dict = Depends(get_current_user)):
 
 
 @api_router.post("/admin/campaigns/{campaign_id}/shortlist")
-async def create_campaign_shortlist(campaign_id: str, data: ShortlistCreate, current_user: dict = Depends(get_current_user)):
+async def create_campaign_shortlist(campaign_id: str, data: ShortlistCreate, current_user: dict = Depends(require_cap("review_applications"))):
     """Ops submits a 3-5 creator shortlist (with a 'why we chose them' note each)."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can create a shortlist")
@@ -4186,7 +4224,7 @@ async def get_creator_capacity_status(current_user: dict = Depends(get_current_u
 
 
 @api_router.get("/admin/match-metrics")
-async def get_match_metrics(current_user: dict = Depends(get_current_user)):
+async def get_match_metrics(current_user: dict = Depends(require_cap("review_applications"))):
     """PRD 5.8: aggregate match-interaction metrics for ops (not shown publicly)."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view match metrics")
@@ -4661,7 +4699,7 @@ async def request_chat_false_positive(violation_id: str, data: ChatFalsePositive
     return {"message": "False-positive review submitted", "review": request_doc}
 
 @api_router.post("/admin/chat/violations/{violation_id}/false-positive-review")
-async def review_chat_false_positive(violation_id: str, data: ChatFalsePositiveReview, current_user: dict = Depends(get_current_user)):
+async def review_chat_false_positive(violation_id: str, data: ChatFalsePositiveReview, current_user: dict = Depends(require_cap("content_moderation"))):
     if current_user["role"] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
         raise HTTPException(status_code=403, detail="Admin access required")
     if data.status not in ["approved", "rejected"]:
@@ -5085,7 +5123,7 @@ async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_
     return items
 
 @api_router.get("/admin/violations")
-async def get_all_violations(current_user: dict = Depends(get_current_user)):
+async def get_all_violations(current_user: dict = Depends(require_cap("content_moderation"))):
     """Admin endpoint to view all violations"""
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -5094,7 +5132,7 @@ async def get_all_violations(current_user: dict = Depends(get_current_user)):
     return violations
 
 @api_router.get("/admin/chats")
-async def get_all_chats(current_user: dict = Depends(get_current_user)):
+async def get_all_chats(current_user: dict = Depends(require_cap("content_moderation"))):
     """Admin endpoint to view all chat conversations"""
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -5175,7 +5213,7 @@ async def get_all_chats(current_user: dict = Depends(get_current_user)):
     return conversations
 
 @api_router.get("/admin/chat/{user1_id}/{user2_id}")
-async def get_chat_for_admin(user1_id: str, user2_id: str, current_user: dict = Depends(get_current_user)):
+async def get_chat_for_admin(user1_id: str, user2_id: str, current_user: dict = Depends(require_cap("content_moderation"))):
     """Admin endpoint to view specific chat conversation"""
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -5256,7 +5294,7 @@ async def _restore_strike_for_violation(violation: dict, reviewed_by: str) -> No
 
 
 @api_router.post("/admin/message/moderate")
-async def moderate_chat_message(data: MessageModerationAction, current_user: dict = Depends(get_current_user)):
+async def moderate_chat_message(data: MessageModerationAction, current_user: dict = Depends(require_cap("content_moderation"))):
     """Per-message oversight action: approve (false positive), confirm violation
     (apply strike + notify), or escalate (warn / suspend the sender)."""
     if current_user["role"] not in OPS_ROLES:
@@ -5365,7 +5403,7 @@ DEFAULT_FILTER_RULES = [
 
 
 @api_router.get("/admin/filter-rules")
-async def list_filter_rules(current_user: dict = Depends(get_current_user)):
+async def list_filter_rules(current_user: dict = Depends(require_cap("content_moderation"))):
     """List the contact-info filter rules (regex patterns and keyword lists)."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -5377,7 +5415,7 @@ async def list_filter_rules(current_user: dict = Depends(get_current_user)):
 
 
 @api_router.post("/admin/filter-rules/propose")
-async def propose_filter_rule(data: FilterRulePropose, current_user: dict = Depends(get_current_user)):
+async def propose_filter_rule(data: FilterRulePropose, current_user: dict = Depends(require_cap("content_moderation"))):
     """Propose a new filter rule. Proposals stay disabled pending senior-admin
     (ADMIN role) review before they go live."""
     if current_user["role"] not in OPS_ROLES:
@@ -5744,7 +5782,7 @@ async def auto_approve_stale_submissions() -> int:
 
 
 @api_router.post("/admin/payouts/run-due")
-async def run_due_payouts(current_user: dict = Depends(get_current_user)):
+async def run_due_payouts(current_user: dict = Depends(require_cap("release_payouts"))):
     """Sweep: release due payouts and auto-approve stale submissions. Safe to call
     on a schedule (cron) or manually from the admin dashboard."""
     if current_user["role"] not in OPS_ROLES:
@@ -5788,7 +5826,7 @@ async def get_creator_penalties(current_user: dict = Depends(get_current_user)):
 
 
 @api_router.post("/admin/late-offenses/{offense_id}/waive")
-async def waive_late_offense(offense_id: str, current_user: dict = Depends(get_current_user)):
+async def waive_late_offense(offense_id: str, current_user: dict = Depends(require_cap("manage_deals"))):
     """PRD 8.8 exception grants: admin waives a late-delivery penalty (medical,
     platform issue, brand-caused delay, force majeure)."""
     if current_user["role"] not in OPS_ROLES:
@@ -5861,7 +5899,7 @@ async def report_user(data: ReportUserSubmit, current_user: dict = Depends(get_c
 
 
 @api_router.post("/admin/brand-penalty")
-async def apply_brand_penalty(data: BrandPenaltyApply, current_user: dict = Depends(get_current_user)):
+async def apply_brand_penalty(data: BrandPenaltyApply, current_user: dict = Depends(require_cap("warn_suspend_users"))):
     """PRD 8.9: admin applies a brand-side penalty (poaching ₹25k, fraud probation,
     suspension, monetary fee, warning)."""
     if current_user["role"] not in OPS_ROLES:
@@ -6400,7 +6438,7 @@ def _business_days_from(start: datetime, days: int) -> datetime:
 
 
 @api_router.get("/admin/disputes")
-async def list_disputes(status: Optional[str] = None, dispute_type: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+async def list_disputes(status: Optional[str] = None, dispute_type: Optional[str] = None, current_user: dict = Depends(require_cap("rule_disputes"))):
     """PRD 9.4: admin dispute dashboard — all disputes sorted by age with SLA countdown."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view disputes")
@@ -6420,7 +6458,7 @@ async def list_disputes(status: Optional[str] = None, dispute_type: Optional[str
 
 
 @api_router.get("/admin/disputes/{dispute_id}")
-async def get_dispute_detail(dispute_id: str, current_user: dict = Depends(get_current_user)):
+async def get_dispute_detail(dispute_id: str, current_user: dict = Depends(require_cap("rule_disputes"))):
     """PRD 9.4: full evidence review panel — brief, timeline, chat, content, shipping, prior disputes."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view disputes")
@@ -6450,7 +6488,7 @@ async def get_dispute_detail(dispute_id: str, current_user: dict = Depends(get_c
 
 
 @api_router.post("/admin/disputes/{dispute_id}/request-info")
-async def dispute_request_info(dispute_id: str, data: DisputeInfoRequest, current_user: dict = Depends(get_current_user)):
+async def dispute_request_info(dispute_id: str, data: DisputeInfoRequest, current_user: dict = Depends(require_cap("rule_disputes"))):
     """PRD 9.4: admin requests more info; SLA pauses; 72h response window."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can request info")
@@ -6465,7 +6503,7 @@ async def dispute_request_info(dispute_id: str, data: DisputeInfoRequest, curren
 
 
 @api_router.post("/admin/disputes/{dispute_id}/rule")
-async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict = Depends(get_current_user)):
+async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict = Depends(require_cap("rule_disputes"))):
     """PRD 9.4/9.5: admin ruling + financial execution within 24h."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can rule on disputes")
@@ -6577,6 +6615,30 @@ class DealRevisionRequest(BaseModel):
     feedback: str
     requested_changes: Optional[List[str]] = None
 
+class ShipLabelDimensions(BaseModel):
+    length: Optional[float] = None   # cm
+    width: Optional[float] = None    # cm
+    height: Optional[float] = None    # cm
+
+class ShipLabelPickupAddress(BaseModel):
+    full_name: str
+    phone: str
+    line1: str
+    line2: Optional[str] = ""
+    city: str
+    state: str
+    pincode: str
+    country: Optional[str] = "India"
+
+class ShipLabelRequest(BaseModel):
+    # Brand's only inputs for the Shiprocket flow: product details + their pickup address.
+    # The creator's delivery address is pulled from their profile server-side and is
+    # NEVER returned to the brand.
+    description: str
+    weight: float                       # kg
+    dimensions: Optional[ShipLabelDimensions] = None
+    pickup_address: ShipLabelPickupAddress
+
 async def get_brand_deal_campaign(deal_id: str, current_user: dict) -> dict:
     """Resolve a deal id to a campaign and assert the caller is its brand."""
     if current_user.get('role') != UserRole.BUSINESS:
@@ -6616,6 +6678,120 @@ async def mark_deal_delivered(deal_id: str, current_user: dict = Depends(get_cur
     await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "delivered", "Shipment was marked delivered.")
     await insert_deal_system_message(campaign, "Shipment was marked delivered.")
     return {"message": "Marked delivered"}
+
+
+def creator_delivery_address(user: dict) -> Optional[dict]:
+    """Build a Shiprocket-ready delivery address from a creator's saved profile.
+    Defensive: reads from the structured profile.address (set via /shipping/address)
+    OR the flat fields captured at signup (profile.address string + city/state/pincode).
+    Returns None if there isn't enough to ship to."""
+    user = user or {}
+    profile = user.get("profile") or {}
+    addr = profile.get("address")
+    # Structured address dict (from /shipping/address) takes priority.
+    if isinstance(addr, dict):
+        line1 = addr.get("line1")
+        built = {
+            "full_name": addr.get("full_name") or profile.get("fullName") or user.get("nickname") or "",
+            "phone": addr.get("phone") or user.get("phone") or profile.get("phone") or user.get("phone_number") or "",
+            "line1": line1 or "",
+            "line2": addr.get("line2") or "",
+            "city": addr.get("city") or profile.get("city") or "",
+            "state": addr.get("state") or profile.get("state") or "",
+            "pincode": addr.get("pincode") or profile.get("pincode") or "",
+            "country": addr.get("country") or profile.get("country") or "India",
+        }
+    else:
+        # Flat signup fields: profile.address is a plain string.
+        line1 = addr if isinstance(addr, str) else (profile.get("address") or user.get("address"))
+        built = {
+            "full_name": profile.get("fullName") or user.get("full_name") or user.get("nickname") or "",
+            "phone": user.get("phone") or profile.get("phone") or user.get("phone_number") or "",
+            "line1": line1 or "",
+            "line2": "",
+            "city": profile.get("city") or user.get("city") or "",
+            "state": profile.get("state") or user.get("state") or "",
+            "pincode": profile.get("pincode") or user.get("pincode") or "",
+            "country": profile.get("country") or user.get("country") or "India",
+        }
+    # Must have at least a line1 + pincode to generate a label.
+    if not built["line1"] or not built["pincode"]:
+        return None
+    return built
+
+
+@api_router.post("/deals/{deal_id}/ship-label")
+async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_user: dict = Depends(get_current_user)):
+    """Brand submits product details + pickup address; the platform generates a
+    pre-paid shipping label. The creator's delivery address is pulled from their
+    profile here and passed to the courier — it is NEVER exposed to the brand.
+
+    PHASE 1: label + tracking are MOCKED. Replace the marked block below with a
+    real Shiprocket 'create order + generate label' call when the API is wired in."""
+    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    if not campaign.get("requires_shipment"):
+        raise HTTPException(status_code=400, detail="This deal does not require a shipment")
+
+    creator = await db.users.find_one({"id": campaign.get("selected_creator")}, {"_id": 0}) or {}
+    delivery = creator_delivery_address(creator)
+    if not delivery:
+        raise HTTPException(status_code=400, detail="The creator hasn't set a complete delivery address yet. Ask them to add it in their profile.")
+
+    dims = (data.dimensions.dict() if data.dimensions else {}) or {}
+
+    # ─── MOCK SHIPROCKET (Phase 1) ─────────────────────────────────────────────
+    # A real integration would: authenticate, create an order with pickup +
+    # delivery + package, request a courier + label, and return awb/label_url.
+    short = uuid.uuid4().hex[:10].upper()
+    tracking_number = f"MOCK{short}"
+    label_url = f"/mock-labels/{campaign['id']}.pdf"
+    courier_name = "Shiprocket (mock)"
+    # ───────────────────────────────────────────────────────────────────────────
+
+    shipment_doc = {
+        "campaign_id": campaign["id"],
+        "product": {"description": data.description, "weight": data.weight, "dimensions": dims},
+        "pickup_address": data.pickup_address.dict(),
+        "delivery_address": delivery,          # internal only — never sent to the brand
+        "tracking_number": tracking_number,
+        "courier_name": courier_name,
+        "label_url": label_url,
+        "courier_status": "label_generated",
+        "status": "awaiting_pickup",
+        "label_generated_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await db.shipments.update_one({"campaign_id": campaign["id"]}, {"$set": shipment_doc}, upsert=True)
+    await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "label_generated",
+                               "Shipping label generated. Awaiting courier pickup.")
+    await insert_deal_system_message(campaign, "The brand generated a shipping label. The product will be picked up by the courier shortly.")
+
+    # Brand-safe response: product + tracking + label, but NOT the creator's address.
+    return {
+        "message": "Label generated",
+        "tracking_number": tracking_number,
+        "courier_name": courier_name,
+        "label_url": label_url,
+        "status": "awaiting_pickup",
+    }
+
+
+@api_router.post("/deals/{deal_id}/mark-picked-up")
+async def mark_shipment_picked_up(deal_id: str, current_user: dict = Depends(get_current_user)):
+    """Brand confirms the courier has picked up the package → deal moves to 'Shipped'.
+    PHASE 2: this transition will be driven automatically by the Shiprocket pickup
+    webhook instead of a manual button."""
+    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    sh = await db.shipments.find_one({"campaign_id": campaign["id"]}, {"_id": 0})
+    if not sh:
+        raise HTTPException(status_code=404, detail="No shipment/label found for this deal yet")
+    await db.shipments.update_one(
+        {"campaign_id": campaign["id"]},
+        {"$set": {"courier_status": "shipped", "status": "shipped", "shipped_at": now_iso(), "updated_at": now_iso()}},
+    )
+    await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "shipped", "Package picked up by courier — shipment is in transit.")
+    await insert_deal_system_message(campaign, "The package has been picked up by the courier and is on its way.")
+    return {"message": "Marked as shipped"}
 
 @api_router.post("/deals/{deal_id}/approve")
 async def approve_deal_content(deal_id: str, current_user: dict = Depends(get_current_user)):
@@ -7048,7 +7224,7 @@ async def get_payout_ranges(current_user: dict = Depends(get_current_user)):
 # Admin Routes
 @api_router.get("/admin/pending-profiles")
 async def get_pending_profiles(status: Optional[str] = None,
-                               current_user: dict = Depends(get_current_user)):
+                               current_user: dict = Depends(require_cap("review_applications"))):
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
 
@@ -7070,7 +7246,7 @@ async def get_pending_profiles(status: Optional[str] = None,
     return profiles
 
 @api_router.post("/admin/approve-profile")
-async def approve_profile(data: ApprovalAction, current_user: dict = Depends(get_current_user)):
+async def approve_profile(data: ApprovalAction, current_user: dict = Depends(require_cap("review_applications"))):
     if current_user['role'] not in [UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Admin access required")
 
@@ -7132,7 +7308,7 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(get
     return {"success": True, "message": "Profile updated", "approval_status": status}
 
 @api_router.get("/admin/pending-campaigns")
-async def get_pending_campaigns(current_user: dict = Depends(get_current_user)):
+async def get_pending_campaigns(current_user: dict = Depends(require_cap("review_applications"))):
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
         raise HTTPException(status_code=403, detail="Admin access required")
     
@@ -7144,7 +7320,7 @@ async def get_pending_campaigns(current_user: dict = Depends(get_current_user)):
     return _json_safe(campaigns)
 
 @api_router.post("/admin/approve-campaign")
-async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(get_current_user)):
+async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(require_cap("review_applications"))):
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
 
@@ -7206,7 +7382,7 @@ async def auto_assign_campaign_manager(campaign_id: str):
     )
 
 @api_router.post("/admin/assign-campaign")
-async def manually_assign_campaign(campaign_id: str, manager_id: str, current_user: dict = Depends(get_current_user)):
+async def manually_assign_campaign(campaign_id: str, manager_id: str, current_user: dict = Depends(require_cap("review_applications"))):
     """Manually assign campaign to specific campaign manager"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -7234,7 +7410,7 @@ async def manually_assign_campaign(campaign_id: str, manager_id: str, current_us
     }
 
 @api_router.get("/admin/campaign-assignments")
-async def get_campaign_assignments(current_user: dict = Depends(get_current_user)):
+async def get_campaign_assignments(current_user: dict = Depends(require_cap("review_applications"))):
     """Get all campaign manager assignments"""
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -7263,7 +7439,7 @@ async def get_campaign_assignments(current_user: dict = Depends(get_current_user
     return assignments
 
 @api_router.post("/admin/manage-role")
-async def manage_role(data: RoleUpdate, current_user: dict = Depends(get_current_user)):
+async def manage_role(data: RoleUpdate, current_user: dict = Depends(require_cap("manage_roles"))):
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
     
@@ -7298,7 +7474,7 @@ async def get_admin_stats(current_user: dict = Depends(get_current_user)):
     }
 
 @api_router.get("/admin/users")
-async def get_all_users(current_user: dict = Depends(get_current_user)):
+async def get_all_users(current_user: dict = Depends(require_cap("user_management"))):
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
     
@@ -7306,7 +7482,7 @@ async def get_all_users(current_user: dict = Depends(get_current_user)):
     return _json_safe(users)
 
 @api_router.get("/admin/user/{user_id}")
-async def get_user_details(user_id: str, current_user: dict = Depends(get_current_user)):
+async def get_user_details(user_id: str, current_user: dict = Depends(require_cap("user_management"))):
     """Get detailed information for a specific user"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -7318,7 +7494,7 @@ async def get_user_details(user_id: str, current_user: dict = Depends(get_curren
     return user
 
 @api_router.post("/admin/user/update")
-async def update_user(data: UserUpdateRequest, current_user: dict = Depends(get_current_user)):
+async def update_user(data: UserUpdateRequest, current_user: dict = Depends(require_cap("user_management"))):
     """Update user information"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -7353,7 +7529,7 @@ async def update_user(data: UserUpdateRequest, current_user: dict = Depends(get_
     return {"message": "User updated successfully"}
 
 @api_router.post("/admin/user/ban")
-async def ban_user(data: UserBanRequest, current_user: dict = Depends(get_current_user)):
+async def ban_user(data: UserBanRequest, current_user: dict = Depends(require_cap("ban_users"))):
     """Ban or unban a user"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -7410,7 +7586,7 @@ async def _admin_target(user_id, current_user, block_self=False, block_admin=Fal
     return user
 
 @api_router.post("/admin/user/warn")
-async def admin_warn_user(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+async def admin_warn_user(data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("warn_suspend_users"))):
     user_id = data.get("user_id")
     message = (data.get("message") or "").strip()
     await _admin_target(user_id, current_user)
@@ -7422,22 +7598,32 @@ async def admin_warn_user(data: Dict[str, Any] = Body(...), current_user: dict =
     return {"message": "Warning sent"}
 
 @api_router.post("/admin/user/suspend")
-async def admin_suspend_user(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+async def admin_suspend_user(data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("warn_suspend_users"))):
     user_id = data.get("user_id")
     reason = (data.get("reason") or "").strip()
     duration_days = int(data.get("duration_days") or 0)
     await _admin_target(user_id, current_user, block_self=True, block_admin=True)
     until = (datetime.now(timezone.utc) + timedelta(days=duration_days)).isoformat() if duration_days > 0 else None
     await db.users.update_one({"id": user_id}, {"$set": {
-        "status": "suspended", "suspended_reason": reason, "suspended_until": until,
+        "suspended": True, "status": "suspended", "suspended_reason": reason, "suspended_until": until,
         "suspended_by": current_user['id'], "updated_at": now_iso()}})
     span = f" for {duration_days} day(s)" if duration_days else ""
     await notify_user(user_id, "Account suspended", f"Your account has been suspended{span}. Reason: {reason or 'policy violation'}", ntype="warning")
     await log_admin_action(current_user, "user.suspended", target_type="user", target_id=user_id, reason=reason, after={"duration_days": duration_days})
     return {"message": "User suspended"}
 
+@api_router.post("/admin/user/unsuspend")
+async def admin_unsuspend_user(data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("warn_suspend_users"))):
+    user_id = data.get("user_id")
+    await _admin_target(user_id, current_user)
+    await db.users.update_one({"id": user_id}, {"$set": {
+        "suspended": False, "status": "active", "suspended_until": None, "suspended_reason": None, "updated_at": now_iso()}})
+    await notify_user(user_id, "Suspension lifted", "Your account suspension has been lifted — you can log in again.", ntype="info")
+    await log_admin_action(current_user, "user.unsuspended", target_type="user", target_id=user_id)
+    return {"message": "Suspension lifted"}
+
 @api_router.post("/admin/user/message")
-async def admin_message_user(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+async def admin_message_user(data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("user_management"))):
     user_id = data.get("user_id")
     message = (data.get("message") or "").strip()
     await _admin_target(user_id, current_user)
@@ -7448,7 +7634,7 @@ async def admin_message_user(data: Dict[str, Any] = Body(...), current_user: dic
     return {"message": "Message sent"}
 
 @api_router.post("/admin/user/level")
-async def admin_set_level(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+async def admin_set_level(data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("user_management"))):
     user_id = data.get("user_id")
     direction = data.get("direction")   # 'promote' | 'demote'
     user = await _admin_target(user_id, current_user)
@@ -7463,7 +7649,7 @@ async def admin_set_level(data: Dict[str, Any] = Body(...), current_user: dict =
     return {"message": f"Creator {direction}d", "level": new_level, "level_label": cf.CREATOR_LEVELS[new_level]["label"]}
 
 @api_router.post("/admin/user/payout-schedule")
-async def admin_payout_schedule(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+async def admin_payout_schedule(data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("user_management"))):
     user_id = data.get("user_id")
     schedule = data.get("schedule") or "weekly"
     await _admin_target(user_id, current_user)
@@ -7472,7 +7658,7 @@ async def admin_payout_schedule(data: Dict[str, Any] = Body(...), current_user: 
     return {"message": f"Payout schedule set to {schedule}"}
 
 @api_router.post("/admin/user/commission")
-async def admin_set_commission(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+async def admin_set_commission(data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("user_management"))):
     user_id = data.get("user_id")
     rate = float(data.get("commission_rate") or 0)
     await _admin_target(user_id, current_user)
@@ -7481,7 +7667,7 @@ async def admin_set_commission(data: Dict[str, Any] = Body(...), current_user: d
     return {"message": "Commission updated"}
 
 @api_router.post("/admin/user/convert-pro")
-async def admin_convert_pro(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+async def admin_convert_pro(data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("user_management"))):
     user_id = data.get("user_id")
     await _admin_target(user_id, current_user)
     await db.users.update_one({"id": user_id}, {"$set": {"is_pro": True, "plan": "pro", "updated_at": now_iso()}})
@@ -7525,7 +7711,7 @@ CAMPAIGN_CHILD_COLLECTIONS = [
 ]
 
 @api_router.delete("/admin/user/{user_id}")
-async def delete_user(user_id: str, current_user: dict = Depends(get_current_user)):
+async def delete_user(user_id: str, current_user: dict = Depends(require_cap("ban_users"))):
     """Permanently delete a user and ALL of their data (cascade)."""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -7582,7 +7768,7 @@ async def delete_user(user_id: str, current_user: dict = Depends(get_current_use
     return {"message": "User and all related data deleted successfully", "deleted": deleted}
 
 @api_router.get("/admin/withdrawals")
-async def get_all_withdrawals(status: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+async def get_all_withdrawals(status: Optional[str] = None, current_user: dict = Depends(require_cap("view_financials"))):
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
     
@@ -7602,7 +7788,7 @@ async def get_all_withdrawals(status: Optional[str] = None, current_user: dict =
     return withdrawals
 
 @api_router.post("/admin/withdrawals/{withdrawal_id}/approve")
-async def approve_withdrawal(withdrawal_id: str, current_user: dict = Depends(get_current_user)):
+async def approve_withdrawal(withdrawal_id: str, current_user: dict = Depends(require_cap("release_payouts"))):
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
     
@@ -7635,7 +7821,7 @@ async def approve_withdrawal(withdrawal_id: str, current_user: dict = Depends(ge
     return {"message": "Withdrawal approved successfully", "receipt": receipt}
 
 @api_router.post("/admin/withdrawals/{withdrawal_id}/reject")
-async def reject_withdrawal(withdrawal_id: str, reason: str, current_user: dict = Depends(get_current_user)):
+async def reject_withdrawal(withdrawal_id: str, reason: str, current_user: dict = Depends(require_cap("release_payouts"))):
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
     
@@ -7826,7 +8012,7 @@ async def upload_campaign_file(file: UploadFile = File(...), current_user: dict 
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
 
 @api_router.post("/admin/users/{user_id}/update-role")
-async def update_user_role(user_id: str, role: UserRole, current_user: dict = Depends(get_current_user)):
+async def update_user_role(user_id: str, role: UserRole, current_user: dict = Depends(require_cap("manage_roles"))):
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Only admins can update user roles")
     
@@ -7853,7 +8039,7 @@ async def update_user_role(user_id: str, role: UserRole, current_user: dict = De
 
 # Payment Gateway Management Endpoints
 @api_router.post("/admin/payment-gateway")
-async def create_payment_gateway(data: PaymentGatewayConfig, current_user: dict = Depends(get_current_user)):
+async def create_payment_gateway(data: PaymentGatewayConfig, current_user: dict = Depends(require_cap("edit_settings"))):
     """Create or update payment gateway configuration"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -7897,7 +8083,7 @@ async def create_payment_gateway(data: PaymentGatewayConfig, current_user: dict 
     return {"message": f"Payment gateway {data.gateway_name} configured successfully"}
 
 @api_router.get("/admin/payment-gateways")
-async def get_payment_gateways(current_user: dict = Depends(get_current_user)):
+async def get_payment_gateways(current_user: dict = Depends(require_cap("edit_settings"))):
     """Get all payment gateway configurations"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -7909,7 +8095,7 @@ async def get_payment_gateways(current_user: dict = Depends(get_current_user)):
 async def update_payment_gateway(
     gateway_name: str,
     data: PaymentGatewayUpdate,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(require_cap("edit_settings"))
 ):
     """Update payment gateway settings"""
     if current_user['role'] != UserRole.ADMIN:
@@ -7939,7 +8125,7 @@ async def update_payment_gateway(
     return {"message": f"Gateway {gateway_name} updated successfully"}
 
 @api_router.delete("/admin/payment-gateway/{gateway_name}")
-async def delete_payment_gateway(gateway_name: str, current_user: dict = Depends(get_current_user)):
+async def delete_payment_gateway(gateway_name: str, current_user: dict = Depends(require_cap("edit_settings"))):
     """Delete payment gateway configuration"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8164,7 +8350,7 @@ async def verify_payment(
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.get("/admin/payment-transactions")
-async def get_payment_transactions(current_user: dict = Depends(get_current_user)):
+async def get_payment_transactions(current_user: dict = Depends(require_cap("view_financials"))):
     """Get all payment transactions"""
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8267,7 +8453,7 @@ async def cashfree_webhook(request: dict):
 
 # Notification Gateway Management Endpoints
 @api_router.post("/admin/notification-gateway")
-async def create_notification_gateway(data: NotificationGatewayConfig, current_user: dict = Depends(get_current_user)):
+async def create_notification_gateway(data: NotificationGatewayConfig, current_user: dict = Depends(require_cap("edit_settings"))):
     """Create or update notification gateway configuration"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8307,7 +8493,7 @@ async def create_notification_gateway(data: NotificationGatewayConfig, current_u
     return {"message": f"Notification gateway {data.provider} configured successfully"}
 
 @api_router.get("/admin/notification-gateways")
-async def get_notification_gateways(current_user: dict = Depends(get_current_user)):
+async def get_notification_gateways(current_user: dict = Depends(require_cap("edit_settings"))):
     """Get all notification gateway configurations"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8328,7 +8514,7 @@ async def get_notification_gateways(current_user: dict = Depends(get_current_use
     return gateways
 
 @api_router.patch("/admin/notification-gateway/{gateway_id}")
-async def update_notification_gateway(gateway_id: str, enabled: bool, current_user: dict = Depends(get_current_user)):
+async def update_notification_gateway(gateway_id: str, enabled: bool, current_user: dict = Depends(require_cap("edit_settings"))):
     """Toggle notification gateway enabled status"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8345,7 +8531,7 @@ async def update_notification_gateway(gateway_id: str, enabled: bool, current_us
     return {"message": f"Gateway {gateway_id} updated"}
 
 @api_router.delete("/admin/notification-gateway/{gateway_id}")
-async def delete_notification_gateway(gateway_id: str, current_user: dict = Depends(get_current_user)):
+async def delete_notification_gateway(gateway_id: str, current_user: dict = Depends(require_cap("edit_settings"))):
     """Delete notification gateway"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8451,7 +8637,7 @@ async def send_notification(data: SendNotificationRequest, current_user: dict = 
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.get("/admin/notification-logs")
-async def get_notification_logs(current_user: dict = Depends(get_current_user)):
+async def get_notification_logs(current_user: dict = Depends(require_cap("edit_settings"))):
     """Get notification sending logs"""
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8501,7 +8687,7 @@ async def mark_all_read(current_user: dict = Depends(get_current_user)):
     return {"message": "All notifications marked as read"}
 
 @api_router.post("/admin/broadcast-notification")
-async def broadcast_notification(data: BroadcastNotification, current_user: dict = Depends(get_current_user)):
+async def broadcast_notification(data: BroadcastNotification, current_user: dict = Depends(require_cap("user_management"))):
     """Broadcast in-app notification to multiple users"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8576,7 +8762,7 @@ async def create_notification(
 
 # Staff Management
 @api_router.post("/admin/staff/create")
-async def create_staff(data: StaffCreate, current_user: dict = Depends(get_current_user)):
+async def create_staff(data: StaffCreate, current_user: dict = Depends(require_cap("manage_roles"))):
     """Create staff member (campaign manager or support staff)"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8656,7 +8842,7 @@ async def get_all_staff(current_user: dict = Depends(get_current_user)):
     return staff
 
 @api_router.patch("/admin/staff/permissions")
-async def update_staff_permissions(data: PermissionUpdate, current_user: dict = Depends(get_current_user)):
+async def update_staff_permissions(data: PermissionUpdate, current_user: dict = Depends(require_cap("manage_roles"))):
     """Update staff permissions"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8708,6 +8894,8 @@ def _map_staff_row(u: dict) -> dict:
         "nickname": u.get("nickname"),
         "admin_role": u.get("admin_role") or "founder",
         "assigned_categories": u.get("assigned_categories") or [],
+        "admin_caps": u.get("admin_caps") or [],
+        "admin_scope": u.get("admin_scope") or "all",
     }
 
 
@@ -8725,7 +8913,7 @@ async def admin_get_categories(current_user: dict = Depends(get_current_user)):
 
 @api_router.post("/admin/staff/role")
 async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Request = None,
-                               current_user: dict = Depends(get_current_user)):
+                               current_user: dict = Depends(require_cap("manage_roles"))):
     """Assign / change an admin's sub-role, or grant admin to a new email
     (creating the account with a one-time temp password). Founder-only."""
     if not _is_founder_admin(current_user):
@@ -8734,8 +8922,13 @@ async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Reques
     user_id = data.get("user_id")
     email = (data.get("email") or "").strip().lower()
     admin_role = data.get("admin_role")
-    if admin_role not in ADMIN_SUB_ROLES:
+    if admin_role not in admin_caps.ADMIN_ROLES:
         raise HTTPException(status_code=400, detail="Invalid role")
+    # Custom admins carry an explicit capability list + data scope; other roles
+    # derive their capabilities from the fixed CAPS matrix.
+    is_custom = admin_role == "custom"
+    custom_caps = [c for c in (data.get("admin_caps") or []) if c in admin_caps.ALL_CAPS] if is_custom else []
+    custom_scope = data.get("admin_scope") if data.get("admin_scope") in ("all", "creator", "business") else "all"
 
     user = None
     if user_id:
@@ -8758,6 +8951,8 @@ async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Reques
             "password": hash_password(temp_password),
             "role": UserRole.ADMIN,
             "admin_role": admin_role,
+            "admin_caps": custom_caps,
+            "admin_scope": custom_scope if is_custom else "all",
             "approval_status": "approved",
             "profile_completed": True,
             "assigned_categories": [],
@@ -8775,6 +8970,8 @@ async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Reques
             {"$set": {
                 "role": UserRole.ADMIN,
                 "admin_role": admin_role,
+                "admin_caps": custom_caps,
+                "admin_scope": custom_scope if is_custom else "all",
                 "approval_status": "approved",
                 "profile_completed": True,
                 "updated_at": now_iso(),
@@ -8787,7 +8984,7 @@ async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Reques
         "staff.created" if temp_password else "staff.role_changed",
         target_type="user", target_id=user["id"],
         after={"role": "admin", "admin_role": admin_role},
-        reason=f"{'Created' if temp_password else 'Set'} {user['email']} → {ADMIN_ROLE_LABELS[admin_role]}",
+        reason=f"{'Created' if temp_password else 'Set'} {user['email']} → {admin_caps.ROLE_LABELS.get(admin_role, admin_role)}",
         request=request,
     )
     return {
@@ -8800,7 +8997,7 @@ async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Reques
 
 @api_router.post("/admin/staff/revoke")
 async def admin_revoke_staff(data: Dict[str, Any] = Body(...), request: Request = None,
-                             current_user: dict = Depends(get_current_user)):
+                             current_user: dict = Depends(require_cap("manage_roles"))):
     """Revoke admin access entirely (demote back to a regular creator). Founder-only."""
     if not _is_founder_admin(current_user):
         raise HTTPException(status_code=403, detail="Only the founder can revoke admin roles")
@@ -8820,7 +9017,7 @@ async def admin_revoke_staff(data: Dict[str, Any] = Body(...), request: Request 
 
 @api_router.post("/admin/staff/categories")
 async def admin_set_staff_categories(data: Dict[str, Any] = Body(...),
-                                     current_user: dict = Depends(get_current_user)):
+                                     current_user: dict = Depends(require_cap("manage_roles"))):
     """Set the categories an ops admin is responsible for (work distribution). Founder-only."""
     if not _is_founder_admin(current_user):
         raise HTTPException(status_code=403, detail="Only the founder can assign categories")
@@ -8838,7 +9035,7 @@ async def admin_set_staff_categories(data: Dict[str, Any] = Body(...),
 
 # Payout Ranges Management
 @api_router.get("/admin/payout-ranges")
-async def admin_get_payout_ranges(current_user: dict = Depends(get_current_user)):
+async def admin_get_payout_ranges(current_user: dict = Depends(require_cap("view_financials"))):
     """Get all payout ranges (including inactive) for admin management."""
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8846,7 +9043,7 @@ async def admin_get_payout_ranges(current_user: dict = Depends(get_current_user)
     return {"ranges": ranges}
 
 @api_router.post("/admin/payout-ranges")
-async def admin_create_payout_range(data: PayoutRangeCreate, current_user: dict = Depends(get_current_user)):
+async def admin_create_payout_range(data: PayoutRangeCreate, current_user: dict = Depends(require_cap("edit_settings"))):
     """Create a new payout range."""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8869,7 +9066,7 @@ async def admin_create_payout_range(data: PayoutRangeCreate, current_user: dict 
     return doc
 
 @api_router.put("/admin/payout-ranges/{range_id}")
-async def admin_update_payout_range(range_id: str, data: PayoutRangeUpdate, current_user: dict = Depends(get_current_user)):
+async def admin_update_payout_range(range_id: str, data: PayoutRangeUpdate, current_user: dict = Depends(require_cap("edit_settings"))):
     """Update a payout range."""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8889,7 +9086,7 @@ async def admin_update_payout_range(range_id: str, data: PayoutRangeUpdate, curr
     return updated
 
 @api_router.delete("/admin/payout-ranges/{range_id}")
-async def admin_delete_payout_range(range_id: str, current_user: dict = Depends(get_current_user)):
+async def admin_delete_payout_range(range_id: str, current_user: dict = Depends(require_cap("edit_settings"))):
     """Delete a payout range."""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8947,7 +9144,7 @@ async def get_analytics(current_user: dict = Depends(get_current_user)):
 
 # Withdrawal Export
 @api_router.get("/admin/withdrawals/export")
-async def export_withdrawals(current_user: dict = Depends(get_current_user)):
+async def export_withdrawals(current_user: dict = Depends(require_cap("view_financials"))):
     """Export withdrawal requests to CSV"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -8996,7 +9193,7 @@ async def export_withdrawals(current_user: dict = Depends(get_current_user)):
     )
 
 @api_router.get("/admin/creator/{creator_id}/financial-details")
-async def get_creator_financial_details(creator_id: str, current_user: dict = Depends(get_current_user)):
+async def get_creator_financial_details(creator_id: str, current_user: dict = Depends(require_cap("view_financials"))):
     """Get user's bank account and UPI details (admin access)"""
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -9118,7 +9315,7 @@ async def get_audit_logs(action: Optional[str] = None, module: Optional[str] = N
                          date_from: Optional[str] = Query(None, alias="from"),
                          date_to: Optional[str] = Query(None, alias="to"),
                          limit: int = 500,
-                         current_user: dict = Depends(get_current_user)):
+                         current_user: dict = Depends(require_cap("view_audit"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view audit logs")
     query = _build_audit_query(current_user, action, module, admin_id, target_id, date_from, date_to)
@@ -9131,7 +9328,7 @@ async def export_audit_logs(action: Optional[str] = None, module: Optional[str] 
                             admin_id: Optional[str] = None, target_id: Optional[str] = None,
                             date_from: Optional[str] = Query(None, alias="from"),
                             date_to: Optional[str] = Query(None, alias="to"),
-                            current_user: dict = Depends(get_current_user)):
+                            current_user: dict = Depends(require_cap("view_audit"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view audit logs")
     query = _build_audit_query(current_user, action, module, admin_id, target_id, date_from, date_to)
@@ -9181,7 +9378,7 @@ async def get_platform_settings() -> dict:
 
 
 @api_router.get("/admin/settings")
-async def admin_get_settings(current_user: dict = Depends(get_current_user)):
+async def admin_get_settings(current_user: dict = Depends(require_cap("edit_settings"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view settings")
     return {"settings": await get_platform_settings(), "defaults": DEFAULT_PLATFORM_SETTINGS}
@@ -9189,7 +9386,7 @@ async def admin_get_settings(current_user: dict = Depends(get_current_user)):
 
 @api_router.put("/admin/settings")
 async def admin_update_settings(data: Dict[str, Any] = Body(...), request: Request = None,
-                                current_user: dict = Depends(get_current_user)):
+                                current_user: dict = Depends(require_cap("edit_settings"))):
     # Founder-only (PRD 11.3 / 11.14).
     if current_user["role"] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Only the founder/admin can change platform settings")
@@ -9209,7 +9406,7 @@ async def admin_update_settings(data: Dict[str, Any] = Body(...), request: Reque
 
 # --- Financials (PRD 11.11) -------------------------------------------------
 @api_router.get("/admin/financials/overview")
-async def admin_financials_overview(current_user: dict = Depends(get_current_user)):
+async def admin_financials_overview(current_user: dict = Depends(require_cap("view_financials"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view financials")
     escrows = await db.escrow.find({}, {"_id": 0}).to_list(20000)
@@ -9234,7 +9431,7 @@ async def admin_financials_overview(current_user: dict = Depends(get_current_use
 
 
 @api_router.get("/admin/payouts")
-async def admin_payout_queue(status_filter: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+async def admin_payout_queue(status_filter: Optional[str] = None, current_user: dict = Depends(require_cap("view_financials"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view payouts")
     query = {"payout_status": {"$in": ["scheduled", "released"]}}
@@ -9257,7 +9454,7 @@ async def admin_payout_queue(status_filter: Optional[str] = None, current_user: 
 
 
 @api_router.get("/admin/escrow")
-async def admin_escrow_list(current_user: dict = Depends(get_current_user)):
+async def admin_escrow_list(current_user: dict = Depends(require_cap("view_financials"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view escrow")
     escrows = await db.escrow.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
@@ -9287,7 +9484,7 @@ def _csv_response(rows: List[dict], fieldnames: List[str], filename: str):
 
 
 @api_router.get("/admin/financials/tds/export")
-async def export_tds(current_user: dict = Depends(get_current_user)):
+async def export_tds(current_user: dict = Depends(require_cap("export_tax"))):
     """PRD 11.11: TDS certificate prep (Form 16A) — one row per creator earning."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin/finance can export tax docs")
@@ -9306,7 +9503,7 @@ async def export_tds(current_user: dict = Depends(get_current_user)):
 
 
 @api_router.get("/admin/financials/gst/export")
-async def export_gst(current_user: dict = Depends(get_current_user)):
+async def export_gst(current_user: dict = Depends(require_cap("export_tax"))):
     """PRD 11.11: GST-ready invoice export."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin/finance can export tax docs")
@@ -9327,7 +9524,7 @@ async def export_gst(current_user: dict = Depends(get_current_user)):
 
 @api_router.post("/admin/wallet/adjust")
 async def admin_wallet_adjust(data: Dict[str, Any] = Body(...), request: Request = None,
-                              current_user: dict = Depends(get_current_user)):
+                              current_user: dict = Depends(require_cap("adjust_wallet"))):
     # Financial adjustment — founder/admin only, mandatory reason, audit-logged (PRD 11.11/11.16).
     if current_user["role"] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Only the founder/admin can adjust wallet balances")
@@ -9365,7 +9562,7 @@ def _period_cutoff_iso(period: Optional[str]) -> str:
 
 
 @api_router.get("/admin/wallet/{user_id}/transactions")
-async def admin_wallet_transactions(user_id: str, current_user: dict = Depends(get_current_user)):
+async def admin_wallet_transactions(user_id: str, current_user: dict = Depends(require_cap("view_financials"))):
     """PRD 11.11: per-wallet transaction history for the admin wallet view."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view wallet history")
@@ -9383,7 +9580,7 @@ async def admin_wallet_transactions(user_id: str, current_user: dict = Depends(g
 
 
 @api_router.get("/admin/financials/revenue")
-async def admin_financials_revenue(period: Optional[str] = "month", current_user: dict = Depends(get_current_user)):
+async def admin_financials_revenue(period: Optional[str] = "month", current_user: dict = Depends(require_cap("view_financials"))):
     """PRD 11.11 revenue tracking: commission, listing fees, refunded fees and
     penalty collections over the selected rolling period."""
     if current_user["role"] not in OPS_ROLES:
@@ -9438,7 +9635,7 @@ async def _release_one_payout(escrow_id: str) -> bool:
 
 @api_router.post("/admin/payouts/{escrow_id}/hold")
 async def admin_hold_payout(escrow_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
-                            current_user: dict = Depends(get_current_user)):
+                            current_user: dict = Depends(require_cap("release_payouts"))):
     """PRD 11.11: hold a scheduled payout (fraud review / dispute-in-progress)."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can hold payouts")
@@ -9456,7 +9653,7 @@ async def admin_hold_payout(escrow_id: str, data: Dict[str, Any] = Body(...), re
 
 
 @api_router.post("/admin/payouts/{escrow_id}/release")
-async def admin_release_payout(escrow_id: str, request: Request = None, current_user: dict = Depends(get_current_user)):
+async def admin_release_payout(escrow_id: str, request: Request = None, current_user: dict = Depends(require_cap("release_payouts"))):
     """PRD 11.11: release a single scheduled or held payout immediately."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can release payouts")
@@ -9471,7 +9668,7 @@ async def admin_release_payout(escrow_id: str, request: Request = None, current_
 
 @api_router.post("/admin/payouts/batch-release")
 async def admin_batch_release_payouts(data: Dict[str, Any] = Body(...), request: Request = None,
-                                      current_user: dict = Depends(get_current_user)):
+                                      current_user: dict = Depends(require_cap("release_payouts"))):
     """PRD 11.11: batch-release every payout scheduled for a date (or an explicit
     list of escrow ids)."""
     if current_user["role"] not in OPS_ROLES:
@@ -9493,7 +9690,7 @@ async def admin_batch_release_payouts(data: Dict[str, Any] = Body(...), request:
 
 @api_router.post("/admin/escrow/{escrow_id}/release")
 async def admin_release_escrow(escrow_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
-                               current_user: dict = Depends(get_current_user)):
+                               current_user: dict = Depends(require_cap("release_payouts"))):
     """PRD 11.11: release held escrow funds to the creator with a mandatory reason."""
     if current_user["role"] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Only the founder/admin can move escrow funds")
@@ -9531,7 +9728,7 @@ async def admin_release_escrow(escrow_id: str, data: Dict[str, Any] = Body(...),
 
 @api_router.post("/admin/escrow/{escrow_id}/refund")
 async def admin_refund_escrow(escrow_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
-                              current_user: dict = Depends(get_current_user)):
+                              current_user: dict = Depends(require_cap("release_payouts"))):
     """PRD 11.11: refund held escrow funds back to the brand with a mandatory reason."""
     if current_user["role"] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Only the founder/admin can move escrow funds")
@@ -9561,7 +9758,7 @@ async def admin_refund_escrow(escrow_id: str, data: Dict[str, Any] = Body(...), 
 
 
 @api_router.get("/admin/financials/pnl/export")
-async def export_pnl(period: Optional[str] = "month", current_user: dict = Depends(get_current_user)):
+async def export_pnl(period: Optional[str] = "month", current_user: dict = Depends(require_cap("view_financials"))):
     """PRD 11.11: monthly P&L summary export."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin/finance can export financials")
@@ -9586,7 +9783,7 @@ async def export_pnl(period: Optional[str] = "month", current_user: dict = Depen
 
 
 @api_router.get("/admin/financials/reconciliation/export")
-async def export_reconciliation(current_user: dict = Depends(get_current_user)):
+async def export_reconciliation(current_user: dict = Depends(require_cap("view_financials"))):
     """PRD 11.11: reconciliation report (wallet + escrow + bank)."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin/finance can export financials")
@@ -9608,7 +9805,7 @@ async def export_reconciliation(current_user: dict = Depends(get_current_user)):
 
 # --- Shipping Queue (PRD 11.9) ---------------------------------------------
 @api_router.get("/admin/shipping/requests")
-async def admin_shipping_requests(current_user: dict = Depends(get_current_user)):
+async def admin_shipping_requests(current_user: dict = Depends(require_cap("manage_shipping"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view the shipping queue")
     campaigns = await db.campaigns.find(
@@ -9638,7 +9835,7 @@ async def admin_shipping_requests(current_user: dict = Depends(get_current_user)
 
 @api_router.post("/admin/shipping/{campaign_id}/label")
 async def admin_upload_shipping_label(campaign_id: str, file: UploadFile = File(...),
-                                      current_user: dict = Depends(get_current_user)):
+                                      current_user: dict = Depends(require_cap("manage_shipping"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can upload labels")
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
@@ -9659,7 +9856,7 @@ async def admin_upload_shipping_label(campaign_id: str, file: UploadFile = File(
 
 @api_router.post("/admin/shipping/{campaign_id}/ship")
 async def admin_mark_shipped(campaign_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
-                             current_user: dict = Depends(get_current_user)):
+                             current_user: dict = Depends(require_cap("manage_shipping"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can mark shipped")
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
@@ -9682,7 +9879,7 @@ async def admin_mark_shipped(campaign_id: str, data: Dict[str, Any] = Body(...),
 
 # --- Deals admin (PRD 11.7) -------------------------------------------------
 @api_router.get("/admin/deals")
-async def admin_list_deals(state: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+async def admin_list_deals(state: Optional[str] = None, current_user: dict = Depends(require_cap("manage_deals"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view deals")
     query = {"selected_creator": {"$nin": [None, ""]}}
@@ -9707,7 +9904,7 @@ async def admin_list_deals(state: Optional[str] = None, current_user: dict = Dep
 
 
 @api_router.get("/admin/deals/{campaign_id}")
-async def admin_deal_detail(campaign_id: str, current_user: dict = Depends(get_current_user)):
+async def admin_deal_detail(campaign_id: str, current_user: dict = Depends(require_cap("manage_deals"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view deals")
     c = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
@@ -9729,9 +9926,24 @@ async def admin_deal_detail(campaign_id: str, current_user: dict = Depends(get_c
     }
 
 
+@api_router.get("/admin/business/{business_id}/profile")
+async def admin_business_profile(business_id: str, current_user: dict = Depends(require_cap("manage_deals"))):
+    """Read-only brand profile for ops/admin (e.g. the deal room). Merges the
+    business_settings the brand edited with their user doc, same as the brand's
+    own settings page sees."""
+    user = await db.users.find_one({"id": business_id}, {"_id": 0, "password": 0})
+    if not user:
+        raise HTTPException(status_code=404, detail="Business not found")
+    settings = await db.business_settings.find_one({"business_id": business_id}, {"_id": 0})
+    profile = business_profile_defaults(user, (settings or {}).get("profile"))
+    profile["role"] = user.get("role")
+    profile["username"] = user.get("username")
+    return profile
+
+
 @api_router.post("/admin/deals/{campaign_id}/force-transition")
 async def admin_force_transition(campaign_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
-                                 current_user: dict = Depends(get_current_user)):
+                                 current_user: dict = Depends(require_cap("manage_deals"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can force transitions")
     new_status = (data.get("to_state") or data.get("new_status") or "").strip()
@@ -9759,7 +9971,7 @@ async def admin_force_transition(campaign_id: str, data: Dict[str, Any] = Body(.
 
 @api_router.post("/admin/deals/{campaign_id}/notes")
 async def admin_add_deal_note(campaign_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
-                              current_user: dict = Depends(get_current_user)):
+                              current_user: dict = Depends(require_cap("manage_deals"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can add notes")
     note_text = (data.get("note") or "").strip()
