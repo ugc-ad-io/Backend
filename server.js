@@ -563,6 +563,7 @@ app.post('/api/admin/staff/role', adminAuth, requireCap('manage_roles'), async (
     }
 
     let u = await User.findOne(user_id ? { _id: user_id } : { email: String(email || '').toLowerCase() });
+    const isNew = !u; // whether this call creates a brand-new admin account
 
     // Grant-by-email on a brand-new address → create the admin account so the
     // founder can onboard staff without the user pre-registering. Use the password
@@ -602,7 +603,7 @@ app.post('/api/admin/staff/role', adminAuth, requireCap('manage_roles'), async (
     u.profile_completed = true;
     await u.save();
     await writeAdminLog(req, { action: tempPassword || passwordSet ? 'staff.created' : 'staff.role_changed', module: 'settings', target_type: 'user', target_id: String(u._id), before, after: { role: 'admin', admin_role }, reason_text: `${tempPassword || passwordSet ? 'Created/updated' : 'Set'} ${u.email} → ${ROLE_LABELS[admin_role]}${passwordSet ? ' (password set)' : ''}` });
-    res.json({ success: true, created: !!tempPassword, password_set: passwordSet, temp_password: tempPassword, staff: mapStaffRow(u.toObject(), FOUNDER_EMAIL) });
+    res.json({ success: true, created: isNew, password_set: passwordSet, temp_password: tempPassword, staff: mapStaffRow(u.toObject(), FOUNDER_EMAIL) });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 

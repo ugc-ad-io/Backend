@@ -2155,15 +2155,22 @@ async def google_auth(data: GoogleAuthRequest):
         if user.get("banned", False):
             raise HTTPException(status_code=403, detail=f"Account banned: {user.get('ban_reason', 'Account suspended')}")
 
-        # Link the Google identity to an existing (email/password) account.
+        # Backfill/link fields on the existing account. Match by email (always
+        # present + unique) since a legacy account may have no "id" field.
+        link = {}
+        # Legacy accounts (e.g. created by another service) may lack the string
+        # "id" the whole app keys on — backfill one so tokens resolve.
+        if not user.get("id"):
+            link["id"] = str(uuid.uuid4())
         if not user.get("google_id"):
-            link = {"google_id": info.get("sub")}
+            link["google_id"] = info.get("sub")
             if not user.get("profile_photo") and info.get("picture"):
                 link["profile_photo"] = info.get("picture")
-            await db.users.update_one({"id": user["id"]}, {"$set": link})
+        if link:
+            await db.users.update_one({"email": email}, {"$set": link})
             user.update(link)
 
-    token = create_token(user["id"], user["email"], user.get("role"))
+    token = create_token(user["id"], user.get("email", email), user.get("role"))
     return {
         "token": token,
         "user_id": user.get("id"),
@@ -7388,6 +7395,99 @@ async def ban_user(data: UserBanRequest, current_user: dict = Depends(get_curren
                            before={"banned": bool(user.get("banned"))}, after={"banned": data.banned},
                            reason=data.ban_reason)
     return {"message": f"User {action} successfully"}
+
+# ── Admin user actions (warn / suspend / message / level / payout / commission / pro) ──
+async def _admin_target(user_id, current_user, block_self=False, block_admin=False):
+    if current_user['role'] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    user = await db.users.find_one({"id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if block_self and user_id == current_user['id']:
+        raise HTTPException(status_code=400, detail="Cannot perform this on yourself")
+    if block_admin and user.get('role') == UserRole.ADMIN:
+        raise HTTPException(status_code=400, detail="Cannot perform this on admin users")
+    return user
+
+@api_router.post("/admin/user/warn")
+async def admin_warn_user(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+    user_id = data.get("user_id")
+    message = (data.get("message") or "").strip()
+    await _admin_target(user_id, current_user)
+    if not message:
+        raise HTTPException(status_code=400, detail="Warning message is required")
+    await db.users.update_one({"id": user_id}, {"$inc": {"warnings": 1}, "$set": {"updated_at": now_iso()}})
+    await notify_user(user_id, "Warning issued", message, ntype="warning")
+    await log_admin_action(current_user, "user.warned", target_type="user", target_id=user_id, reason=message)
+    return {"message": "Warning sent"}
+
+@api_router.post("/admin/user/suspend")
+async def admin_suspend_user(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+    user_id = data.get("user_id")
+    reason = (data.get("reason") or "").strip()
+    duration_days = int(data.get("duration_days") or 0)
+    await _admin_target(user_id, current_user, block_self=True, block_admin=True)
+    until = (datetime.now(timezone.utc) + timedelta(days=duration_days)).isoformat() if duration_days > 0 else None
+    await db.users.update_one({"id": user_id}, {"$set": {
+        "status": "suspended", "suspended_reason": reason, "suspended_until": until,
+        "suspended_by": current_user['id'], "updated_at": now_iso()}})
+    span = f" for {duration_days} day(s)" if duration_days else ""
+    await notify_user(user_id, "Account suspended", f"Your account has been suspended{span}. Reason: {reason or 'policy violation'}", ntype="warning")
+    await log_admin_action(current_user, "user.suspended", target_type="user", target_id=user_id, reason=reason, after={"duration_days": duration_days})
+    return {"message": "User suspended"}
+
+@api_router.post("/admin/user/message")
+async def admin_message_user(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+    user_id = data.get("user_id")
+    message = (data.get("message") or "").strip()
+    await _admin_target(user_id, current_user)
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+    await notify_user(user_id, "Message from the UGCad team", message, ntype="admin_message")
+    await log_admin_action(current_user, "user.message", target_type="user", target_id=user_id, reason=message)
+    return {"message": "Message sent"}
+
+@api_router.post("/admin/user/level")
+async def admin_set_level(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+    user_id = data.get("user_id")
+    direction = data.get("direction")   # 'promote' | 'demote'
+    user = await _admin_target(user_id, current_user)
+    keys = [k for k, _ in sorted(cf.CREATOR_LEVELS.items(), key=lambda kv: kv[1]["rank"])]
+    cur = cf.normalize_level(user.get("level"))
+    i = keys.index(cur) if cur in keys else 0
+    ni = min(len(keys) - 1, i + 1) if direction == "promote" else max(0, i - 1)
+    new_level = keys[ni]
+    await db.users.update_one({"id": user_id}, {"$set": {"level": new_level, "updated_at": now_iso()}})
+    await log_admin_action(current_user, f"user.level_{direction}", target_type="user", target_id=user_id,
+                           before={"level": cur}, after={"level": new_level})
+    return {"message": f"Creator {direction}d", "level": new_level, "level_label": cf.CREATOR_LEVELS[new_level]["label"]}
+
+@api_router.post("/admin/user/payout-schedule")
+async def admin_payout_schedule(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+    user_id = data.get("user_id")
+    schedule = data.get("schedule") or "weekly"
+    await _admin_target(user_id, current_user)
+    await db.users.update_one({"id": user_id}, {"$set": {"payout_schedule": schedule, "updated_at": now_iso()}})
+    await log_admin_action(current_user, "user.payout_schedule", target_type="user", target_id=user_id, after={"schedule": schedule})
+    return {"message": f"Payout schedule set to {schedule}"}
+
+@api_router.post("/admin/user/commission")
+async def admin_set_commission(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+    user_id = data.get("user_id")
+    rate = float(data.get("commission_rate") or 0)
+    await _admin_target(user_id, current_user)
+    await db.users.update_one({"id": user_id}, {"$set": {"commission_rate": rate, "updated_at": now_iso()}})
+    await log_admin_action(current_user, "user.commission", target_type="user", target_id=user_id, after={"commission_rate": rate})
+    return {"message": "Commission updated"}
+
+@api_router.post("/admin/user/convert-pro")
+async def admin_convert_pro(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+    user_id = data.get("user_id")
+    await _admin_target(user_id, current_user)
+    await db.users.update_one({"id": user_id}, {"$set": {"is_pro": True, "plan": "pro", "updated_at": now_iso()}})
+    await notify_user(user_id, "Upgraded to Pro", "Your account has been upgraded to a Pro account by an admin.", ntype="info")
+    await log_admin_action(current_user, "user.convert_pro", target_type="user", target_id=user_id)
+    return {"message": "Converted to Pro"}
 
 # Every field name across the DB that points at a user id. Used to cascade-delete
 # all of a user's data. Extra fields a given collection doesn't have are harmless
