@@ -15,6 +15,7 @@ const campaignSchema = new mongoose.Schema({
   escrow_amount: { type: Number, default: 0 },
   category: { type: String, default: '' },
   deliverables: { type: String, default: '' },
+  image_url: { type: String, default: '' }, // optional campaign banner/cover image
   work_submission: { type: mongoose.Schema.Types.Mixed, default: null },
   shipment: { type: mongoose.Schema.Types.Mixed, default: null },
   shortlist_invites: { type: [String], default: [] },

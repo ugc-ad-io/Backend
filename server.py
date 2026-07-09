@@ -275,6 +275,7 @@ class CampaignCreate(BaseModel):
     requires_shipment: bool = False
     shipment_option: Optional[str] = 'no'  # 'yes', 'no', 'not_sure'
     shipment_checklist: Optional[Dict[str, Any]] = None
+    image_url: Optional[str] = ''  # optional campaign banner/cover image
 
 class BidCreate(BaseModel):
     campaign_id: str
@@ -692,6 +693,14 @@ CONTACT_URL_DOMAINS = ["wa.me", "t.me", "telegram.me", "linktr.ee", "linktree", 
 SOCIAL_PLATFORM_PATTERN = re.compile(r"\b(instagram|insta|whatsapp|telegram|linkedin|twitter|youtube|yt|x\.com)\b", re.IGNORECASE)
 OBFUSCATED_EMAIL_PATTERN = re.compile(r"\b[\w.-]+\s+(?:at|\[at\]|\(at\))\s+[\w.-]+\s+(?:dot|\[dot\]|\(dot\))\s+[a-z]{2,}\b", re.IGNORECASE)
 PHONE_SEQUENCE_PATTERN = re.compile(r"(?<!\w)(?:\+?\d[\s().-]*){10,15}(?!\w)")
+# Broader digit-run catcher (7-15 digits) so partial / shorter numbers can't slip
+# through when written next to a contact-intent word (e.g. "call me 900900000").
+PHONE_LOOSE_PATTERN = re.compile(r"(?<!\w)(?:\+?\d[\s().-]*){7,15}(?!\w)")
+CONTACT_INTENT_PATTERN = re.compile(
+    r"\b(call|contact|reach|ping|text|dm|number|num|mob(?:ile)?|phone|cell|whats?app|wa|telegram|signal|"
+    r"insta(?:gram)?|email|mail|connect|hit me|reach me|call me)\b",
+    re.IGNORECASE,
+)
 
 ACTION_CARD_TYPES = {
     "custom_offer",
@@ -785,10 +794,14 @@ def check_contact_info_policy(message: str, allowed_domains: Optional[List[str]]
     if obfuscated_emails:
         violations.append({"type": "obfuscated_email", "content": obfuscated_emails, "severity": "high"})
 
+    # A run of digits reads as a phone number when it's long (9+), or shorter (7+)
+    # but written next to a contact-intent word like "call me" / "whatsapp".
+    has_contact_intent = bool(CONTACT_INTENT_PATTERN.search(text))
+    min_phone_digits = 7 if has_contact_intent else 9
     phone_matches = []
-    for match in PHONE_SEQUENCE_PATTERN.findall(text):
+    for match in PHONE_LOOSE_PATTERN.findall(text):
         digits = re.sub(r"\D", "", match)
-        if 10 <= len(digits) <= 15:
+        if min_phone_digits <= len(digits) <= 15:
             phone_matches.append(match.strip())
     if phone_matches:
         violations.append({"type": "phone", "content": phone_matches, "severity": "high"})
@@ -3746,6 +3759,7 @@ async def create_draft(data: CampaignDraftCreate, current_user: dict = Depends(g
         "brand_name": brand_name,
         "brand_logo_url": brand_logo_url,
         "brand_cover_image_url": brand_cover_image_url,
+        "image_url": campaign_data.get("image_url") or "",
         "business_verified": business_verified,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -3986,6 +4000,7 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
         "brand_name": brand_name,
         "brand_logo_url": brand_logo_url,
         "brand_cover_image_url": brand_cover_image_url,
+        "image_url": campaign_data.get("image_url") or "",
         "business_verified": business_verified,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),

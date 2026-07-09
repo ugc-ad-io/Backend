@@ -150,7 +150,8 @@ class CampaignCreateExtended(BriefSectionsMixin):
     requires_shipment: Optional[bool] = None
     shipment_option: Optional[str] = 'no'
     shipment_checklist: Optional[Dict[str, Any]] = None
-    
+    image_url: Optional[str] = ''  # optional campaign banner/cover image
+
     # New extended fields
     # Step 1: Product Info
     product_name: Optional[str] = None
