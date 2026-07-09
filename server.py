@@ -562,10 +562,17 @@ class PermissionUpdate(BaseModel):
     permissions: List[str]
 
 def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    # bcrypt only uses the first 72 bytes; truncate so we never raise on long
+    # passwords and stay compatible with the Node/bcryptjs backend (which truncates too).
+    return bcrypt.hashpw(password.encode('utf-8')[:72], bcrypt.gensalt()).decode('utf-8')
 
 def verify_password(password: str, hashed: str) -> bool:
-    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+    # Never raise (a malformed/foreign hash or >72-byte password must fail as
+    # "invalid credentials", not crash the login with a 500).
+    try:
+        return bcrypt.checkpw(password.encode('utf-8')[:72], (hashed or '').encode('utf-8'))
+    except (ValueError, TypeError):
+        return False
 
 def create_token(user_id: str, email: str, role: str) -> str:
     payload = {
