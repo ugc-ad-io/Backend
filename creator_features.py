@@ -142,8 +142,16 @@ QUALITY_TIER_MULTIPLIERS: Dict[str, float] = {
 }
 
 
-def normalize_level(level: Optional[str]) -> str:
-    level = (level or "").strip().lower()
+def normalize_level(level) -> str:
+    # Node stores `level` as an integer rank (1..5); map those by rank so a numeric
+    # value never crashes .strip() and resolves to the right level name.
+    if isinstance(level, (int, float)) and not isinstance(level, bool):
+        rank = int(level)
+        for name, meta in CREATOR_LEVELS.items():
+            if meta.get("rank") == rank:
+                return name
+        return DEFAULT_CREATOR_LEVEL
+    level = str(level if level is not None else "").strip().lower()
     level = LEVEL_ALIASES.get(level, level)
     return level if level in CREATOR_LEVELS else DEFAULT_CREATOR_LEVEL
 

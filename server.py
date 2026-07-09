@@ -614,14 +614,26 @@ async def generate_creator_code() -> str:
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user = await db.users.find_one({"id": payload['user_id']}, {"_id": 0})
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+    # Tokens may be minted by either backend: Python uses 'user_id'; Node uses
+    # 'userId'/'id'/'sub'. Accept any of them so a token from one works on the other.
+    uid = payload.get('user_id') or payload.get('userId') or payload.get('id') or payload.get('sub')
+    if not uid:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = await db.users.find_one({"id": uid}, {"_id": 0})
+    if not user:
+        # Node-created users are keyed on ObjectId _id and may lack a string 'id'.
+        try:
+            from bson import ObjectId
+            user = await db.users.find_one({"_id": ObjectId(uid)}, {"_id": 0})
+        except Exception:
+            user = None
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
 
 async def get_current_business_user(current_user: dict = Depends(get_current_user)):
     if current_user.get("role") != UserRole.BUSINESS:
