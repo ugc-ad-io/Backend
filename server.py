@@ -1361,6 +1361,50 @@ def campaign_budget_total(campaign: dict) -> float:
         return budget_max
     return budget_min or budget_max
 
+async def reserve_campaign_budget(user: dict, campaign_doc: dict) -> Optional[dict]:
+    """Hold a campaign's full budget from the brand wallet at post time so it shows as
+    'on hold' in Transaction History. Raises 400 if the wallet can't cover it."""
+    amount = round(campaign_budget_total(campaign_doc), 2)
+    if amount <= 0:
+        return None
+    # Atomic conditional debit — only deduct if the balance can cover the reservation.
+    debit = await db.users.update_one(
+        {"id": user["id"], "balance": {"$gte": amount}},
+        {"$inc": {"balance": -amount}},
+    )
+    if debit.modified_count != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient wallet balance to reserve this campaign's budget (₹{amount:,.0f}). Add funds to your wallet and try again.",
+        )
+    escrow_doc = {
+        "id": str(uuid.uuid4()),
+        "campaign_id": campaign_doc["id"],
+        "business_id": user["id"],
+        "creator_id": None,
+        "amount": amount,
+        "reserved_amount": amount,
+        "status": "reserved",
+        "funded": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.escrow.insert_one(escrow_doc)
+    return escrow_doc
+
+async def refund_campaign_reservation(campaign_id: str, reason: str = "refund") -> None:
+    """Refund a still-reserved (no creator selected yet) campaign budget to the wallet.
+    No-op once a creator is engaged (status becomes 'held')."""
+    escrow = await db.escrow.find_one({"campaign_id": campaign_id, "status": "reserved"}, {"_id": 0})
+    if not escrow:
+        return
+    amount = to_float(escrow.get("reserved_amount") or escrow.get("amount"))
+    if amount > 0 and escrow.get("funded"):
+        await db.users.update_one({"id": escrow["business_id"]}, {"$inc": {"balance": amount}})
+    await db.escrow.update_one(
+        {"id": escrow["id"]},
+        {"$set": {"status": "refunded", "refund_reason": reason, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+
 def campaign_category(campaign: dict) -> str:
     return (
         campaign.get("industry_category") or
@@ -2299,7 +2343,7 @@ def creator_is_directory_visible(creator: dict) -> bool:
         creator.get("role") == UserRole.CREATOR and
         creator.get("approval_status") == ApprovalStatus.APPROVED and
         creator.get("profile_completed") is True and
-        (creator.get("curated_brand_visible") is True or creator.get("creator_directory_visible") is True)
+        creator.get("creator_directory_visible") is not False
     )
 
 async def get_visible_directory_creator(creator_id: str) -> Optional[dict]:
@@ -2308,10 +2352,7 @@ async def get_visible_directory_creator(creator_id: str) -> Optional[dict]:
         "role": UserRole.CREATOR,
         "approval_status": ApprovalStatus.APPROVED,
         "profile_completed": True,
-        "$or": [
-            {"curated_brand_visible": True},
-            {"creator_directory_visible": True},
-        ],
+        "creator_directory_visible": {"$ne": False},
     }, {"_id": 0})
 
 async def creator_deliverables_completed(creator: dict) -> int:
@@ -2451,14 +2492,13 @@ async def get_creator_directory(
     if sort not in ["recent", "active", "best_match", None]:
         raise HTTPException(status_code=400, detail="Invalid sort option")
 
+    # Approved, profile-complete creators are discoverable by default; only those who
+    # explicitly opt out (creator_directory_visible == False) are hidden.
     creators = await db.users.find({
         "role": UserRole.CREATOR,
         "approval_status": ApprovalStatus.APPROVED,
         "profile_completed": True,
-        "$or": [
-            {"curated_brand_visible": True},
-            {"creator_directory_visible": True},
-        ],
+        "creator_directory_visible": {"$ne": False},
     }, {"_id": 0}).to_list(10000)
 
     rows = []
@@ -2599,12 +2639,44 @@ async def get_business_wallet(current_user: dict = Depends(get_approved_business
         tx_type = "Wallet Recharge" if row.get("purpose") == "wallet_recharge" else row.get("purpose") or "Payment"
         transactions.append(normalize_wallet_transaction(row, tx_type, "credit"))
 
-    brand_campaigns = await db.campaigns.find({"business_id": current_user["id"]}, {"_id": 0, "id": 1}).to_list(10000)
+    brand_campaigns = await db.campaigns.find(
+        {"business_id": current_user["id"]},
+        {"_id": 0, "id": 1, "title": 1, "status": 1, "budget": 1, "budget_min": 1, "budget_max": 1, "created_at": 1, "submitted_at": 1},
+    ).to_list(10000)
     campaign_ids = [campaign.get("id") for campaign in brand_campaigns if campaign.get("id")]
+    escrowed_campaign_ids = set()
     if campaign_ids:
         escrow_rows = await db.escrow.find({"campaign_id": {"$in": campaign_ids}}, {"_id": 0}).to_list(10000)
         for row in escrow_rows:
-            transactions.append(normalize_wallet_transaction({**row, "type": "Escrow Lock"}, "Escrow Lock", "debit"))
+            escrowed_campaign_ids.add(row.get("campaign_id"))
+            e_status = row.get("status")
+            if e_status == "refunded":
+                # Reservation was returned to the wallet (e.g. campaign rejected/cancelled).
+                amt = to_float(row.get("reserved_amount") or row.get("amount"))
+                transactions.append(normalize_wallet_transaction({**row, "amount": amt, "type": "Budget Refund"}, "Budget Refund", "credit"))
+                continue
+            label = "Budget Reserved" if e_status == "reserved" else "Escrow Lock"
+            amt = to_float(row.get("brand_charged") or row.get("reserved_amount") or row.get("amount"))
+            transactions.append(normalize_wallet_transaction({**row, "amount": amt, "type": label}, label, "debit"))
+
+        # Live / awaiting-approval campaigns without an escrow record (posted before the
+        # budget-at-post reservation) still show their committed budget as "on hold".
+        HELD_STATUSES = {"active", "pending_approval", "in_progress", "work_submitted"}
+        for campaign in brand_campaigns:
+            if campaign.get("id") in escrowed_campaign_ids:
+                continue
+            if str(campaign.get("status")) not in HELD_STATUSES:
+                continue
+            amt = campaign_budget_total(campaign)
+            if amt <= 0:
+                continue
+            transactions.append(normalize_wallet_transaction({
+                "id": f"hold-{campaign.get('id')}",
+                "campaign_id": campaign.get("id"),
+                "amount": amt,
+                "type": "Budget Reserved",
+                "created_at": campaign.get("submitted_at") or campaign.get("created_at"),
+            }, "Budget Reserved", "debit"))
 
     transactions.sort(key=lambda item: item.get("date") or "", reverse=True)
 
@@ -3849,16 +3921,23 @@ async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(g
     # Moderate the free-text "things to avoid" field for contact info
     enforce_brief_contact_policy(campaign)
 
-    # No admin approval gate: a submitted brief goes live immediately so creators
-    # see it. Stamp approval metadata so admin tooling/reporting stays consistent.
+    # Hold the campaign budget on the wallet now (shows as 'on hold' in Transaction
+    # History). Raises 400 if the wallet can't cover it — the brief stays a draft.
+    await reserve_campaign_budget(current_user, campaign)
+
+    # Submitting sends the brief for admin approval — it goes live (ACTIVE) only after
+    # an admin approves it, so creators never see un-reviewed campaigns.
     now_iso_str = datetime.now(timezone.utc).isoformat()
     update_fields = {
-        "status": CampaignStatus.ACTIVE,
+        "status": CampaignStatus.PENDING_APPROVAL,
         "submitted_at": now_iso_str,
-        "approved_at": now_iso_str,
-        "approval_reason": "auto-published",
         "updated_at": now_iso_str
     }
+    await notify_admins(
+        "New campaign awaiting approval",
+        f"'{campaign.get('title', '')}' was submitted and needs admin approval before it goes live to creators.",
+        link="/admin/campaigns",
+    )
 
     # Flag to admin if the budget is hidden from creators
     await flag_hidden_budget_if_needed(campaign)
@@ -3875,15 +3954,11 @@ async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(g
             link="/admin/match-queue",
         )
 
-    # Publish the brief
+    # Submit the brief for approval
     await db.campaigns.update_one(
         {"id": campaign_id},
         {"$set": update_fields}
     )
-
-    # Keep the campaign manageable downstream (chat, ops) by assigning a manager,
-    # which previously happened only on admin approval.
-    await auto_assign_campaign_manager(campaign_id)
 
     return {
         "campaign_id": campaign_id,
@@ -3964,8 +4039,8 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
     
     # Determine status: explicit drafts allow partial data. Publish requests must pass
     # validation and should never be silently converted to drafts.
-    # Briefs publish instantly (no admin approval gate) -> they go live as ACTIVE so
-    # creators see them immediately. Drafts stay drafts.
+    # Published briefs go to PENDING_APPROVAL and only become ACTIVE (visible to creators)
+    # after an admin approves them — creators never see un-reviewed campaigns. Drafts stay drafts.
     status = campaign_data.pop('status', None)
     if status == 'draft':
         is_publish = False
@@ -3973,10 +4048,10 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
     elif status == 'pending_approval':
         validate_campaign_for_submission(campaign_data)
         is_publish = True
-        final_status = CampaignStatus.ACTIVE.value
+        final_status = CampaignStatus.PENDING_APPROVAL.value
     else:
         is_publish = True
-        final_status = CampaignStatus.ACTIVE.value
+        final_status = CampaignStatus.PENDING_APPROVAL.value
         try:
             validate_campaign_for_submission(campaign_data)
         except HTTPException:
@@ -4014,29 +4089,24 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
     })
 
     if is_publish:
+        # Hold the campaign budget on the wallet now (shows as 'on hold' in Transaction
+        # History). Raises 400 if the wallet can't cover it — the campaign is not created.
+        await reserve_campaign_budget(current_user, campaign_doc)
         now_iso = datetime.now(timezone.utc).isoformat()
         campaign_doc['submitted_at'] = now_iso
-        # No admin approval gate: brief is live immediately. Stamp approval metadata
-        # so admin tooling / reporting that reads these fields stays consistent.
-        campaign_doc['approved_at'] = now_iso
-        campaign_doc['approval_reason'] = 'auto-published'
+        # Awaits admin approval before going live — no approved_at stamp yet.
         # Flag to admin if the budget is hidden from creators
         await flag_hidden_budget_if_needed(campaign_doc)
         # PRD 5.2 Path B: brand requested an ops-curated shortlist
         if campaign_doc.get('match_requested'):
             campaign_doc['match_status'] = 'queued'
-            await notify_admins(
-                "New brief awaiting matches",
-                f"'{campaign_doc.get('title', '')}' was published with Request Matches and needs an ops shortlist.",
-                link=f"/admin/match-queue",
-            )
+        await notify_admins(
+            "New campaign awaiting approval",
+            f"'{campaign_doc.get('title', '')}' was submitted and needs admin approval before it goes live to creators.",
+            link="/admin/campaigns",
+        )
 
     await db.campaigns.insert_one(campaign_doc)
-
-    # Keep the campaign manageable downstream (chat, ops) by assigning a manager,
-    # which previously happened only on admin approval.
-    if is_publish:
-        await auto_assign_campaign_manager(campaign_id)
 
     message = "Campaign published" if is_publish else "Draft campaign created"
     
@@ -4303,11 +4373,13 @@ async def get_campaigns(
     query = {}
     
     if current_user['role'] == UserRole.CREATOR:
-        # Creators should see active campaigns and their own in_progress campaigns
+        # Creators see active campaigns to browse, PLUS every deal they were selected
+        # for in ANY status (in_progress, work_submitted, completed, cancelled) — so
+        # the "Completed" / "Cancelled" tabs of My Active Work aren't empty.
         query = {
             "$or": [
                 {"status": CampaignStatus.ACTIVE},
-                {"status": CampaignStatus.IN_PROGRESS, "selected_creator": current_user['id']}
+                {"selected_creator": current_user['id']}
             ]
         }
     elif current_user['role'] == UserRole.BUSINESS:
@@ -4450,26 +4522,63 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
     deal_amount = float(selected_bid['amount'])
     brand_fee = brand_commission(deal_amount)
     brand_total = round(deal_amount + brand_fee, 2)
-    # Charge the brand the deal amount + brand-side commission. Best-effort debit:
-    # only deduct if the wallet can cover it (mirrors the chat-offer funding path).
-    debit = await db.users.update_one(
-        {"id": current_user['id'], "balance": {"$gte": brand_total}},
-        {"$inc": {"balance": -brand_total}},
-    )
-    escrow_doc = {
-        "id": escrow_id,
-        "campaign_id": campaign_id,
-        "business_id": current_user['id'],
-        "creator_id": creator_id,
-        "amount": deal_amount,
-        "brand_commission_amount": brand_fee,
-        "brand_commission_percent": BRAND_COMMISSION_PERCENT,
-        "brand_charged": brand_total,
-        "funded": debit.modified_count == 1,
-        "status": "held",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.escrow.insert_one(escrow_doc)
+
+    # The campaign budget was reserved on the wallet at post time. Convert that
+    # reservation into the deal instead of charging again: refund any surplus
+    # (reserved budget − deal total), or top up the small shortfall if commission
+    # pushes the deal above the reserved budget.
+    reservation = await db.escrow.find_one({"campaign_id": campaign_id, "status": "reserved"}, {"_id": 0})
+    if reservation:
+        escrow_id = reservation["id"]
+        reserved = to_float(reservation.get("reserved_amount") or reservation.get("amount"))
+        funded = True
+        if brand_total <= reserved:
+            surplus = round(reserved - brand_total, 2)
+            if surplus > 0:
+                await db.users.update_one({"id": current_user['id']}, {"$inc": {"balance": surplus}})
+        else:
+            shortfall = round(brand_total - reserved, 2)
+            topup = await db.users.update_one(
+                {"id": current_user['id'], "balance": {"$gte": shortfall}},
+                {"$inc": {"balance": -shortfall}},
+            )
+            funded = topup.modified_count == 1
+        escrow_doc = {
+            "id": escrow_id,
+            "campaign_id": campaign_id,
+            "business_id": current_user['id'],
+            "creator_id": creator_id,
+            "amount": deal_amount,
+            "brand_commission_amount": brand_fee,
+            "brand_commission_percent": BRAND_COMMISSION_PERCENT,
+            "brand_charged": brand_total,
+            "reserved_amount": reserved,
+            "funded": funded,
+            "status": "held",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.escrow.update_one({"id": escrow_id}, {"$set": escrow_doc})
+    else:
+        # Legacy path (campaign posted before budget-at-post reservation): charge now.
+        # Best-effort debit: only deduct if the wallet can cover it.
+        debit = await db.users.update_one(
+            {"id": current_user['id'], "balance": {"$gte": brand_total}},
+            {"$inc": {"balance": -brand_total}},
+        )
+        escrow_doc = {
+            "id": escrow_id,
+            "campaign_id": campaign_id,
+            "business_id": current_user['id'],
+            "creator_id": creator_id,
+            "amount": deal_amount,
+            "brand_commission_amount": brand_fee,
+            "brand_commission_percent": BRAND_COMMISSION_PERCENT,
+            "brand_charged": brand_total,
+            "funded": debit.modified_count == 1,
+            "status": "held",
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        await db.escrow.insert_one(escrow_doc)
     
     await db.campaigns.update_one(
         {"id": campaign_id},
@@ -6755,9 +6864,9 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
         raise HTTPException(status_code=400, detail="This deal does not require a shipment")
 
     creator = await db.users.find_one({"id": campaign.get("selected_creator")}, {"_id": 0}) or {}
+    # The creator's delivery address is NOT the brand's concern — don't block the brand on it.
+    # If it isn't set yet, proceed anyway; the creator/platform completes it before dispatch.
     delivery = creator_delivery_address(creator)
-    if not delivery:
-        raise HTTPException(status_code=400, detail="The creator hasn't set a complete delivery address yet. Ask them to add it in their profile.")
 
     dims = (data.dimensions.dict() if data.dimensions else {}) or {}
 
@@ -6774,7 +6883,8 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
         "campaign_id": campaign["id"],
         "product": {"description": data.description, "weight": data.weight, "dimensions": dims},
         "pickup_address": data.pickup_address.dict(),
-        "delivery_address": delivery,          # internal only — never sent to the brand
+        "delivery_address": delivery or {},    # internal only — completed before dispatch
+        "awaiting_creator_address": not delivery,
         "tracking_number": tracking_number,
         "courier_name": courier_name,
         "label_url": label_url,
@@ -7357,7 +7467,7 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
         )
     
     status = CampaignStatus.ACTIVE if data.action == "approve" else CampaignStatus.REJECTED
-    
+
     await db.campaigns.update_one(
         {"id": data.item_id},
         {"$set": {
@@ -7366,11 +7476,14 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
             "approved_at": datetime.now(timezone.utc).isoformat()
         }}
     )
-    
-    # Auto-assign to campaign manager if approved
+
     if data.action == "approve":
+        # Auto-assign to a campaign manager
         await auto_assign_campaign_manager(data.item_id)
-    
+    else:
+        # Rejected → refund the reserved budget back to the brand wallet.
+        await refund_campaign_reservation(data.item_id, reason="campaign_rejected")
+
     return {"message": f"Campaign {data.action}d"}
 
 async def auto_assign_campaign_manager(campaign_id: str):

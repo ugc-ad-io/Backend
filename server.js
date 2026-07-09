@@ -1860,12 +1860,15 @@ app.get('/api/shipment/:id', auth, async (req, res) => {
     const s = (d && d.shipment) || {};
     const received_at = (d && d.receipt && d.receipt.received_at) || null;
     const status = s.courier_status || (s.requested_at ? 'requested' : null);
+    const receipt = (d && d.receipt) || {};
     res.json({
       id: req.params.id,
       status,                                     // requested | shipped | delivered | null
       requested: !!s.requested_at,
       tracking_number: s.tracking_id || null,
       courier_name: s.courier || null,
+      courier_slip: s.courier_slip || null,
+      shipment_checklist: s.shipment_checklist || {},
       label_url: s.label_url || null,
       expected_delivery: s.expected_delivery_at || null,
       shipped_at: s.shipped_at || null,
@@ -1875,14 +1878,35 @@ app.get('/api/shipment/:id', auth, async (req, res) => {
       pickup_address: s.pickup_address || null,   // brand's own pickup — fine to show
       received: !!received_at,
       received_at,
+      unboxing_video: receipt.unboxing_video_url || null,
+      dispute: receipt.items_damaged ? { reason: receipt.damage_report || '' } : null,
       // ship_address (creator delivery) intentionally omitted
     });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 app.post('/api/shipment/update', auth, async (req, res) => {
   try {
-    const { campaign_id } = req.body;
-    if (campaign_id) { const c = await Campaign.findById(campaign_id); if (c) { c.shipment = { ...(c.shipment || {}), ...req.body, updated_at: new Date() }; c.markModified('shipment'); await c.save(); } }
+    // Write to the Deal.shipment — the SAME place GET /shipment/:id and /receive use,
+    // so a brand-entered tracking number actually persists and shows up.
+    const { campaign_id, tracking_number, courier_slip, expected_delivery, shipment_checklist } = req.body;
+    if (campaign_id) {
+      const d = await Deal.findOne({ campaign_id });
+      if (d) {
+        if (!d.shipment) d.shipment = {};
+        if (tracking_number) d.shipment.tracking_id = tracking_number;
+        if (courier_slip) d.shipment.courier_slip = courier_slip;
+        if (expected_delivery) d.shipment.expected_delivery_at = expected_delivery;
+        if (shipment_checklist) d.shipment.shipment_checklist = shipment_checklist;
+        // Adding tracking means it's on the way — advance to shipped unless already delivered.
+        if (d.shipment.courier_status !== 'delivered') {
+          d.shipment.courier_status = 'shipped';
+          d.shipment.shipped_at = d.shipment.shipped_at || new Date();
+        }
+        d.shipment.updated_at = new Date();
+        d.markModified('shipment');
+        await d.save();
+      }
+    }
     res.json({ success: true });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
@@ -1945,8 +1969,9 @@ app.post('/api/deals/:id/request-shipment', auth, async (req, res) => {
 
     let creator = null;
     try { creator = await User.findById(d.creator_id).lean(); } catch (e) { /* uuid id */ }
+    // The creator's delivery address is NOT the brand's concern — don't block the brand on it.
+    // If it isn't set yet, accept the request anyway; the creator/platform fills it in before dispatch.
     const delivery = creatorDeliveryAddress(creator);
-    if (!delivery) return res.status(400).json({ detail: "The creator hasn't set a complete delivery address yet. Ask them to add it in their profile." });
 
     const { description, weight, dimensions, pickup_address } = req.body;
     const dims = dimensions && (dimensions.length || dimensions.width || dimensions.height)
@@ -1960,8 +1985,9 @@ app.post('/api/deals/:id/request-shipment', auth, async (req, res) => {
       weight: weight ? `${weight} kg` : '',
       dimensions: dims,
       pickup_address: formatShipAddress(pickup_address),   // brand pickup (internal)
-      ship_address: formatShipAddress(delivery),           // creator delivery (internal)
-      ship_city: delivery.city || '',
+      ship_address: delivery ? formatShipAddress(delivery) : '',   // creator delivery (internal) — may be filled later
+      ship_city: delivery ? (delivery.city || '') : '',
+      awaiting_creator_address: !delivery,                 // platform/creator completes address before dispatch
       courier_status: 'requested',
     };
     d.activity_feed.push({ actor_type: 'brand', actor_name: d.brand_name || 'Brand', event_type: 'shipment_requested', message: 'Brand submitted product & pickup details. Awaiting label from the platform.', timestamp: new Date() });
@@ -2187,8 +2213,35 @@ app.get('/api/withdrawal/history', auth, (req, res) => res.json([]));
 app.post('/api/withdrawal/request', auth, (req, res) => res.status(201).json({ success: true, message: 'Withdrawal requested' }));
 app.get('/api/payout/overview', auth, async (req, res) => {
   try {
-    const u = await User.findById(req.user.id).lean();
-    res.json({ balance: u?.wallet_balance || 0, pending_release: 0, paid_this_month: 0, all_time_earnings: 0, last_month: 0, deals_paid: 0 });
+    // Compute the creator's earnings from their deals so a "Paid - Complete"
+    // deal shows up in Available Balance / Paid this month / All-time earnings.
+    const deals = await Deal.find({ creator_id: req.user.id }).lean();
+    const earn = (d) => Number(d.escrow?.net_payable) || Number(d.bid_amount) || 0;
+    const isPaid = (d) => d.current_state === 'Paid - Complete' || d.escrow?.status === 'released';
+    const isEscrow = (d) => !isPaid(d)
+      && ['held', 'queued'].includes(d.escrow?.status)
+      && !String(d.current_state || '').toLowerCase().includes('cancel');
+
+    const now = new Date();
+    const inThisMonth = (d) => {
+      const raw = d.escrow?.released_at || d.updatedAt;
+      const dt = raw ? new Date(raw) : null;
+      return dt && dt.getMonth() === now.getMonth() && dt.getFullYear() === now.getFullYear();
+    };
+
+    const paid = deals.filter(isPaid);
+    const allTime = paid.reduce((s, d) => s + earn(d), 0);
+    const paidThisMonth = paid.filter(inThisMonth).reduce((s, d) => s + earn(d), 0);
+    const pending = deals.filter(isEscrow).reduce((s, d) => s + earn(d), 0);
+
+    res.json({
+      balance: allTime,           // available to withdraw (no withdrawals tracked yet)
+      pending_release: pending,
+      paid_this_month: paidThisMonth,
+      all_time_earnings: allTime,
+      last_month: 0,
+      deals_paid: paid.length,
+    });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 app.get('/api/payout-ranges', auth, (req, res) => res.json({ ranges: [] }));
