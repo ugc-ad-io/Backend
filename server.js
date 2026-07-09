@@ -1852,15 +1852,31 @@ app.post('/api/work/:id/request-revision', auth, async (req, res) => {
 });
 
 // ── Shipment (tied to a campaign) ────────────────────────────────────────────
+// Brand's shipment view reads the canonical Deal.shipment (the same record the
+// admin shipping queue works on). The creator's delivery address is never exposed.
 app.get('/api/shipment/:id', auth, async (req, res) => {
   try {
-    const c = await Campaign.findById(req.params.id).lean();
-    if (!c) return res.json({});
-    const s = c.shipment || {};
-    // Flatten the embedded shipment onto the campaign so the client can read
-    // status/tracking/label directly. NEVER expose the creator's delivery address.
-    const { delivery_address, ...safe } = s;
-    res.json({ ...c, ...safe, id: c._id });
+    const d = await Deal.findOne({ campaign_id: req.params.id }).lean();
+    const s = (d && d.shipment) || {};
+    const received_at = (d && d.receipt && d.receipt.received_at) || null;
+    const status = s.courier_status || (s.requested_at ? 'requested' : null);
+    res.json({
+      id: req.params.id,
+      status,                                     // requested | shipped | delivered | null
+      requested: !!s.requested_at,
+      tracking_number: s.tracking_id || null,
+      courier_name: s.courier || null,
+      label_url: s.label_url || null,
+      expected_delivery: s.expected_delivery_at || null,
+      shipped_at: s.shipped_at || null,
+      product_summary: s.product_summary || null,
+      weight: s.weight || null,
+      dimensions: s.dimensions || null,
+      pickup_address: s.pickup_address || null,   // brand's own pickup — fine to show
+      received: !!received_at,
+      received_at,
+      // ship_address (creator delivery) intentionally omitted
+    });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 app.post('/api/shipment/update', auth, async (req, res) => {
@@ -1872,8 +1888,18 @@ app.post('/api/shipment/update', auth, async (req, res) => {
 });
 app.post('/api/shipment/receive', auth, async (req, res) => {
   try {
-    const { campaign_id } = req.body;
-    if (campaign_id) { const c = await Campaign.findById(campaign_id); if (c) { c.shipment = { ...(c.shipment || {}), ...req.body, received: true, received_at: new Date(), status: 'received', courier_status: 'delivered', updated_at: new Date() }; c.markModified('shipment'); await c.save(); } }
+    const { campaign_id, unboxing_video, items_damaged, dispute_reason } = req.body;
+    if (campaign_id) {
+      const d = await Deal.findOne({ campaign_id });
+      if (d) {
+        d.receipt = { ...(d.receipt || {}), received_at: new Date(), unboxing_video_url: unboxing_video || (d.receipt && d.receipt.unboxing_video_url) || null, items_damaged: !!items_damaged, damage_report: items_damaged ? (dispute_reason || '') : null };
+        if (!d.shipment) d.shipment = {};
+        d.shipment.courier_status = 'delivered';
+        d.shipment.delivered_at = new Date();
+        d.markModified('receipt'); d.markModified('shipment');
+        await d.save();
+      }
+    }
     res.json({ success: true });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
@@ -1899,64 +1925,50 @@ function creatorDeliveryAddress(u) {
   return built;
 }
 
-// Brand: generate a pre-paid shipping label. The creator's delivery address is
-// pulled server-side and passed to the courier — it is NEVER returned to the brand.
-// PHASE 1: label + tracking are MOCKED. Swap the marked block for a real Shiprocket
-// "create order + generate label" call when the API is wired in.
-app.post('/api/deals/:id/ship-label', auth, async (req, res) => {
+// Render an address object into the single-line string the admin queue displays.
+function formatShipAddress(a) {
+  if (!a) return '';
+  const line = [a.line1, a.line2, a.city, [a.state, a.pincode].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+  const who = [a.full_name, a.phone].filter(Boolean).join(' · ');
+  return who ? `${who}\n${line}` : line;
+}
+
+// Brand: submit product + pickup details → creates a shipment REQUEST on the Deal.
+// The admin shipping queue then generates the label (manual Shiprocket) and ships.
+// The creator's delivery address is captured server-side for ops and NEVER shown
+// to the brand.
+app.post('/api/deals/:id/request-shipment', auth, async (req, res) => {
   try {
-    const c = await Campaign.findById(req.params.id);
-    if (!c) return res.status(404).json({ detail: 'Deal not found' });
-    if (String(c.business_id) !== String(req.user.id)) return res.status(403).json({ detail: 'Not authorized for this deal' });
-    if (!c.requires_shipment) return res.status(400).json({ detail: 'This deal does not require a shipment' });
+    const d = await Deal.findOne({ campaign_id: req.params.id });
+    if (!d) return res.status(404).json({ detail: 'Deal not found' });
+    if (String(d.brand_id) !== String(req.user.id)) return res.status(403).json({ detail: 'Not authorized for this deal' });
 
     let creator = null;
-    try { creator = await User.findById(c.selected_creator).lean(); } catch (e) { /* uuid id */ }
-    if (!creator && c.selected_creator) creator = await User.findOne({ $or: [{ public_id: c.selected_creator }, { username: c.selected_creator }] }).lean();
+    try { creator = await User.findById(d.creator_id).lean(); } catch (e) { /* uuid id */ }
     const delivery = creatorDeliveryAddress(creator);
     if (!delivery) return res.status(400).json({ detail: "The creator hasn't set a complete delivery address yet. Ask them to add it in their profile." });
 
     const { description, weight, dimensions, pickup_address } = req.body;
+    const dims = dimensions && (dimensions.length || dimensions.width || dimensions.height)
+      ? `${dimensions.length || '?'}×${dimensions.width || '?'}×${dimensions.height || '?'} cm` : '';
 
-    // ─── MOCK SHIPROCKET (Phase 1) ───────────────────────────────────────────
-    const short = Math.random().toString(36).slice(2, 12).toUpperCase();
-    const tracking_number = `MOCK${short}`;
-    const label_url = `/mock-labels/${c._id}.pdf`;
-    const courier_name = 'Shiprocket (mock)';
-    // ─────────────────────────────────────────────────────────────────────────
-
-    c.shipment = {
-      ...(c.shipment || {}),
-      product: { description, weight, dimensions: dimensions || {} },
-      pickup_address: pickup_address || {},
-      delivery_address: delivery,          // internal only — stripped from GET responses
-      tracking_number, tracking_id: tracking_number,
-      courier_name, courier: courier_name,
-      label_url,
-      courier_status: 'label_generated',
-      status: 'awaiting_pickup',
-      label_generated_at: new Date(),
-      updated_at: new Date(),
+    d.shipment = {
+      ...(d.shipment ? d.shipment.toObject ? d.shipment.toObject() : d.shipment : {}),
+      required: true,
+      requested_at: new Date(),
+      product_summary: description || '',
+      weight: weight ? `${weight} kg` : '',
+      dimensions: dims,
+      pickup_address: formatShipAddress(pickup_address),   // brand pickup (internal)
+      ship_address: formatShipAddress(delivery),           // creator delivery (internal)
+      ship_city: delivery.city || '',
+      courier_status: 'requested',
     };
-    c.markModified('shipment');
-    await c.save();
+    d.activity_feed.push({ actor_type: 'brand', actor_name: d.brand_name || 'Brand', event_type: 'shipment_requested', message: 'Brand submitted product & pickup details. Awaiting label from the platform.', timestamp: new Date() });
+    d.markModified('shipment');
+    await d.save();
 
-    res.json({ message: 'Label generated', tracking_number, courier_name, label_url, status: 'awaiting_pickup' });
-  } catch (e) { res.status(500).json({ detail: e.message }); }
-});
-
-// Brand confirms courier pickup → shipment is in transit.
-// PHASE 2: this transition will be driven by the Shiprocket pickup webhook.
-app.post('/api/deals/:id/mark-picked-up', auth, async (req, res) => {
-  try {
-    const c = await Campaign.findById(req.params.id);
-    if (!c) return res.status(404).json({ detail: 'Deal not found' });
-    if (String(c.business_id) !== String(req.user.id)) return res.status(403).json({ detail: 'Not authorized for this deal' });
-    if (!c.shipment) return res.status(404).json({ detail: 'No shipment/label found for this deal yet' });
-    c.shipment = { ...(c.shipment || {}), courier_status: 'shipped', status: 'shipped', shipped_at: new Date(), updated_at: new Date() };
-    c.markModified('shipment');
-    await c.save();
-    res.json({ message: 'Marked as shipped' });
+    res.json({ message: 'Shipment requested', status: 'requested' });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 

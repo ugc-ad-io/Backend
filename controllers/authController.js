@@ -196,9 +196,34 @@ exports.forgotPassword = async (req, res, next) => {
       console.error('[forgot-password] email send failed:', mailErr.message);
     }
 
-    if (process.env.NODE_ENV !== 'production') generic.dev_code = code;
-
+    // Never return the code in the API response — it's delivered by email only.
     res.json(generic);
+  } catch (err) {
+    next(err);
+  }
+};
+
+// POST /api/auth/verify-reset-code { email, code }
+// Checks the reset code is valid and unexpired WITHOUT consuming it, so the UI
+// can gate the new-password step. The code is still required again on reset.
+exports.verifyResetCode = async (req, res, next) => {
+  try {
+    const email = (req.body.email || '').toLowerCase().trim();
+    const code = (req.body.code || '').toString().trim();
+    if (!email || !code) return fail(res, 400, 'Email and code are required');
+
+    const user = await User.findOne({ email }).select('+reset_code +reset_code_expires');
+    if (
+      !user ||
+      !user.reset_code ||
+      !user.reset_code_expires ||
+      user.reset_code_expires < new Date() ||
+      user.reset_code !== hashCode(code)
+    ) {
+      return fail(res, 400, 'Invalid or expired reset code');
+    }
+
+    res.json({ valid: true });
   } catch (err) {
     next(err);
   }
