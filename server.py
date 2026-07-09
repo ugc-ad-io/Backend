@@ -2412,9 +2412,18 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
         (creator.get("tags") or [None])[0] if isinstance(creator.get("tags"), list) else None,
         (profile.get("tags") or [None])[0] if isinstance(profile.get("tags"), list) else None,
     )
+    # Public display name = the admin-assigned handle/nickname (never the real full name).
+    display_name = first_non_empty(
+        creator.get("nickname"),
+        ("@" + creator["username"]) if creator.get("username") else None,
+        profile.get("nickname"),
+        creator.get("public_creator_id"),
+    ) or ""
     return {
         "id": creator.get("id"),
         "public_creator_id": creator.get("public_creator_id") or "",
+        "name": display_name,
+        "nickname": creator.get("nickname") or "",
         "profile_photo": first_non_empty(creator.get("profile_photo"), creator.get("profile_picture"), profile.get("profile_photo"), profile.get("profile_picture")),
         "primary_category": primary_category or "",
         "languages": compact_list(creator.get("languages"), profile.get("languages"), creator.get("content_languages"), profile.get("content_languages")),
