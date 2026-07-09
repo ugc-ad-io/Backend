@@ -61,6 +61,10 @@ app.get('/api/campaigns', auth, async (req, res) => {
     const filter = {};
     if (req.query.status) filter.status = req.query.status;
     if (req.user.role === 'business') filter.business_id = req.user.id;
+    // A creator's own campaigns = those they were selected for. Without this the
+    // creator_id query param was ignored, so e.g. "completed deals" counted every
+    // completed campaign on the platform, not just this creator's.
+    if (req.query.creator_id) filter.selected_creator = req.query.creator_id;
     const campaigns = await Campaign.find(filter).lean();
     res.json(campaigns.map(c => ({ ...c, id: c._id })));
   } catch (e) { res.status(500).json({ detail: e.message }); }

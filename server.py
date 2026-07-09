@@ -5295,18 +5295,28 @@ async def get_all_chats(current_user: dict = Depends(require_cap("content_modera
     # Group by conversation (unique pairs of users)
     conversations_dict = {}
     for msg in messages:
+        sender = msg.get('sender_id')
+        recipient = msg.get('recipient_id')
+        # Skip non person-to-person items (system / action-card / invitation rows have
+        # no recipient pair and no timestamp) so they can't crash the oversight view.
+        if not sender or not recipient:
+            continue
         # Create a consistent conversation ID (sorted user IDs)
-        user_pair = tuple(sorted([msg['sender_id'], msg['recipient_id']]))
-        
-        if user_pair not in conversations_dict or msg['timestamp'] > conversations_dict[user_pair]['last_message_at']:
+        user_pair = tuple(sorted([sender, recipient]))
+        # Timestamp field name varies by source (Node vs Python) — fall back gracefully.
+        ts = str(msg.get('timestamp') or msg.get('created_at') or msg.get('createdAt') or msg.get('read_at') or '')
+        text = (msg.get('message') or '')[:50]
+
+        if user_pair not in conversations_dict or ts > conversations_dict[user_pair]['last_message_at']:
             conversations_dict[user_pair] = {
                 "user1_id": user_pair[0],
                 "user2_id": user_pair[1],
-                "last_message": msg['message'][:50],
-                "last_message_at": msg['timestamp'],
-                "has_filtered": False
+                "last_message": text,
+                "last_message_at": ts,
+                # Preserve a filtered flag already seen for this pair from an older message.
+                "has_filtered": conversations_dict.get(user_pair, {}).get('has_filtered', False),
             }
-        
+
         # Check if any message in this conversation was filtered
         if msg.get('filtered', False):
             conversations_dict[user_pair]['has_filtered'] = True
