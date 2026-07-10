@@ -123,7 +123,8 @@ exports.googleAuth = async (req, res, next) => {
         role: ['creator', 'business', 'admin'].includes(role) ? role : 'creator',
         google_id: payload.sub,
         auth_provider: 'google',
-        nickname: payload.name || email.split('@')[0],
+        nickname: email.split('@')[0],
+        username: email.split('@')[0],
         full_name: payload.name || '',
         profile_photo: payload.picture || null
       });
