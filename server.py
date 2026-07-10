@@ -10536,6 +10536,19 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
          "status": {"$in": ["in_progress", "active", "work_submitted", "completed"]}},
         {"_id": 0},
     ).to_list(2000)
+    def _fmt_addr(a):
+        # Render a structured address dict into a readable multi-line string.
+        if not a:
+            return None
+        if isinstance(a, str):
+            return a
+        if not isinstance(a, dict):
+            return None
+        region = " ".join(x for x in [a.get("state"), a.get("pincode")] if x)
+        line = ", ".join(x for x in [a.get("line1"), a.get("line2"), a.get("city"), region] if x)
+        who = " · ".join(x for x in [a.get("full_name"), a.get("phone")] if x)
+        return (who + "\n" + line) if who else (line or None)
+
     rows = []
     for c in campaigns:
         cid = c.get("id")
@@ -10545,15 +10558,25 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
         ship_status = sh.get("courier_status") or sh.get("status") or "pending"
         brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "nickname": 1, "profile": 1}) or {}
         creator = await db.users.find_one({"id": c.get("selected_creator")}, {"_id": 0, "nickname": 1, "profile": 1}) or {}
-        requested = c.get("work_started_at") or c.get("updated_at") or c.get("created_at")
+        requested = sh.get("requested_at") or c.get("work_started_at") or c.get("updated_at") or c.get("created_at")
+        prod = sh.get("product") or {}
+        dims = prod.get("dimensions") or {}
+        dim_str = (f"{dims.get('length') or '?'}×{dims.get('width') or '?'}×{dims.get('height') or '?'} cm"
+                   if any(dims.get(k) for k in ("length", "width", "height")) else None)
+        product_name = sh.get("product_summary") or prod.get("description") or c.get("product_name") or "—"
         rows.append({
             "id": cid, "deal_id": cid, "campaign_title": c.get("title"),
             "brand": brand.get("nickname"), "creator": creator.get("nickname"),
-            "product": c.get("product_name") or "—", "requested_at": requested, "created_at": requested,
+            "product": product_name, "product_summary": product_name,
+            "weight": (f"{prod.get('weight')} kg" if prod.get("weight") else None),
+            "dimensions": dim_str,
+            "requested_at": requested, "created_at": requested,
             "status": ship_status, "courier": sh.get("courier_name"), "tracking_number": sh.get("tracking_number"),
             "has_label": bool(sh.get("label_url")), "label_url": sh.get("label_url"),
-            "pickup_address": (brand.get("profile") or {}).get("address"),
-            "shipping_address": (creator.get("profile") or {}).get("address"),
+            # Prefer what the brand submitted in the request; fall back to saved profiles.
+            "pickup_address": _fmt_addr(sh.get("pickup_address")) or (brand.get("profile") or {}).get("address"),
+            "ship_address": _fmt_addr(sh.get("delivery_address")) or (creator.get("profile") or {}).get("address"),
+            "shipping_address": _fmt_addr(sh.get("delivery_address")) or (creator.get("profile") or {}).get("address"),
         })
     rows.sort(key=lambda r: r.get("requested_at") or "")
     return rows
@@ -10627,7 +10650,7 @@ async def admin_list_deals(state: Optional[str] = None, current_user: dict = Dep
         overdue = bool(countdown is not None and countdown < 0 and not terminal)
         urgency = "overdue" if overdue else ("due_soon" if (countdown is not None and 0 <= countdown <= 24 and not terminal) else "normal")
         rows.append({
-            "id": c["id"], "deal_id": c["id"], "campaign_title": c.get("title"), "campaign": c.get("title"),
+            "id": cid, "deal_id": cid, "campaign_title": c.get("title"), "campaign": c.get("title"),
             "brand": brand.get("nickname"), "creator": creator.get("nickname"),
             "current_state": c.get("status"), "state": c.get("status"),
             "deadline": deadline,
