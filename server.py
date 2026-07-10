@@ -641,6 +641,105 @@ async def get_current_business_user(current_user: dict = Depends(get_current_use
     return current_user
 
 
+# ── Real-world validators: does this website resolve / does this IG handle exist ──
+_VALIDATE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
+
+
+def _host_is_public(host: str) -> bool:
+    """Resolve host and reject private/loopback ranges (SSRF guard). Returns False
+    if DNS doesn't resolve — which is exactly how we detect a fake domain."""
+    import ipaddress
+    import socket
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast:
+            return False
+    return True
+
+
+def _check_website_sync(raw: str) -> dict:
+    from urllib.parse import urlparse
+    u = (raw or "").strip()
+    if not u:
+        return {"valid": False, "reason": "empty"}
+    if not re.match(r"^https?://", u, re.I):
+        u = "https://" + u
+    host = (urlparse(u).hostname or "").lower()
+    if not host or "." not in host:
+        return {"valid": False, "reason": "format"}
+    if not _host_is_public(host):
+        # DNS didn't resolve (or points somewhere private) → treat as a dead/fake site.
+        return {"valid": False, "reason": "unreachable"}
+    candidates = [u]
+    if u.startswith("https://"):
+        candidates.append("http://" + u[len("https://"):])
+    for cu in candidates:
+        try:
+            r = requests.head(cu, timeout=6, allow_redirects=True, headers={"User-Agent": _VALIDATE_UA})
+            if r.status_code < 400 or r.status_code in (401, 403, 405, 406, 429):
+                return {"valid": True, "status": r.status_code, "normalized": r.url}
+            r = requests.get(cu, timeout=6, allow_redirects=True, stream=True, headers={"User-Agent": _VALIDATE_UA})
+            if r.status_code < 500:
+                return {"valid": True, "status": r.status_code, "normalized": r.url}
+        except requests.RequestException:
+            continue
+    return {"valid": False, "reason": "unreachable"}
+
+
+def _check_instagram_sync(raw: str) -> dict:
+    u = (raw or "").strip().lstrip("@")
+    if not re.match(r"^[A-Za-z0-9._]{1,30}$", u):
+        return {"valid": False, "reason": "format"}
+    try:
+        r = requests.get(
+            f"https://www.instagram.com/{u}/",
+            timeout=7, allow_redirects=True,
+            headers={"User-Agent": _VALIDATE_UA, "Accept-Language": "en-US,en;q=0.9"},
+        )
+        if r.status_code == 404:
+            return {"valid": False, "reason": "not_found"}
+        if r.status_code == 200:
+            body = (r.text or "")
+            low = body.lower()
+            if ('"user":null' in body) or ("sorry, this page isn't available" in low) or ("page not found" in low):
+                return {"valid": False, "reason": "not_found"}
+            # Positive proof the profile exists (present only on a real profile page,
+            # not on Instagram's logged-out login wall).
+            confirmed = (
+                f'"username":"{u.lower()}"' in low
+                or f'content="https://www.instagram.com/{u.lower()}/"' in low
+                or f'@{u.lower()} •' in low
+                or f'alternatename":"@{u.lower()}"' in low
+            )
+            if confirmed:
+                return {"valid": True}
+            # Instagram showed a login wall — we genuinely can't tell. Don't claim valid.
+            return {"uncertain": True, "reason": "unverified"}
+        return {"uncertain": True, "reason": "unverified"}
+    except requests.RequestException:
+        return {"uncertain": True, "reason": "unverified"}
+
+
+@api_router.post("/validate/website")
+async def validate_website(payload: dict = Body(...), current_user: dict = Depends(get_current_user)):
+    """Best-effort check that a business website actually resolves and responds."""
+    return await asyncio.to_thread(_check_website_sync, str(payload.get("url", "")))
+
+
+@api_router.post("/validate/instagram")
+async def validate_instagram(payload: dict = Body(...), current_user: dict = Depends(get_current_user)):
+    """Best-effort check that an Instagram handle exists (IG blocks bots, so failures
+    are reported as 'uncertain' rather than invalid)."""
+    return await asyncio.to_thread(_check_instagram_sync, str(payload.get("username", "")))
+
+
 def require_cap(capability: str):
     """FastAPI dependency factory: ensures the caller is an admin AND holds
     `capability` (per admin_caps.can). Mirrors the Express requireCap middleware
