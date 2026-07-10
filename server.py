@@ -5980,10 +5980,20 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
 
     await db.work_submissions.insert_one(work_doc)
 
-    # Update campaign status to work_submitted
+    # Update campaign status + surface the submission for the brand's Work Review.
     await db.campaigns.update_one(
         {"id": data.campaign_id},
-        {"$set": {"status": "work_submitted"}}
+        {"$set": {
+            "status": "work_submitted",
+            "work_submission": {
+                "id": work_doc["id"],
+                "creator_id": current_user['id'],
+                "work_files": data.work_files,
+                "video_url": primary_file,
+                "creator_note": data.description,
+                "submitted_at": work_doc["submitted_at"],
+            },
+        }}
     )
 
     await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", "Content was submitted for brand review.")
@@ -6704,7 +6714,23 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         "revisions": []
     }
     await db.work_submissions.insert_one(work_doc)
-    await db.campaigns.update_one({"id": campaign['id']}, {"$set": {"status": "work_submitted", "updated_at": now_iso()}})
+    # Surface the submission on the campaign so the brand's Work Review (which reads
+    # campaign.work_submission) can see it. No explicit status → the UI derives it
+    # from campaign.status (pending_review → approved on completion).
+    await db.campaigns.update_one({"id": campaign['id']}, {"$set": {
+        "status": "work_submitted",
+        "work_submission": {
+            "id": work_doc["id"],
+            "creator_id": current_user['id'],
+            "work_files": work_doc["work_files"],
+            "video_url": data.video_url,
+            "thumbnail_url": data.thumbnail_url,
+            "creator_note": data.creator_note,
+            "submitted_at": work_doc["submitted_at"],
+            "version": version,
+        },
+        "updated_at": now_iso(),
+    }})
     await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", f"Content version {version} submitted for review.")
     await insert_deal_system_message(campaign, f"Content version {version} was submitted and is awaiting brand review.")
     return {"message": "Content submitted", "version": version}
