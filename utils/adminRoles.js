@@ -28,7 +28,9 @@ const ALL_CAPS = [
   'review_applications', 'manage_deals', 'rule_disputes', 'manage_shipping',
   'release_payouts', 'adjust_wallet', 'warn_suspend_users', 'ban_users',
   'view_financials', 'generate_reports', 'export_tax', 'user_management',
-  'content_moderation', 'view_audit', 'manage_roles'
+  'content_moderation', 'view_audit', 'manage_roles',
+  // Manage platform settings: payout ranges, payment/notification gateways.
+  'edit_settings'
 ];
 
 // Per-role dispute resolution ceiling (₹). Infinity = no limit.
@@ -54,7 +56,9 @@ const CAPS = {
     'release_payouts', 'generate_reports', 'content_moderation', 'view_audit'
   ],
   finance: [
-    'view_financials', 'generate_reports', 'export_tax', 'view_audit'
+    'view_financials', 'generate_reports', 'export_tax', 'view_audit',
+    // Finance owns payout ranges + payment/notification gateway config.
+    'edit_settings'
   ],
   custom: [] // resolved from the user's own admin_caps
 };

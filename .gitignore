@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
 # IDE and editors
@@ -19,6 +18,11 @@ node_modules/
 
 # Testing
 /coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Next.js
 /.next/
@@ -28,11 +32,15 @@ next-env.d.ts
 
 # Production builds
 /build
+build/
 dist/
 dist
+*.egg-info/
 
-# Environment files (comprehensive coverage)
-
+# Environment files (keep secrets out of git)
+.env
+.env.*
+!.env.example
 *token.json*
 *credentials.json*
 
@@ -41,17 +49,26 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+.pytest_cache/
 dump.rdb
+*.log
 
 # System files
 .DS_Store
+Thumbs.db
 *.pem
 
 # Python
 __pycache__/
-*pyc*
+*.py[cod]
+*$py.class
 venv/
 .venv/
+env/
+ENV/
+
+# Local uploads and generated files
+uploads/
 
 # Development tools
 chainlit.md
@@ -78,43 +95,4 @@ agenthub/agents/youtube/db
 .cache/
 
 # Mobile development
-android-sdk/ 
-=======
-# Environment
-.env
-.env.*
-!.env.example
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-
-# Local uploads and generated files
-uploads/
-
-# Build artifacts
-build/
-dist/
-*.egg-info/
-
-# IDE and OS files
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
->>>>>>> 552a145b6c20cc2aa0ba2b679be3a53dc5e13a50
+android-sdk/

@@ -201,6 +201,18 @@ class GoogleAuthRequest(BaseModel):
     credential: str                      # Google ID token (JWT) from GIS
     role: Optional[UserRole] = None      # used only when creating a new account
 
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class VerifyResetCodeRequest(BaseModel):
+    email: str
+    code: str
+
+class ResetPasswordRequest(BaseModel):
+    email: str
+    code: str
+    password: str
+
 class CreatorProfileUpdate(BaseModel):
     username: Optional[str] = None
     profile_picture: Optional[str] = None
@@ -582,6 +594,70 @@ def create_token(user_id: str, email: str, role: str) -> str:
         'exp': datetime.now(timezone.utc) + timedelta(days=7)
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+# ---- Email (Resend) --------------------------------------------------------
+# Generic transactional email sender. Safe no-op if RESEND_API_KEY is unset.
+def _send_email_sync(to, subject: str, html: str, text: Optional[str] = None) -> dict:
+    api_key = os.environ.get('RESEND_API_KEY', '')
+    if not api_key:
+        logger.warning(f"[email] RESEND_API_KEY not set — skipping send to {to} (\"{subject}\")")
+        return {"skipped": True}
+    from_addr = os.environ.get('EMAIL_FROM', 'UGCad.io <onboarding@resend.dev>')
+    reply_to = os.environ.get('EMAIL_REPLY_TO') or None
+    payload = {
+        "from": from_addr,
+        "to": to if isinstance(to, list) else [to],
+        "subject": subject,
+        "html": html,
+    }
+    if text:
+        payload["text"] = text
+    if reply_to:
+        payload["reply_to"] = reply_to
+    try:
+        r = requests.post(
+            "https://api.resend.com/emails",
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            logger.error(f"[email] Resend send failed {r.status_code}: {r.text}")
+            return {"error": r.text}
+        return r.json()
+    except Exception as e:
+        logger.error(f"[email] send exception: {e}")
+        return {"error": str(e)}
+
+async def send_email(to, subject: str, html: str, text: Optional[str] = None) -> dict:
+    return await asyncio.to_thread(_send_email_sync, to, subject, html, text)
+
+def _email_base_template(title: str, content_html: str) -> str:
+    year = datetime.now(timezone.utc).year
+    return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f4f5fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2340;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5fb;padding:32px 12px;"><tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 8px 30px rgba(20,22,58,0.08);">
+<tr><td style="background:linear-gradient(135deg,#5b6bff,#8b5cf6);padding:24px 32px;"><span style="color:#fff;font-size:20px;font-weight:800;">UGCad.io</span></td></tr>
+<tr><td style="padding:32px;">{content_html}</td></tr>
+<tr><td style="padding:20px 32px;background:#fafbff;border-top:1px solid #eef0f6;color:#9296ba;font-size:12px;line-height:1.6;">You're receiving this email from UGCad.io.<br/>&copy; {year} UGCad.io. All rights reserved.</td></tr>
+</table></td></tr></table></body></html>"""
+
+# ---- Password-reset code helpers -------------------------------------------
+def _reset_code_hash(code: str) -> str:
+    return hashlib.sha256((code or '').encode('utf-8')).hexdigest()
+
+def _reset_code_valid(user: Optional[dict], code: str) -> bool:
+    if not user or not user.get('reset_code') or not user.get('reset_code_expires'):
+        return False
+    try:
+        exp = datetime.fromisoformat(user['reset_code_expires'])
+    except Exception:
+        return False
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp < datetime.now(timezone.utc):
+        return False
+    return user['reset_code'] == _reset_code_hash(code)
 
 async def generate_nickname() -> str:
     """Generate a unique nickname by checking database for existing nicknames"""
@@ -966,8 +1042,42 @@ async def notify_admins(title: str, message: str, link: Optional[str] = None):
     await db.in_app_notifications.insert_one(notification)
     await db.admin_notifications.insert_one(notification.copy())
 
-async def notify_user(user_id: str, title: str, message: str, link: Optional[str] = None, ntype: str = "info"):
-    """Send an in-app notification to a single user."""
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://www.ugcad.io")
+
+
+def _notification_email_html(title: str, message: str, link: Optional[str], name: Optional[str]) -> str:
+    cta = ""
+    if link:
+        url = link if str(link).startswith("http") else f"{FRONTEND_URL}{link}"
+        cta = (
+            f'<p style="margin:24px 0"><a href="{url}" '
+            'style="background:#07074e;color:#fff;padding:12px 22px;border-radius:8px;'
+            'text-decoration:none;font-weight:600;display:inline-block">Open UGCad.io</a></p>'
+        )
+    greeting = f"Hi {name}," if name else "Hi,"
+    return (
+        '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;color:#1a1a2e">'
+        f'<h2 style="color:#07074e">{title}</h2>'
+        f'<p style="font-size:15px;line-height:1.6">{greeting}</p>'
+        f'<p style="font-size:15px;line-height:1.6">{message}</p>'
+        f'{cta}'
+        '<hr style="border:none;border-top:1px solid #eee;margin:24px 0">'
+        '<p style="font-size:12px;color:#888">UGCad.io — where brands meet real creators.</p>'
+        '</div>'
+    )
+
+
+def _in_quiet_hours() -> bool:
+    """Quiet hours 10pm-8am IST (the platform is India-first). Non-critical emails
+    are held back during this window; the in-app notification still records."""
+    ist_hour = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).hour
+    return ist_hour >= 22 or ist_hour < 8
+
+
+async def notify_user(user_id: str, title: str, message: str, link: Optional[str] = None, ntype: str = "info", email: bool = False, critical: bool = False):
+    """Send an in-app notification to a single user. Set email=True to ALSO send an
+    email (best-effort — a mail failure never breaks the in-app notification/action).
+    Set critical=True for SLA/security emails that must bypass quiet hours."""
     await db.in_app_notifications.insert_one({
         "id": str(uuid.uuid4()),
         "user_id": user_id,
@@ -979,6 +1089,16 @@ async def notify_user(user_id: str, title: str, message: str, link: Optional[str
         "created_at": now_iso(),
         "created_by": "system",
     })
+    # Non-critical email is suppressed during quiet hours (the in-app record still shows).
+    if email and (critical or not _in_quiet_hours()):
+        try:
+            u = await db.users.find_one({"id": user_id}, {"_id": 0, "email": 1, "nickname": 1, "full_name": 1})
+            addr = (u or {}).get("email")
+            if addr:
+                html = _notification_email_html(title, message, link, (u.get("full_name") or u.get("nickname")))
+                await send_email(addr, title, html, message)
+        except Exception:
+            pass
 
 async def enforce_suspension(user: dict):
     """Block login for a suspended account, or auto-lift the suspension once its
@@ -1906,13 +2026,26 @@ def compute_deal_state(campaign: dict, shipment: Optional[dict], receipt: dict, 
         campaign.get('deadline') or
         campaign.get('due_date')
     )
+    countdown = hours_until(next_deadline)
+    # SLA surfacing: a deal blocked on a human party past its deadline is overdue/urgent.
+    # System/admin states (payout, dispute) don't count — nobody is holding those up.
+    actionable = party in ("brand", "creator")
+    is_overdue = bool(next_deadline and countdown is not None and countdown < 0 and actionable)
+    if is_overdue:
+        urgency = "overdue"
+    elif actionable and countdown is not None and 0 <= countdown <= 24:
+        urgency = "due_soon"
+    else:
+        urgency = "normal"
     return {
         "current_state": state,
         "active_party": party,
         "primary_next_action": action,
         "state_started_at": started,
         "next_deadline_at": next_deadline,
-        "deadline_countdown_hours": hours_until(next_deadline)
+        "deadline_countdown_hours": countdown,
+        "is_overdue": is_overdue,
+        "urgency": urgency,
     }
 
 def map_sender_type(sender_id: str, campaign: dict, creator_id: str, sender_role: Optional[str] = None) -> str:
@@ -2398,6 +2531,94 @@ async def google_auth(data: GoogleAuthRequest):
         "approval_status": user.get("approval_status", ApprovalStatus.PENDING),
         "profile_photo": user.get("profile_photo"),
     }
+
+
+def _auth_response(user: dict) -> dict:
+    """Shared login/reset response shape (same as /auth/login)."""
+    return {
+        "token": create_token(user["id"], user.get("email", ""), user.get("role")),
+        "user_id": user.get("id"),
+        "nickname": user.get("nickname") or user.get("full_name") or user.get("username") or (user.get("email") or "").split("@")[0],
+        "username": user.get("username"),
+        "creator_code": user.get("creator_code"),
+        "level": user.get("level"),
+        "role": user.get("role"),
+        "admin_role": user.get("admin_role"),
+        "admin_caps": user.get("admin_caps", []),
+        "admin_scope": user.get("admin_scope", "all"),
+        "assigned_categories": user.get("assigned_categories", []),
+        "profile_completed": user.get("profile_completed", False),
+        "approval_status": user.get("approval_status", ApprovalStatus.PENDING),
+        "profile_photo": user.get("profile_photo"),
+    }
+
+
+@api_router.post("/auth/forgot-password")
+async def forgot_password(data: ForgotPasswordRequest):
+    """Issue a 6-digit reset code (valid 15 min) and email it. Always returns the
+    same generic message so it can't be used to probe which emails have accounts.
+    Google-only accounts (no password) get the generic response with no code."""
+    email = (data.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+    generic = {"message": "If an account exists for that email, a reset code has been sent."}
+    user = await db.users.find_one({"email": email})
+    if not user or (not user.get("password") and user.get("google_id")):
+        return generic
+    code = f"{random.randint(100000, 999999)}"
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"reset_code": _reset_code_hash(code), "reset_code_expires": expires}},
+    )
+    logger.info(f"[forgot-password] reset code for {email}: {code}")
+    try:
+        html = _email_base_template("Password reset", f"""
+            <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Reset your password</h1>
+            <p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#4a4f74;">Use the code below to reset your password. It expires in 15 minutes.</p>
+            <div style="font-size:32px;font-weight:800;letter-spacing:8px;color:#5b6bff;background:#f4f5fb;border-radius:12px;padding:18px 0;text-align:center;">{code}</div>
+            <p style="margin:20px 0 0;font-size:13px;line-height:1.6;color:#9296ba;">If you didn't request this, you can safely ignore this email.</p>""")
+        await send_email(email, "Your UGCad.io password reset code", html)
+    except Exception as e:
+        logger.error(f"[forgot-password] email send failed: {e}")
+    return generic
+
+
+@api_router.post("/auth/verify-reset-code")
+async def verify_reset_code(data: VerifyResetCodeRequest):
+    """Check the reset code is valid and unexpired WITHOUT consuming it, so the UI
+    can gate the new-password step."""
+    email = (data.email or "").strip().lower()
+    code = (data.code or "").strip()
+    if not email or not code:
+        raise HTTPException(status_code=400, detail="Email and code are required")
+    user = await db.users.find_one({"email": email})
+    if not _reset_code_valid(user, code):
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+    return {"valid": True}
+
+
+@api_router.post("/auth/reset-password")
+async def reset_password(data: ResetPasswordRequest):
+    """Verify the code, set the new password, clear the code, and sign the user in."""
+    email = (data.email or "").strip().lower()
+    code = (data.code or "").strip()
+    password = data.password or ""
+    if not email or not code or not password:
+        raise HTTPException(status_code=400, detail="Email, code and new password are required")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    user = await db.users.find_one({"email": email})
+    if not _reset_code_valid(user, code):
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+    if user.get("banned"):
+        raise HTTPException(status_code=403, detail=f"Account banned: {user.get('ban_reason', 'Account suspended')}")
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"password": hash_password(password)}, "$unset": {"reset_code": "", "reset_code_expires": ""}},
+    )
+    fresh = await db.users.find_one({"id": user["id"]}, {"_id": 0})
+    return _auth_response(fresh or user)
 
 
 @api_router.get("/auth/me")
@@ -4739,9 +4960,9 @@ You can now communicate directly with {creator['nickname']} to coordinate the wo
             "system_message": True
         }
         await db.messages.insert_one(creator_message_doc)
-        print(f"✅ Created system message to creator: {creator_message_doc['id']}")
+        print(f"[ok] Created system message to creator: {creator_message_doc['id']}")
     except Exception as e:
-        print(f"❌ Error creating creator system message: {str(e)}")
+        print(f"[err] Error creating creator system message: {str(e)}")
     
     # Send message to business
     try:
@@ -4756,9 +4977,9 @@ You can now communicate directly with {creator['nickname']} to coordinate the wo
             "system_message": True
         }
         await db.messages.insert_one(business_message_doc)
-        print(f"✅ Created system message to business: {business_message_doc['id']}")
+        print(f"[ok] Created system message to business: {business_message_doc['id']}")
     except Exception as e:
-        print(f"❌ Error creating business system message: {str(e)}")
+        print(f"[err] Error creating business system message: {str(e)}")
     
     # Create initial conversation between business and creator
     try:
@@ -4772,9 +4993,9 @@ You can now communicate directly with {creator['nickname']} to coordinate the wo
             "read": False
         }
         await db.messages.insert_one(conversation_starter)
-        print(f"✅ Created conversation starter: {conversation_starter['id']}")
+        print(f"[ok] Created conversation starter: {conversation_starter['id']}")
     except Exception as e:
-        print(f"❌ Error creating conversation starter: {str(e)}")
+        print(f"[err] Error creating conversation starter: {str(e)}")
     
     # Create in-app notification for creator
     notification_doc = {
@@ -5852,10 +6073,20 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
         }
 
     if not already_approved:
-        await db.work_submissions.update_one(
-            {"id": work_id},
+        # RACE GUARD: flip to APPROVED only if it isn't already approved, atomically.
+        # If a concurrent approval won the flip, bail out WITHOUT releasing payout again
+        # (prevents double-payout when both parties/tabs approve at once).
+        flip = await db.work_submissions.update_one(
+            {"id": work_id, "status": {"$ne": WorkStatus.APPROVED}},
             {"$set": {"status": WorkStatus.APPROVED, "approved_at": now}}
         )
+        if flip.modified_count == 0:
+            esc2 = await db.escrow.find_one({"campaign_id": work['campaign_id']})
+            return {
+                "message": "Content was already approved (a concurrent action won).",
+                "payout_status": (esc2 or {}).get('payout_status', 'released'),
+                "net_payable": (esc2 or {}).get('net_payable', 0),
+            }
 
     # Keep the creator's deal content view in sync — mark the submitted version approved.
     await db.deal_content_submissions.update_many(
@@ -5880,7 +6111,7 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
         {"$set": {"status": CampaignStatus.COMPLETED, "payout_status": "approved", "approved_at": now, "updated_at": now}}
     )
     await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "content_approved", "Content approved.")
-    await notify_user(work['creator_id'], "Your content was approved", "Your content was approved.", link="/my-deals")
+    await notify_user(work['creator_id'], "Your content was approved", "Your content was approved.", link="/my-deals", ntype="success", email=True)
     return {"message": "Content approved.", **payout_info}
 
 
@@ -6239,7 +6470,7 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
     # PRD Section 8: first 2 revisions are free; each one thereafter costs the
     # brand a flat ₹500, debited from the wallet at request time.
     fee = cf.revision_fee_for(used)
-    paid = False
+    paid = fee > 0
     if fee > 0:
         balance = float(current_user.get('balance') or 0)
         if balance < fee:
@@ -6247,19 +6478,6 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
                 status_code=402,
                 detail=f"This is a paid revision (₹{fee}). Your wallet balance (₹{int(balance)}) is insufficient. Please recharge.",
             )
-        await db.users.update_one({"id": current_user['id']}, {"$inc": {"balance": -fee}})
-        await db.wallet_ledger.insert_one({
-            "id": str(uuid.uuid4()),
-            "user_id": current_user['id'],
-            "type": "debit",
-            "category": "revision_fee",
-            "amount": fee,
-            "campaign_id": work['campaign_id'],
-            "work_id": work_id,
-            "description": f"Paid revision #{used + 1} for campaign {work['campaign_id']}",
-            "created_at": now_iso(),
-        })
-        paid = True
 
     revision = {
         "feedback": feedback,
@@ -6273,14 +6491,37 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
         "fee": fee,
     }
 
-    await db.work_submissions.update_one(
-        {"id": work_id},
+    # RACE GUARD: claim the transition atomically — succeeds only if the work is still the
+    # SUBMITTED version awaiting review. If a concurrent approval or revision won, bail out
+    # BEFORE charging anything (stops approve+revise both landing, and double revision fees).
+    claim = await db.work_submissions.update_one(
+        {"id": work_id, "status": WorkStatus.SUBMITTED},
         {"$set": {"status": WorkStatus.REVISION_REQUESTED}, "$push": {"revisions": revision}}
     )
+    if claim.modified_count == 0:
+        raise HTTPException(status_code=409, detail="This submission is no longer awaiting review — it was just approved or revised. Refresh to see the latest state.")
+
+    # Charge the paid-revision fee only after the transition is secured.
+    if fee > 0:
+        await db.users.update_one({"id": current_user['id']}, {"$inc": {"balance": -fee}})
+        await db.wallet_ledger.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": current_user['id'],
+            "type": "debit",
+            "category": "revision_fee",
+            "amount": fee,
+            "campaign_id": work['campaign_id'],
+            "work_id": work_id,
+            "description": f"Paid revision #{used + 1} for campaign {work['campaign_id']}",
+            "created_at": now_iso(),
+        })
 
     note = f" (paid revision, ₹{fee} charged)" if paid else f" ({cf.FREE_REVISION_LIMIT - used - 1} free revision(s) remaining)"
     await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "revision_requested", f"Brand requested content revisions.{note}")
     await insert_deal_system_message(campaign, f"Brand requested content revisions.{note}")
+    await notify_user(work['creator_id'], "Revision requested on your content",
+                      "The brand requested changes on your submission. Open your deal to review the feedback and resubmit.",
+                      link="/my-deals", ntype="info", email=True)
 
     return {
         "message": "Revision requested",
@@ -6763,6 +7004,49 @@ async def dispute_request_info(dispute_id: str, data: DisputeInfoRequest, curren
     return {"message": "Info requested", "dispute_id": dispute_id}
 
 
+@api_router.get("/admin/disputes/appeals")
+async def list_dispute_appeals(current_user: dict = Depends(require_cap("rule_disputes"))):
+    """Disputes the losing party has appealed (awaiting a senior re-review)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view appeals")
+    appeals = await db.disputes.find({"status": "appealed"}, {"_id": 0}).sort("created_at", 1).to_list(500)
+    return {"appeals": appeals}
+
+
+@api_router.post("/admin/disputes/{dispute_id}/assign")
+async def assign_dispute(dispute_id: str, current_user: dict = Depends(require_cap("rule_disputes"))):
+    """Claim a dispute for review (ops workflow)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can assign disputes")
+    name = current_user.get("nickname") or current_user.get("full_name") or "Admin"
+    r = await db.disputes.update_one({"id": dispute_id}, {"$set": {"assigned_to": current_user.get("id"), "assigned_to_name": name, "updated_at": now_iso()}})
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    return {"success": True, "assigned_to_name": name}
+
+
+@api_router.post("/admin/disputes/{dispute_id}/ruling-draft")
+async def save_ruling_draft(dispute_id: str, data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("rule_disputes"))):
+    """Save a work-in-progress ruling draft on the dispute (not yet executed)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can draft rulings")
+    r = await db.disputes.update_one({"id": dispute_id}, {"$set": {"ruling_draft": data, "updated_at": now_iso()}})
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    return {"success": True}
+
+
+@api_router.post("/admin/disputes/{dispute_id}/request-review")
+async def request_peer_review(dispute_id: str, data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("rule_disputes"))):
+    """Send the drafted ruling for a peer/senior review before executing."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can request peer review")
+    r = await db.disputes.update_one({"id": dispute_id}, {"$set": {"peer_review_status": "requested", "ruling_draft": data, "updated_at": now_iso()}})
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    return {"success": True}
+
+
 @api_router.post("/admin/disputes/{dispute_id}/rule")
 async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict = Depends(require_cap("rule_disputes"))):
     """PRD 9.4/9.5: admin ruling + financial execution within 24h."""
@@ -6779,15 +7063,15 @@ async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict 
     escrow = await db.escrow.find_one({"campaign_id": dispute["campaign_id"]})
     held = float((escrow or {}).get("amount") or 0)
 
-    # PRD 11.3 role matrix: Ops (regular) can rule disputes up to ₹25K; the
-    # founder/admin has no limit. (No "senior ops" tier in V0.5, so the founder
-    # handles anything larger.)
-    OPS_DISPUTE_LIMIT = 25000
+    # PRD 11.3 role matrix — tiered ruling ceiling keyed on the admin SUB-role
+    # (founder ∞, ops_senior ₹1L, ops_regular ₹25K, custom ₹25K, finance ₹0).
+    # Keyed on admin_role (not marketplace role) so ops admins are actually capped.
     dispute_value = max(held, float(data.refund_amount or 0), float(data.creator_amount or 0))
-    if current_user["role"] != UserRole.ADMIN and dispute_value > OPS_DISPUTE_LIMIT:
+    cap = admin_caps.dispute_cap(current_user)  # None = unlimited (founder)
+    if cap is not None and dispute_value > cap:
         raise HTTPException(
             status_code=403,
-            detail=f"This dispute (₹{dispute_value:,.0f}) exceeds the ₹{OPS_DISPUTE_LIMIT:,} ops limit. Escalate to the founder/admin.",
+            detail=f"This dispute (₹{dispute_value:,.0f}) exceeds your ₹{cap:,} ruling limit. Escalate to a senior admin.",
         )
     refund = round(float(data.refund_amount or 0), 2)
     creator_amt = round(float(data.creator_amount or 0), 2)
@@ -7038,6 +7322,38 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
     }
 
 
+@api_router.post("/deals/{deal_id}/request-shipment")
+async def request_shipment(deal_id: str, data: ShipLabelRequest, current_user: dict = Depends(get_current_user)):
+    """Brand submits product + pickup details → creates a shipment REQUEST. The admin
+    shipping queue then generates the label and marks it shipped. The creator's
+    delivery address is captured server-side and is NEVER shown to the brand."""
+    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    if not campaign.get("requires_shipment"):
+        raise HTTPException(status_code=400, detail="This deal does not require a shipment")
+
+    creator = await db.users.find_one({"id": campaign.get("selected_creator")}, {"_id": 0}) or {}
+    delivery = creator_delivery_address(creator)
+    dims = (data.dimensions.dict() if data.dimensions else {}) or {}
+
+    shipment_doc = {
+        "campaign_id": campaign["id"],
+        "product": {"description": data.description, "weight": data.weight, "dimensions": dims},
+        "product_summary": data.description,
+        "pickup_address": data.pickup_address.dict(),
+        "delivery_address": delivery or {},          # internal only — stripped from GET responses
+        "awaiting_creator_address": not delivery,
+        "courier_status": "requested",
+        "status": "requested",
+        "requested_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    await db.shipments.update_one({"campaign_id": campaign["id"]}, {"$set": shipment_doc}, upsert=True)
+    await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "shipment_requested",
+                               "Brand submitted product & pickup details. Awaiting label from the platform.")
+    await insert_deal_system_message(campaign, "The brand submitted shipment details. The platform team will prepare the label shortly.")
+    return {"message": "Shipment requested", "status": "requested"}
+
+
 @api_router.post("/deals/{deal_id}/mark-picked-up")
 async def mark_shipment_picked_up(deal_id: str, current_user: dict = Depends(get_current_user)):
     """Brand confirms the courier has picked up the package → deal moves to 'Shipped'.
@@ -7073,7 +7389,12 @@ async def request_deal_revision(deal_id: str, data: DealRevisionRequest, current
     )
     if not work:
         raise HTTPException(status_code=404, detail="No submitted work to revise")
-    return await request_revision(work['id'], data.feedback, current_user)
+    # request_revision expects a RevisionRequestIn model (it reads .items/.feedback);
+    # build one from the deal-room's simpler payload instead of passing a bare string.
+    feedback = (data.feedback or "").strip()
+    if data.requested_changes:
+        feedback = (feedback + "\n" + "\n".join(f"- {c}" for c in data.requested_changes)).strip()
+    return await request_revision(work['id'], RevisionRequestIn(feedback=feedback), current_user)
 
 @api_router.post("/deals/{deal_id}/archive")
 async def archive_deal(deal_id: str, current_user: dict = Depends(get_current_user)):
@@ -7299,6 +7620,8 @@ async def get_shipment(campaign_id: str, current_user: dict = Depends(get_curren
     shipment = await db.shipments.find_one({"campaign_id": campaign_id}, {"_id": 0})
     if not shipment:
         raise HTTPException(status_code=404, detail="Shipment not found")
+    # The creator's delivery address is ops-only — never expose it to the brand.
+    shipment.pop("delivery_address", None)
     return shipment
 
 
@@ -7419,14 +7742,31 @@ async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount
     return {k: v for k, v in receipt.items() if k != "_id"}
 
 
+MIN_WITHDRAWAL_AMOUNT = 500  # INR — minimum a creator can withdraw at once
+
 @api_router.post("/withdrawal/request")
 async def request_withdrawal(data: WithdrawalRequest, current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
         raise HTTPException(status_code=403, detail="Only creators can request withdrawals")
-    
+
+    # Only approved creators can withdraw earnings.
+    if current_user.get('approval_status') != ApprovalStatus.APPROVED:
+        raise HTTPException(status_code=403, detail="Your creator profile must be approved before you can withdraw")
+
+    # Amount must be a positive number at or above the minimum.
+    if data.amount is None or data.amount <= 0:
+        raise HTTPException(status_code=400, detail="Withdrawal amount must be greater than zero")
+    if data.amount < MIN_WITHDRAWAL_AMOUNT:
+        raise HTTPException(status_code=400, detail=f"Minimum withdrawal amount is INR {MIN_WITHDRAWAL_AMOUNT:,}")
+
+    # Payout account details must actually be filled in (an empty {} is not enough).
+    details = data.account_details or {}
+    if not any(str(v).strip() for v in details.values()):
+        raise HTTPException(status_code=400, detail="Bank / payout account details are required")
+
     if current_user.get('balance', 0) < data.amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
-    
+
     withdrawal_doc = {
         "id": str(uuid.uuid4()),
         "user_id": current_user['id'],
@@ -7505,6 +7845,18 @@ async def get_pending_profiles(status: Optional[str] = None,
         {"_id": 0, "password": 0}
     ).sort("submitted_at", 1).to_list(2000)
 
+    # Ops Regular only reviews applications in their assigned work categories.
+    if admin_caps.normalize_role(current_user.get("admin_role")) == "ops_regular":
+        assigned = {str(c).lower() for c in (current_user.get("assigned_categories") or [])}
+        if assigned:
+            def _cat(u):
+                pr = u.get("profile") or {}
+                for k in ("category", "industry", "niche", "primary_category", "content_category"):
+                    if pr.get(k):
+                        return str(pr[k]).lower()
+                return ""
+            profiles = [u for u in profiles if _cat(u) in assigned]
+
     return profiles
 
 @api_router.post("/admin/approve-profile")
@@ -7535,7 +7887,7 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(req
             "decided_by": current_user["id"],
         }
 
-    user = await db.users.find_one({"id": data.item_id}, {"_id": 0, "role": 1, "public_creator_id": 1})
+    user = await db.users.find_one({"id": data.item_id}, {"_id": 0, "role": 1, "public_creator_id": 1, "email": 1, "nickname": 1, "full_name": 1})
     if not user:
         raise HTTPException(status_code=404, detail="Profile not found")
     update_data = {
@@ -7566,6 +7918,35 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(req
         {"id": data.item_id},
         {"$set": update_data}
     )
+
+    # Branded decision email to the applicant (fire-and-forget — never blocks the decision).
+    try:
+        to_email = user.get("email")
+        name = user.get("nickname") or user.get("full_name") or "there"
+        if to_email:
+            if data.action == "approve":
+                subject = "Your UGCad.io application is approved 🎉"
+                content = f"""
+                    <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">You're approved, {name}!</h1>
+                    <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">Your profile has been reviewed and <strong>approved</strong>. You can now sign in and start on UGCad.io.</p>"""
+            elif data.action == "request_info":
+                items = data.items or []
+                items_html = ("<ul style='margin:12px 0;padding-left:20px;color:#4a4f74;'>" + "".join(f"<li style='margin:4px 0;'>{i}</li>" for i in items) + "</ul>") if items else ""
+                subject = "Action needed on your UGCad.io application"
+                content = f"""
+                    <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">We need a bit more info, {name}</h1>
+                    <p style="margin:0 0 8px;font-size:15px;line-height:1.6;color:#4a4f74;">{data.message or 'Please review and update your profile so we can finish reviewing it.'}</p>{items_html}
+                    <p style="margin:12px 0 0;font-size:14px;color:#4a4f74;">Sign in and update your profile to resubmit.</p>"""
+            else:  # reject
+                reason = data.reason_details or data.reason or "It did not meet our current requirements."
+                subject = "Update on your UGCad.io application"
+                content = f"""
+                    <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Application update</h1>
+                    <p style="margin:0 0 12px;font-size:15px;line-height:1.6;color:#4a4f74;">Hi {name}, unfortunately your application was <strong>not approved</strong> at this time.</p>
+                    <p style="margin:0;font-size:14px;color:#4a4f74;"><strong>Reason:</strong> {reason}</p>"""
+            await send_email(to_email, subject, _email_base_template(subject, content))
+    except Exception as e:
+        logger.error(f"[approve-profile] applicant email failed: {e}")
 
     return {"success": True, "message": "Profile updated", "approval_status": status}
 
@@ -7721,7 +8102,9 @@ async def manage_role(data: RoleUpdate, current_user: dict = Depends(require_cap
 
 @api_router.get("/admin/stats")
 async def get_admin_stats(current_user: dict = Depends(get_current_user)):
-    if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
+    # Dashboard is open to any real admin (incl. custom with zero caps), but NOT
+    # to legacy staff roles (campaign_manager / support_staff), which are retired.
+    if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
     
     total_users = await db.users.count_documents({})
@@ -7742,8 +8125,11 @@ async def get_admin_stats(current_user: dict = Depends(get_current_user)):
 async def get_all_users(current_user: dict = Depends(require_cap("user_management"))):
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
-    
-    users = await db.users.find({}, {"_id": 0, "password": 0}).to_list(1000)
+
+    # Hard scope enforcement: a custom creators-only / brands-only admin only ever
+    # receives their side of the marketplace from this list.
+    scope_q = admin_caps.user_scope_filter(current_user)
+    users = await db.users.find(scope_q, {"_id": 0, "password": 0}).to_list(1000)
     return _json_safe(users)
 
 @api_router.get("/admin/user/{user_id}")
@@ -7755,7 +8141,9 @@ async def get_user_details(user_id: str, current_user: dict = Depends(require_ca
     user = await db.users.find_one({"id": user_id}, {"_id": 0, "password": 0})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+    # A scoped admin can't view a user outside their side of the marketplace.
+    if not admin_caps.in_scope(current_user, user.get("role")):
+        raise HTTPException(status_code=403, detail="This user is outside your data scope")
     return user
 
 @api_router.post("/admin/user/update")
@@ -7768,6 +8156,9 @@ async def update_user(data: UserUpdateRequest, current_user: dict = Depends(requ
     user = await db.users.find_one({"id": data.user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    # A scoped admin can't act on a user outside their side of the marketplace.
+    if not admin_caps.in_scope(current_user, user.get("role")):
+        raise HTTPException(status_code=403, detail="This user is outside your data scope")
     
     # Build update dict with only provided fields
     update_data = {}
@@ -7803,6 +8194,9 @@ async def ban_user(data: UserBanRequest, current_user: dict = Depends(require_ca
     user = await db.users.find_one({"id": data.user_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    # A scoped admin can't act on a user outside their side of the marketplace.
+    if not admin_caps.in_scope(current_user, user.get("role")):
+        raise HTTPException(status_code=403, detail="This user is outside your data scope")
     
     # Prevent banning self
     if data.user_id == current_user['id']:
@@ -10022,6 +10416,31 @@ async def admin_refund_escrow(escrow_id: str, data: Dict[str, Any] = Body(...), 
     return {"message": "Escrow refunded to brand", "escrow_id": escrow_id, "amount": amount}
 
 
+# ---- Deal-room shortcuts: release/refund by DEAL (campaign) id -----------------
+# The admin Deals drawer calls these deal-scoped paths; they resolve the escrow
+# for the campaign and delegate to the escrow release/refund logic above.
+@api_router.post("/admin/deals/{campaign_id}/release-payment")
+async def admin_deal_release_payment(campaign_id: str, data: Dict[str, Any] = Body(default={}),
+                                     request: Request = None, current_user: dict = Depends(require_cap("release_payouts"))):
+    escrow = await db.escrow.find_one({"campaign_id": campaign_id}, {"_id": 0})
+    if not escrow:
+        raise HTTPException(status_code=404, detail="No escrow found for this deal")
+    body = dict(data or {})
+    body.setdefault("reason", "Payment released from the deal room by admin")
+    return await admin_release_escrow(escrow["id"], data=body, request=request, current_user=current_user)
+
+
+@api_router.post("/admin/deals/{campaign_id}/refund")
+async def admin_deal_refund(campaign_id: str, data: Dict[str, Any] = Body(default={}),
+                            request: Request = None, current_user: dict = Depends(require_cap("release_payouts"))):
+    escrow = await db.escrow.find_one({"campaign_id": campaign_id}, {"_id": 0})
+    if not escrow:
+        raise HTTPException(status_code=404, detail="No escrow found for this deal")
+    body = dict(data or {})
+    body.setdefault("reason", "Refunded from the deal room by admin")
+    return await admin_refund_escrow(escrow["id"], data=body, request=request, current_user=current_user)
+
+
 @api_router.get("/admin/financials/pnl/export")
 async def export_pnl(period: Optional[str] = "month", current_user: dict = Depends(require_cap("view_financials"))):
     """PRD 11.11: monthly P&L summary export."""
@@ -10066,6 +10485,45 @@ async def export_reconciliation(current_user: dict = Depends(require_cap("view_f
     ]
     await log_admin_action(current_user, "export.reconciliation", target_type="report")
     return _csv_response(rows, ["account", "balance"], "reconciliation.csv")
+
+
+@api_router.get("/admin/reports/digest")
+async def export_reports_digest(period: Optional[str] = "daily", current_user: dict = Depends(require_cap("generate_reports"))):
+    """Platform activity digest (users / applications / campaigns / deals / escrow)
+    as a CSV, scoped to the requested period."""
+    cutoff = _period_cutoff_iso(period)
+    since = {"$gte": cutoff} if cutoff else None
+
+    async def _count(coll, extra=None, date_field="created_at"):
+        q = dict(extra or {})
+        if since:
+            q[date_field] = since
+        return await db[coll].count_documents(q)
+
+    total_users = await db.users.count_documents({})
+    new_creators = await _count("users", {"role": UserRole.CREATOR}, "created_at")
+    new_brands = await _count("users", {"role": UserRole.BUSINESS}, "created_at")
+    pending_apps = await db.users.count_documents({"approval_status": ApprovalStatus.PENDING})
+    new_campaigns = await _count("campaigns", None, "created_at")
+    active_campaigns = await db.campaigns.count_documents({"status": CampaignStatus.ACTIVE})
+    open_disputes = await db.disputes.count_documents({"status": {"$in": ["open", "info_requested", "appealed"]}})
+    escrows = await db.escrow.find({"status": "held"}, {"_id": 0, "amount": 1}).to_list(50000)
+    escrow_held = round(sum(to_float(e.get("amount")) for e in escrows), 2)
+
+    rows = [
+        {"metric": "period", "value": period or "daily"},
+        {"metric": "generated_at", "value": now_iso()},
+        {"metric": "total_users", "value": total_users},
+        {"metric": "new_creators", "value": new_creators},
+        {"metric": "new_brands", "value": new_brands},
+        {"metric": "pending_applications", "value": pending_apps},
+        {"metric": "new_campaigns", "value": new_campaigns},
+        {"metric": "active_campaigns", "value": active_campaigns},
+        {"metric": "open_disputes", "value": open_disputes},
+        {"metric": "escrow_held_inr", "value": escrow_held},
+    ]
+    await log_admin_action(current_user, "export.digest", target_type="report", reason=period)
+    return _csv_response(rows, ["metric", "value"], f"digest_{(period or 'daily')}.csv")
 
 
 # --- Shipping Queue (PRD 11.9) ---------------------------------------------
@@ -10157,14 +10615,24 @@ async def admin_list_deals(state: Optional[str] = None, current_user: dict = Dep
         creator = await db.users.find_one({"id": c.get("selected_creator")}, {"_id": 0, "nickname": 1}) or {}
         escrow = await db.escrow.find_one({"campaign_id": c["id"]}, {"_id": 0, "amount": 1, "status": 1}) or {}
         disputed = await db.disputes.count_documents({"campaign_id": c["id"], "status": {"$in": ["open", "info_requested", "appealed"]}})
+        deadline = c.get("final_delivery_by") or c.get("due_date")
+        countdown = hours_until(deadline)
+        terminal = c.get("status") in (CampaignStatus.COMPLETED, "completed", "cancelled", "paid")
+        overdue = bool(countdown is not None and countdown < 0 and not terminal)
+        urgency = "overdue" if overdue else ("due_soon" if (countdown is not None and 0 <= countdown <= 24 and not terminal) else "normal")
         rows.append({
             "id": c["id"], "deal_id": c["id"], "campaign_title": c.get("title"), "campaign": c.get("title"),
             "brand": brand.get("nickname"), "creator": creator.get("nickname"),
             "current_state": c.get("status"), "state": c.get("status"),
-            "deadline": c.get("final_delivery_by") or c.get("due_date"),
+            "deadline": deadline,
+            "deadline_countdown_hours": countdown,
+            "is_overdue": overdue,
+            "urgency": urgency,
             "escrow": to_float(escrow.get("amount")), "escrow_status": escrow.get("status"),
             "flagged": bool(disputed), "requires_shipment": bool(c.get("requires_shipment")),
         })
+    # Surface overdue / due-soon deals at the top of the ops queue.
+    rows.sort(key=lambda r: (0 if r["is_overdue"] else 1 if r["urgency"] == "due_soon" else 2))
     return rows
 
 
@@ -10246,6 +10714,105 @@ async def admin_add_deal_note(campaign_id: str, data: Dict[str, Any] = Body(...)
     await db.campaigns.update_one({"id": campaign_id}, {"$push": {"admin_notes": note}})
     await log_admin_action(current_user, "deal.note_added", target_type="deal", target_id=campaign_id, after={"note": note_text}, request=request)
     return {"message": "Note added", "note": note}
+
+
+async def _admin_deal_or_404(campaign_id: str, current_user: dict) -> dict:
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can perform this action")
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    return campaign
+
+
+@api_router.post("/admin/deals/{campaign_id}/raise-dispute")
+async def admin_raise_dispute(campaign_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
+                              current_user: dict = Depends(require_cap("rule_disputes"))):
+    """Open a dispute on a deal on behalf of both parties (ops intervention)."""
+    campaign = await _admin_deal_or_404(campaign_id, current_user)
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="A reason is required")
+    dispute = {
+        "id": str(uuid.uuid4()), "campaign_id": campaign_id, "status": "open",
+        "raised_by": "admin", "reason": reason, "created_at": now_iso(), "updated_at": now_iso(),
+    }
+    existing = await db.disputes.find_one({"campaign_id": campaign_id, "status": {"$in": ["open", "info_requested", "appealed"]}})
+    if not existing:
+        await db.disputes.insert_one(dispute)
+    await db.campaigns.update_one({"id": campaign_id}, {"$set": {"status": "disputed", "updated_at": now_iso()}})
+    await log_admin_action(current_user, "deal.raise_dispute", target_type="deal", target_id=campaign_id, reason=reason, request=request)
+    msg = f"Support opened a dispute on this deal. Reason: {reason}."
+    await insert_deal_system_message(campaign, msg)
+    for uid in [campaign.get("business_id"), campaign.get("selected_creator")]:
+        if uid:
+            await notify_user(uid, "Dispute opened", msg, link="/my-deals")
+    return {"success": True}
+
+
+@api_router.post("/admin/deals/{campaign_id}/message")
+async def admin_deal_message(campaign_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
+                             current_user: dict = Depends(require_cap("manage_deals"))):
+    """Post an admin intervention message into the deal room."""
+    campaign = await _admin_deal_or_404(campaign_id, current_user)
+    message = (data.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="A message is required")
+    await insert_deal_system_message(campaign, f"[Support] {message}")
+    await log_admin_action(current_user, "deal.message", target_type="deal", target_id=campaign_id, request=request)
+    for uid in [campaign.get("business_id"), campaign.get("selected_creator")]:
+        if uid:
+            await notify_user(uid, "Support posted in your deal room", message[:140], link="/my-deals")
+    return {"success": True}
+
+
+@api_router.post("/admin/deals/{campaign_id}/notify")
+async def admin_deal_notify(campaign_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
+                            current_user: dict = Depends(require_cap("manage_deals"))):
+    """Send a notification to one or both parties from the admin console."""
+    campaign = await _admin_deal_or_404(campaign_id, current_user)
+    message = (data.get("message") or "").strip()
+    party = data.get("party") if data.get("party") in ("brand", "creator", "both") else "both"
+    if not message:
+        raise HTTPException(status_code=400, detail="A message is required")
+    targets = []
+    if party in ("brand", "both") and campaign.get("business_id"):
+        targets.append(campaign["business_id"])
+    if party in ("creator", "both") and campaign.get("selected_creator"):
+        targets.append(campaign["selected_creator"])
+    for uid in targets:
+        await notify_user(uid, "Message from support", message, link="/my-deals")
+    await log_admin_action(current_user, "deal.notify", target_type="deal", target_id=campaign_id, request=request)
+    return {"success": True}
+
+
+def _user_category(u: dict) -> str:
+    p = u.get("profile") or {}
+    return str(u.get("category") or p.get("category") or p.get("niche") or p.get("industry") or p.get("industry_category") or "").lower()
+
+
+@api_router.get("/admin/my-assigned")
+async def admin_my_assigned(current_user: dict = Depends(require_cap("review_applications"))):
+    """Creators & brands (profile-completed) in the categories assigned to this ops
+    admin — Founder/Senior see all; ops_regular is scoped to assigned categories."""
+    users = await db.users.find(
+        {"profile_completed": True, "role": {"$in": ["creator", "business"]}},
+        {"_id": 0, "password": 0},
+    ).to_list(2000)
+    assigned = None
+    if current_user.get("admin_role") == "ops_regular":
+        me = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "assigned_categories": 1}) or {}
+        assigned = [str(x).lower() for x in (me.get("assigned_categories") or [])]
+        if assigned:
+            users = [u for u in users if any(a and (a in _user_category(u) or _user_category(u) in a) for a in assigned)]
+    return {"scoped": assigned is not None, "assigned_categories": assigned or [], "users": users}
+
+
+@api_router.get("/reviews")
+async def list_reviews_stub(current_user: dict = Depends(get_current_user)):
+    """Compatibility stub (Express parity) — the creator-scoped reviews live at
+    /reviews/creator/{id}."""
+    return []
 
 
 app.include_router(categories_router)
