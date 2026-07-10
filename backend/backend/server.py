@@ -3369,7 +3369,7 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
     # Send automated system messages to both parties
     system_message_to_creator = f"""🎉 Congratulations! You've been selected for the campaign "{campaign['title']}"!
 
-💰 Payment: ${selected_bid['amount']} has been held in escrow and will be released upon work approval.
+💰 Payment: ₹{selected_bid['amount']:,.0f} has been held in escrow and will be released upon work approval.
 📅 Delivery: {selected_bid['estimated_delivery_days']} days
 📋 Campaign Brief: {campaign.get('brief_text', 'See campaign details')}
 
@@ -3377,7 +3377,7 @@ Let's discuss the next steps and get started! Feel free to ask any questions."""
     
     system_message_to_business = f"""✅ You've successfully selected {creator['nickname']} for "{campaign['title']}"!
 
-💰 Payment: ${selected_bid['amount']} has been held in escrow
+💰 Payment: ₹{selected_bid['amount']:,.0f} has been held in escrow
 📅 Expected Delivery: {selected_bid['estimated_delivery_days']} days
 
 You can now communicate directly with {creator['nickname']} to coordinate the work. Good luck with your campaign!"""
@@ -3437,7 +3437,7 @@ You can now communicate directly with {creator['nickname']} to coordinate the wo
         "id": str(uuid.uuid4()),
         "user_id": creator_id,
         "title": "🎉 You've been selected for a campaign!",
-        "message": f"Congratulations! You've been selected for '{campaign['title']}'. Payment of ${selected_bid['amount']} is now in escrow.",
+        "message": f"Congratulations! You've been selected for '{campaign['title']}'. Payment of ₹{selected_bid['amount']:,.0f} is now in escrow.",
         "type": "success",
         "link": "/creator-dashboard",
         "read": False,

@@ -4934,7 +4934,7 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
     # Send automated system messages to both parties
     system_message_to_creator = f"""🎉 Congratulations! You've been selected for the campaign "{campaign['title']}"!
 
-💰 Payment: ${selected_bid['amount']} has been held in escrow and will be released upon work approval.
+💰 Payment: ₹{int(selected_bid['amount']):,} has been held in escrow and will be released upon work approval.
 📅 Delivery: {selected_bid['estimated_delivery_days']} days
 📋 Campaign Brief: {campaign.get('brief_text', 'See campaign details')}
 
@@ -4942,7 +4942,7 @@ Let's discuss the next steps and get started! Feel free to ask any questions."""
     
     system_message_to_business = f"""✅ You've successfully selected {creator['nickname']} for "{campaign['title']}"!
 
-💰 Payment: ${selected_bid['amount']} has been held in escrow
+💰 Payment: ₹{int(selected_bid['amount']):,} has been held in escrow
 📅 Expected Delivery: {selected_bid['estimated_delivery_days']} days
 
 You can now communicate directly with {creator['nickname']} to coordinate the work. Good luck with your campaign!"""
@@ -5002,7 +5002,7 @@ You can now communicate directly with {creator['nickname']} to coordinate the wo
         "id": str(uuid.uuid4()),
         "user_id": creator_id,
         "title": "🎉 You've been selected for a campaign!",
-        "message": f"Congratulations! You've been selected for '{campaign['title']}'. Payment of ${selected_bid['amount']} is now in escrow.",
+        "message": f"Congratulations! You've been selected for '{campaign['title']}'. Payment of ₹{int(selected_bid['amount']):,} is now in escrow.",
         "type": "success",
         "link": "/creator-dashboard",
         "read": False,
@@ -10868,6 +10868,43 @@ async def list_reviews_stub(current_user: dict = Depends(get_current_user)):
     """Compatibility stub (Express parity) — the creator-scoped reviews live at
     /reviews/creator/{id}."""
     return []
+
+
+@api_router.get("/payout/overview")
+async def payout_overview(current_user: dict = Depends(get_current_user)):
+    """Creator earnings summary for the Earnings page: available balance (credited to
+    the wallet on release), pending escrow, this month's payouts, and lifetime total."""
+    uid = current_user["id"]
+    camp_ids = []
+    async for c in db.campaigns.find({"selected_creator": uid}, {"_id": 0, "id": 1}):
+        if c.get("id"):
+            camp_ids.append(c["id"])
+    escrows = await db.escrow.find({"campaign_id": {"$in": camp_ids}}, {"_id": 0}).to_list(2000) if camp_ids else []
+
+    def payout(e):
+        return to_float(e.get("net_payable") if e.get("net_payable") is not None
+                        else (e.get("creator_payout") if e.get("creator_payout") is not None else e.get("amount")))
+
+    released = [e for e in escrows if e.get("status") == "released"]
+    held = [e for e in escrows if e.get("status") in ("held", "queued", "on_hold")]
+    all_time = sum(payout(e) for e in released)
+    pending = sum(payout(e) for e in held)
+    balance = to_float(current_user.get("balance"))
+
+    now = datetime.now(timezone.utc)
+    def this_month(e):
+        r = parse_iso(e.get("released_at"))
+        return bool(r and r.year == now.year and r.month == now.month)
+    paid_this_month = sum(payout(e) for e in released if this_month(e))
+
+    return {
+        "balance": balance,
+        "pending_release": pending,
+        "paid_this_month": paid_this_month,
+        "all_time_earnings": all_time,
+        "last_month": 0,
+        "deals_paid": len(released),
+    }
 
 
 app.include_router(categories_router)
