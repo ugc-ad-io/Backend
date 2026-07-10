@@ -23,7 +23,7 @@ ROLE_LABELS = {
 
 # Every grantable capability (the custom-admin toggle list).
 ALL_CAPS = [
-    "review_applications", "manage_deals", "rule_disputes", "manage_shipping",
+    "review_applications", "my_users", "manage_deals", "rule_disputes", "manage_shipping",
     "release_payouts", "adjust_wallet", "warn_suspend_users", "ban_users",
     "view_financials", "generate_reports", "export_tax", "user_management",
     "content_moderation", "view_audit", "manage_roles",
@@ -45,12 +45,12 @@ DISPUTE_CAP = {
 CAPS = {
     "founder": ["*"],
     "ops_senior": [
-        "review_applications", "manage_deals", "rule_disputes", "manage_shipping",
+        "review_applications", "my_users", "manage_deals", "rule_disputes", "manage_shipping",
         "release_payouts", "adjust_wallet", "warn_suspend_users", "view_financials",
         "generate_reports", "user_management", "content_moderation", "view_audit",
     ],
     "ops_regular": [
-        "review_applications", "manage_deals", "rule_disputes", "manage_shipping",
+        "review_applications", "my_users", "manage_deals", "rule_disputes", "manage_shipping",
         "release_payouts", "generate_reports", "content_moderation", "view_audit",
     ],
     "finance": [

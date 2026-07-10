@@ -25,7 +25,7 @@ const ROLE_LABELS = {
 
 // Every capability that can be granted to a custom admin (the toggle list).
 const ALL_CAPS = [
-  'review_applications', 'manage_deals', 'rule_disputes', 'manage_shipping',
+  'review_applications', 'my_users', 'manage_deals', 'rule_disputes', 'manage_shipping',
   'release_payouts', 'adjust_wallet', 'warn_suspend_users', 'ban_users',
   'view_financials', 'generate_reports', 'export_tax', 'user_management',
   'content_moderation', 'view_audit', 'manage_roles',
@@ -47,12 +47,12 @@ const DISPUTE_CAP = {
 const CAPS = {
   founder: ['*'],
   ops_senior: [
-    'review_applications', 'manage_deals', 'rule_disputes', 'manage_shipping',
+    'review_applications', 'my_users', 'manage_deals', 'rule_disputes', 'manage_shipping',
     'release_payouts', 'adjust_wallet', 'warn_suspend_users', 'view_financials',
     'generate_reports', 'user_management', 'content_moderation', 'view_audit'
   ],
   ops_regular: [
-    'review_applications', 'manage_deals', 'rule_disputes', 'manage_shipping',
+    'review_applications', 'my_users', 'manage_deals', 'rule_disputes', 'manage_shipping',
     'release_payouts', 'generate_reports', 'content_moderation', 'view_audit'
   ],
   finance: [

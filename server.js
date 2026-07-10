@@ -539,7 +539,7 @@ app.post('/api/admin/staff/categories', adminAuth, requireCap('manage_roles'), a
 
 // The creators / brands this admin is responsible for (their category roster).
 // Ops (Regular) → only their assigned categories. Founder / Senior → everyone.
-app.get('/api/admin/my-assigned', adminAuth, requireCap('review_applications'), async (req, res) => {
+app.get('/api/admin/my-assigned', adminAuth, requireCap('my_users'), async (req, res) => {
   try {
     let users = await User.find({ profile_completed: true, role: { $in: ['creator', 'business'] } })
       .sort({ submitted_at: -1, createdAt: -1 })

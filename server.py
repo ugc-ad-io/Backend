@@ -10792,7 +10792,7 @@ def _user_category(u: dict) -> str:
 
 
 @api_router.get("/admin/my-assigned")
-async def admin_my_assigned(current_user: dict = Depends(require_cap("review_applications"))):
+async def admin_my_assigned(current_user: dict = Depends(require_cap("my_users"))):
     """Creators & brands (profile-completed) in the categories assigned to this ops
     admin — Founder/Senior see all; ops_regular is scoped to assigned categories."""
     users = await db.users.find(
