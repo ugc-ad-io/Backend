@@ -10538,13 +10538,16 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
     ).to_list(2000)
     rows = []
     for c in campaigns:
-        sh = await db.shipments.find_one({"campaign_id": c["id"]}, {"_id": 0}) or {}
+        cid = c.get("id")
+        if not cid:
+            continue  # legacy campaign without a UUID id — skip rather than 500
+        sh = await db.shipments.find_one({"campaign_id": cid}, {"_id": 0}) or {}
         ship_status = sh.get("courier_status") or sh.get("status") or "pending"
         brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "nickname": 1, "profile": 1}) or {}
         creator = await db.users.find_one({"id": c.get("selected_creator")}, {"_id": 0, "nickname": 1, "profile": 1}) or {}
         requested = c.get("work_started_at") or c.get("updated_at") or c.get("created_at")
         rows.append({
-            "id": c["id"], "deal_id": c["id"], "campaign_title": c.get("title"),
+            "id": cid, "deal_id": cid, "campaign_title": c.get("title"),
             "brand": brand.get("nickname"), "creator": creator.get("nickname"),
             "product": c.get("product_name") or "—", "requested_at": requested, "created_at": requested,
             "status": ship_status, "courier": sh.get("courier_name"), "tracking_number": sh.get("tracking_number"),
@@ -10611,10 +10614,13 @@ async def admin_list_deals(state: Optional[str] = None, current_user: dict = Dep
     campaigns = await db.campaigns.find(query, {"_id": 0}).sort("updated_at", -1).to_list(2000)
     rows = []
     for c in campaigns:
+        cid = c.get("id")
+        if not cid:
+            continue  # legacy campaign without a UUID id — skip rather than 500
         brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "nickname": 1}) or {}
         creator = await db.users.find_one({"id": c.get("selected_creator")}, {"_id": 0, "nickname": 1}) or {}
-        escrow = await db.escrow.find_one({"campaign_id": c["id"]}, {"_id": 0, "amount": 1, "status": 1}) or {}
-        disputed = await db.disputes.count_documents({"campaign_id": c["id"], "status": {"$in": ["open", "info_requested", "appealed"]}})
+        escrow = await db.escrow.find_one({"campaign_id": cid}, {"_id": 0, "amount": 1, "status": 1}) or {}
+        disputed = await db.disputes.count_documents({"campaign_id": cid, "status": {"$in": ["open", "info_requested", "appealed"]}})
         deadline = c.get("final_delivery_by") or c.get("due_date")
         countdown = hours_until(deadline)
         terminal = c.get("status") in (CampaignStatus.COMPLETED, "completed", "cancelled", "paid")
