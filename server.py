@@ -635,6 +635,18 @@ def _send_email_sync(to, subject: str, html: str, text: Optional[str] = None) ->
 async def send_email(to, subject: str, html: str, text: Optional[str] = None) -> dict:
     return await asyncio.to_thread(_send_email_sync, to, subject, html, text)
 
+def _email_button(label: str, path: str = "/auth") -> str:
+    """Primary CTA button for transactional emails. `path` is appended to
+    FRONTEND_URL unless it is already an absolute URL."""
+    base = (os.environ.get("FRONTEND_URL") or "https://www.ugcad.io").rstrip("/")
+    url = path if str(path).startswith("http") else f"{base}{path}"
+    return (
+        f'<p style="margin:26px 0 0;"><a href="{url}" '
+        'style="background:#07074e;color:#ffffff;padding:13px 26px;border-radius:8px;'
+        'text-decoration:none;font-weight:600;display:inline-block;font-size:15px;">'
+        f'{label}</a></p>'
+    )
+
 def _email_base_template(title: str, content_html: str) -> str:
     year = datetime.now(timezone.utc).year
     return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f4f5fb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2340;">
@@ -2592,6 +2604,7 @@ async def forgot_password(data: ForgotPasswordRequest):
             <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Reset your password</h1>
             <p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#4a4f74;">Use the code below to reset your password. It expires in 15 minutes.</p>
             <div style="font-size:32px;font-weight:800;letter-spacing:8px;color:#5b6bff;background:#f4f5fb;border-radius:12px;padding:18px 0;text-align:center;">{code}</div>
+            {_email_button("Go to sign in")}
             <p style="margin:20px 0 0;font-size:13px;line-height:1.6;color:#9296ba;">If you didn't request this, you can safely ignore this email.</p>""")
         await send_email(email, "Your UGCad.io password reset code", html)
     except Exception as e:
@@ -8016,7 +8029,8 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(req
                 subject = "Your UGCad.io application is approved 🎉"
                 content = f"""
                     <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">You're approved, {name}!</h1>
-                    <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">Your profile has been reviewed and <strong>approved</strong>. You can now sign in and start on UGCad.io.</p>"""
+                    <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">Your profile has been reviewed and <strong>approved</strong>. You can now sign in and start on UGCad.io.</p>
+                    {_email_button("Sign in to UGCad.io")}"""
             elif data.action == "request_info":
                 items = data.items or []
                 items_html = ("<ul style='margin:12px 0;padding-left:20px;color:#4a4f74;'>" + "".join(f"<li style='margin:4px 0;'>{i}</li>" for i in items) + "</ul>") if items else ""
@@ -8024,7 +8038,8 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(req
                 content = f"""
                     <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">We need a bit more info, {name}</h1>
                     <p style="margin:0 0 8px;font-size:15px;line-height:1.6;color:#4a4f74;">{data.message or 'Please review and update your profile so we can finish reviewing it.'}</p>{items_html}
-                    <p style="margin:12px 0 0;font-size:14px;color:#4a4f74;">Sign in and update your profile to resubmit.</p>"""
+                    <p style="margin:12px 0 0;font-size:14px;color:#4a4f74;">Sign in and update your profile to resubmit.</p>
+                    {_email_button("Sign in and update profile")}"""
             else:  # reject
                 reason = data.reason_details or data.reason or "It did not meet our current requirements."
                 subject = "Update on your UGCad.io application"
@@ -8467,11 +8482,20 @@ async def delete_user(user_id: str, current_user: dict = Depends(require_cap("ba
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Same guards as ban: never delete yourself or another admin.
+    # Never delete yourself.
     if user_id == current_user['id']:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
+    # An admin can only be removed by the founder (Team & Roles → Delete), and the
+    # founder account itself can never be deleted.
     if user.get('role') == UserRole.ADMIN:
-        raise HTTPException(status_code=400, detail="Cannot delete admin users")
+        if not _is_founder_admin(current_user):
+            raise HTTPException(status_code=403, detail="Only the founder can delete an admin")
+        target_is_founder = (
+            (user.get('email') or '').lower() == FOUNDER_EMAIL
+            or user.get('admin_role') in (None, '', 'founder')
+        )
+        if target_is_founder:
+            raise HTTPException(status_code=400, detail="The founder account cannot be deleted")
 
     deleted = {}
 
@@ -10162,7 +10186,7 @@ async def export_audit_logs(action: Optional[str] = None, module: Optional[str] 
 
 # --- Platform Settings (PRD 11.14, founder-only) ---------------------------
 DEFAULT_PLATFORM_SETTINGS = {
-    "commission_rate": 25,
+    "commission_rate": 20,
     "listing_fee": 500,
     "revision_price": 500,
     "auto_approval_days": 5,
@@ -10173,10 +10197,64 @@ DEFAULT_PLATFORM_SETTINGS = {
     "feature_flags": {"matching_v05": True, "instant_payout": True},
 }
 
+# In-process cache so sync helpers (commission, fees) can read live settings without
+# awaiting. Warmed at startup and refreshed every time settings are saved.
+_PLATFORM_SETTINGS_CACHE: Dict[str, Any] = dict(DEFAULT_PLATFORM_SETTINGS)
+
+
+def platform_setting(key: str, default=None):
+    """Sync read of a platform setting (falls back to the shipped default)."""
+    value = _PLATFORM_SETTINGS_CACHE.get(key)
+    if value is None:
+        value = DEFAULT_PLATFORM_SETTINGS.get(key, default)
+    return default if value is None else value
+
+
+def commission_percent() -> float:
+    """Platform commission %, driven by Admin → Settings → Commission rate."""
+    return to_float(platform_setting("commission_rate", 20)) or 20.0
+
+
+def feature_enabled(flag: str) -> bool:
+    return bool((platform_setting("feature_flags") or {}).get(flag, True))
+
+
+def payout_delay_for(level) -> int:
+    """Payout delay (days) for a creator level, from Settings (falls back to the code table)."""
+    table = platform_setting("payout_delay_days") or {}
+    value = table.get(cf.normalize_level(level))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(cf.payout_delay_days(level))
+
+
+def revision_fee_for(used: int) -> float:
+    """Fee for the brand's next revision — free up to the limit, then `revision_price`."""
+    if used < cf.FREE_REVISION_LIMIT:
+        return 0.0
+    return to_float(platform_setting("revision_price", cf.PAID_REVISION_FEE))
+
+
+def is_restricted_category(*values) -> Optional[str]:
+    """Return the restricted keyword a campaign/brand category matches, if any."""
+    blocked = [str(c).strip().lower() for c in (platform_setting("restricted_categories") or []) if str(c).strip()]
+    for value in values:
+        text = str(value or "").lower()
+        if not text:
+            continue
+        for word in blocked:
+            if word and word in text:
+                return word
+    return None
+
 
 async def get_platform_settings() -> dict:
     doc = await db.platform_settings.find_one({"id": "platform"}, {"_id": 0})
-    return {**DEFAULT_PLATFORM_SETTINGS, **((doc or {}).get("values") or {})}
+    merged = {**DEFAULT_PLATFORM_SETTINGS, **((doc or {}).get("values") or {})}
+    _PLATFORM_SETTINGS_CACHE.clear()
+    _PLATFORM_SETTINGS_CACHE.update(merged)
+    return merged
 
 
 @api_router.get("/admin/settings")
