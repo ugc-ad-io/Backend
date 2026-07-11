@@ -6282,9 +6282,13 @@ async def get_all_chats(current_user: dict = Depends(require_cap("content_modera
         user2 = await db.users.find_one({"id": conv_data['user2_id']}, {"_id": 0, "nickname": 1, "username": 1, "role": 1, "warning_count": 1})
         pair_ids = [conv_data['user1_id'], conv_data['user2_id']]
 
-        # Count violations for this conversation
+        # Blocked messages for THIS conversation. A contact-info hit never reaches
+        # db.messages (send_message raises before the insert), so the `filtered` flag
+        # on messages was always False — which left this queue permanently empty even
+        # while users were being strike-paused. db.violations is the real record.
         violation_count = await db.violations.count_documents({
-            "user_id": {"$in": pair_ids}
+            "user_id": {"$in": pair_ids},
+            "recipient_id": {"$in": pair_ids},
         })
 
         # Open user-reports against either participant (harassment / spam queue).
@@ -6315,7 +6319,8 @@ async def get_all_chats(current_user: dict = Depends(require_cap("content_modera
             },
             "last_message": conv_data['last_message'],
             "last_message_at": conv_data['last_message_at'],
-            "has_violations": conv_data['has_filtered'],
+            # Either a delivered-but-flagged message (legacy) OR a blocked one.
+            "has_violations": conv_data['has_filtered'] or violation_count > 0,
             "violation_count": violation_count,
             # New signals for the Chat Oversight queues:
             "report_count": report_count,
@@ -6367,6 +6372,43 @@ async def get_chat_for_admin(user1_id: str, user2_id: str, current_user: dict = 
         msg["sender_nickname"] = sender.get("nickname") or msg.get("sender_nickname")
         msg["sender_username"] = sender.get("username")
 
+    # Blocked messages never made it into db.messages — the contact-info filter raises
+    # before the insert. Fold them in from db.violations as `filtered` rows so the
+    # admin can actually read what was blocked and approve / confirm it. Without this
+    # the drill-down said "No flagged messages in this conversation" every time.
+    pair = [user1_id, user2_id]
+    blocked = await db.violations.find({
+        "user_id": {"$in": pair},
+        "recipient_id": {"$in": pair},
+    }, {"_id": 0}).to_list(500)
+
+    for v in blocked:
+        sender_id = v.get("user_id")
+        if sender_id not in sender_cache:
+            sender_cache[sender_id] = await db.users.find_one(
+                {"id": sender_id}, {"_id": 0, "nickname": 1, "username": 1}
+            ) or {}
+        sender = sender_cache[sender_id]
+        messages.append({
+            "id": v.get("id"),
+            "violation_id": v.get("id"),
+            "sender_id": sender_id,
+            "sender_nickname": sender.get("nickname") or v.get("user_nickname"),
+            "sender_username": sender.get("username"),
+            "recipient_id": v.get("recipient_id"),
+            "message": v.get("original_message"),
+            "timestamp": v.get("timestamp"),
+            "created_at": v.get("timestamp"),
+            # What the oversight UI keys off to show it in the queue + action bar.
+            "filtered": True,
+            "blocked": True,
+            "delivered": False,
+            "violations": v.get("violations", []),
+            "false_positive_status": v.get("false_positive_status"),
+            "attachment_urls": [],
+        })
+
+    messages.sort(key=lambda m: str(m.get("timestamp") or m.get("created_at") or ""))
     return messages
 
 
@@ -6430,8 +6472,26 @@ async def moderate_chat_message(data: MessageModerationAction, current_user: dic
             {"sender_id": data.user2Id, "recipient_id": data.user1Id},
         ],
     }, {"_id": 0})
+
+    # A blocked message was never inserted into db.messages — it only exists as a
+    # violation. Rebuild it from there so admins can approve/confirm it too, instead
+    # of every action on the contact-info queue 404-ing.
+    blocked_violation = None
     if not message:
-        raise HTTPException(status_code=404, detail="Message not found")
+        blocked_violation = await db.violations.find_one({
+            "timestamp": data.timestamp,
+            "user_id": {"$in": [data.user1Id, data.user2Id]},
+            "recipient_id": {"$in": [data.user1Id, data.user2Id]},
+        }, {"_id": 0})
+        if not blocked_violation:
+            raise HTTPException(status_code=404, detail="Message not found")
+        message = {
+            "sender_id": blocked_violation.get("user_id"),
+            "sender_nickname": blocked_violation.get("user_nickname"),
+            "recipient_id": blocked_violation.get("recipient_id"),
+            "message": blocked_violation.get("original_message", ""),
+            "timestamp": blocked_violation.get("timestamp"),
+        }
 
     sender_id = message.get("sender_id")
     recipient_id = message.get("recipient_id")
@@ -6446,10 +6506,34 @@ async def moderate_chat_message(data: MessageModerationAction, current_user: dic
 
     if data.action == "approve":
         # False positive: deliver the message and restore the strike if any.
-        await db.messages.update_one(
-            {"timestamp": data.timestamp, "sender_id": sender_id, "recipient_id": recipient_id},
-            {"$set": {"filtered": False, "moderation_status": "approved", "reported": False}}
-        )
+        if blocked_violation:
+            # It was never delivered — insert it now so the recipient finally sees it.
+            await db.messages.insert_one({
+                "id": str(uuid.uuid4()),
+                "sender_id": sender_id,
+                "sender_nickname": message.get("sender_nickname"),
+                "recipient_id": recipient_id,
+                "message": message.get("message", ""),
+                "attachment_urls": [],
+                "timestamp": data.timestamp,
+                "created_at": data.timestamp,
+                "read": False,
+                "read_by": [sender_id],
+                "delivered_at": reviewed_at,
+                "status": "delivered",
+                "filtered": False,
+                "moderation_status": "approved",
+            })
+            await db.violations.update_one(
+                {"id": blocked_violation["id"]},
+                {"$set": {"status": "approved", "false_positive_status": "confirmed",
+                          "reviewed_at": reviewed_at, "reviewed_by": current_user["id"]}},
+            )
+        else:
+            await db.messages.update_one(
+                {"timestamp": data.timestamp, "sender_id": sender_id, "recipient_id": recipient_id},
+                {"$set": {"filtered": False, "moderation_status": "approved", "reported": False}}
+            )
         if violation:
             await _restore_strike_for_violation(violation, current_user["id"])
         if sender_id:
@@ -7477,16 +7561,63 @@ async def submit_revision_response(deal_id: str, data: DealRevisionResponseSubmi
             ntype="warning" if data.response != "accepted" else "info",
         )
 
-    # Pushing back on a revision must actually raise a dispute so the deal pauses
-    # and it lands in the admin queue — recording a row alone did nothing.
+    # Pushing back on a revision must raise a REAL dispute (db.disputes) — not just a
+    # deal action card. create_issue_action() only wrote an action card + held escrow,
+    # so the creator was told "a dispute was raised" while the admin Disputes queue
+    # stayed empty. Write the same dispute document the structured flow does.
+    dispute_id = None
     if data.response in ("scope_creep", "partial_dispute"):
         reason = (data.note or "").strip() or f"Creator {label} on the latest revision request."
-        await create_issue_action(
-            deal_id, current_user, "raise_dispute", "Dispute raised", reason,
-            DealIssueSubmit(message=reason),
-        )
+        existing = await get_open_dispute(campaign['id'])
+        if existing:
+            dispute_id = existing.get("id")   # don't stack duplicates on the same deal
+        else:
+            dtype = "scope_creep" if data.response == "scope_creep" else "revision_abuse"
+            severity = dispute_severity(dtype)
+            first_hrs, res_days = DISPUTE_SLA[severity]
+            now = datetime.now(timezone.utc)
+            dispute = {
+                "id": str(uuid.uuid4()),
+                "deal_id": make_deal_id(campaign),
+                "campaign_id": campaign['id'],
+                "business_id": campaign.get('business_id'),
+                "creator_id": campaign.get('selected_creator'),
+                "raised_by": current_user['id'],
+                "raised_by_role": current_user.get('role'),
+                "dispute_type": dtype,
+                "severity": severity,
+                "description": reason,
+                "desired_outcome": "other",
+                "evidence_urls": [],
+                "status": "open",
+                "first_response_due_at": (now + timedelta(hours=first_hrs)).isoformat(),
+                "resolution_due_at": (now + timedelta(days=res_days)).isoformat(),
+                "created_at": now_iso(),
+            }
+            await db.disputes.insert_one(dispute)
+            dispute_id = dispute["id"]
 
-    return {"message": "Revision response submitted", "response": data.response}
+            # Pause the deal: hold escrow + drop a dispute card in the room.
+            await db.escrow.update_one({"campaign_id": campaign['id']},
+                                       {"$set": {"status": "on_hold", "updated_at": now_iso()}}, upsert=True)
+            await db.deal_action_cards.insert_one({
+                "id": str(uuid.uuid4()), "deal_id": make_deal_id(campaign), "campaign_id": campaign['id'],
+                "type": "raise_dispute", "title": "Dispute raised", "status": "open", "created_at": now_iso(),
+                "created_by": current_user['id'], "message": reason, "dispute_id": dispute_id,
+            })
+            # PRD 9.9 — admin must be notified, and it must show in the Disputes queue.
+            await notify_admins(
+                f"New {severity} dispute",
+                f"{dtype.replace('_', ' ')} on deal {make_deal_id(campaign)} — first response due in {first_hrs}h.",
+                link="/dashboard/admin/disputes",
+            )
+            if campaign.get('business_id'):
+                await notify_user(
+                    campaign['business_id'], "A dispute was raised on your deal",
+                    "Deal activity is paused while our team reviews it.", link="/dashboard/business/all-campaigns",
+                )
+
+    return {"message": "Revision response submitted", "response": data.response, "dispute_id": dispute_id}
 
 @api_router.get("/deals/{deal_id}/chat")
 async def get_deal_chat(deal_id: str, current_user: dict = Depends(get_current_user)):
