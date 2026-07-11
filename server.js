@@ -132,8 +132,12 @@ app.get('/api/business/creator-directory', auth, async (req, res) => {
     // piece of work counts twice.
     const creatorIds = creators.map((u) => u._id);
     const [paidDeals, doneCampaigns] = await Promise.all([
-      Deal.find({ creator_id: { $in: creatorIds }, current_state: PAID })
-        .select('creator_id campaign_id deal_id').lean(),
+      // Same "is this deal paid out?" test the creator-earnings code uses, so the
+      // deliverables count and the earnings figure can never disagree.
+      Deal.find({
+        creator_id: { $in: creatorIds },
+        $or: [{ current_state: PAID }, { 'escrow.status': 'released' }],
+      }).select('creator_id campaign_id deal_id').lean(),
       Campaign.find({ selected_creator: { $in: creatorIds.map(String) }, status: 'completed' })
         .select('selected_creator').lean(),
     ]);
