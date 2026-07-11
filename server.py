@@ -1969,6 +1969,30 @@ def make_deal_id(campaign: dict) -> str:
         number = sum(ord(ch) for ch in campaign_id) % 9000 + 1000
     return f"DEAL-{number}"
 
+
+async def find_campaign_by_any_id(any_id: str) -> Optional[dict]:
+    """Look a campaign up by its real id, or by the DEAL-#### id the UI displays.
+
+    make_deal_id() DERIVES "DEAL-4466" from the campaign's uuid and stores it
+    nowhere — so a `{"deal_id": ...}` query can never match, and callers that pass
+    the id shown on screen (the Deal Room does) got a 404. Recompute the derived id
+    over the candidate campaigns instead of trusting a field that doesn't exist.
+    """
+    if not any_id:
+        return None
+    campaign = await db.campaigns.find_one({"$or": [{"id": any_id}, {"deal_id": any_id}]}, {"_id": 0})
+    if campaign:
+        return campaign
+    if not str(any_id).upper().startswith("DEAL-"):
+        return None
+    # The hash is lossy (mod 9000), so more than one campaign could collide. Only
+    # campaigns with a creator on them can be a real deal, which makes that vanishingly
+    # unlikely — but scan rather than guess.
+    async for c in db.campaigns.find({"selected_creator": {"$nin": [None, ""]}}, {"_id": 0}):
+        if make_deal_id(c).upper() == str(any_id).upper():
+            return c
+    return None
+
 def get_required_assets(campaign: dict) -> dict:
     checklist = campaign.get('content_requirements') or campaign.get('shipment_checklist') or {}
     return {
@@ -8602,10 +8626,8 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
 
     both_ready = False
     if data.campaign_id:
-        # Accept either the campaign id or the deal id (they can differ).
-        campaign = await db.campaigns.find_one(
-            {"$or": [{"id": data.campaign_id}, {"deal_id": data.campaign_id}]}, {"_id": 0}
-        )
+        # Accept the campaign id OR the DEAL-#### id shown in the Deal Room.
+        campaign = await find_campaign_by_any_id(data.campaign_id)
         if campaign:
             data.campaign_id = campaign["id"]  # normalise for the shipment lookups below
         if campaign and campaign.get("requires_shipment"):
@@ -8670,10 +8692,10 @@ async def get_shipping_address(campaign_id: Optional[str] = None, current_user: 
     if not campaign_id:
         return out
 
-    # Accept either the campaign id or the deal id (they can differ).
-    campaign = await db.campaigns.find_one(
-        {"$or": [{"id": campaign_id}, {"deal_id": campaign_id}]}, {"_id": 0}
-    )
+    # Accept the campaign id OR the DEAL-#### id shown in the Deal Room. The card
+    # renders nothing when this 404s, which turned the creator's "Confirm Delivery
+    # Address" button into a dead click.
+    campaign = await find_campaign_by_any_id(campaign_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Deal not found")
     if current_user["id"] not in [campaign.get("business_id"), campaign.get("selected_creator")]:
@@ -10065,18 +10087,35 @@ async def get_my_transactions(current_user: dict = Depends(get_current_user)):
 
 # Razorpay Webhook
 @api_router.post("/webhooks/razorpay")
-async def razorpay_webhook(request: dict):
-    """Handle Razorpay webhook notifications"""
+async def razorpay_webhook(request: Request):
+    """Handle Razorpay webhook notifications.
+
+    SECURITY: the RAW body is HMAC-SHA256 verified against the Razorpay webhook secret
+    before anything is credited. This endpoint is public and unauthenticated — without
+    the check, anyone could POST a fake `payment.captured` and top up a wallet for free.
+    Fails CLOSED: if no webhook_secret is configured we reject rather than trust the body.
+    """
     try:
-        # Get webhook secret from gateway config
         gateway = await db.payment_gateways.find_one({"gateway_name": "razorpay"})
         if not gateway:
             raise HTTPException(status_code=400, detail="Gateway not configured")
-        
-        # Verify webhook signature (simplified - production needs proper verification)
-        event = request.get("event")
-        payload = request.get("payload")
-        
+
+        webhook_secret = gateway.get("webhook_secret")
+        if not webhook_secret:
+            logger.error("[razorpay-webhook] no webhook_secret configured — rejecting call")
+            raise HTTPException(status_code=503, detail="Webhook secret not configured")
+
+        raw = await request.body()
+        signature = request.headers.get("X-Razorpay-Signature") or ""
+        expected = hmac.new(webhook_secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+        if not signature or not hmac.compare_digest(expected, signature):
+            logger.warning("[razorpay-webhook] invalid signature — rejected")
+            raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+        body = await request.json()
+        event = body.get("event")
+        payload = body.get("payload") or {}
+
         if event == "payment.captured":
             payment = payload.get("payment", {}).get("entity", {})
             order_id = payment.get("order_id")
@@ -10103,9 +10142,13 @@ async def razorpay_webhook(request: dict):
             )
         
         return {"status": "ok"}
-    
+
+    except HTTPException:
+        # Don't swallow our own 400/503 rejections into a 500.
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"[razorpay-webhook] {e}")
+        raise HTTPException(status_code=500, detail="Webhook processing failed")
 
 # Cashfree Webhook
 @api_router.post("/webhooks/cashfree")
@@ -11721,10 +11764,20 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
             "requested_at": requested, "created_at": requested,
             "status": ship_status, "courier": sh.get("courier_name"), "tracking_number": sh.get("tracking_number"),
             "has_label": bool(sh.get("label_url")), "label_url": sh.get("label_url"),
-            # Prefer what the brand submitted in the request; fall back to saved profiles.
-            "pickup_address": _fmt_addr(sh.get("pickup_address")) or (brand.get("profile") or {}).get("address"),
-            "ship_address": _fmt_addr(sh.get("delivery_address")) or (creator.get("profile") or {}).get("address"),
-            "shipping_address": _fmt_addr(sh.get("delivery_address")) or (creator.get("profile") or {}).get("address"),
+            # Prefer what was submitted for THIS shipment; fall back to the saved
+            # profile (the creator confirms their address there, and the shipment doc
+            # may not exist yet). Both branches go through _fmt_addr — the fallback
+            # used to return the raw dict, which the admin table rendered as
+            # "[object Object]".
+            "pickup_address": _fmt_addr(sh.get("pickup_address")) or _fmt_addr((brand.get("profile") or {}).get("address")),
+            "ship_address": _fmt_addr(sh.get("delivery_address")) or _fmt_addr((creator.get("profile") or {}).get("address")),
+            "shipping_address": _fmt_addr(sh.get("delivery_address")) or _fmt_addr((creator.get("profile") or {}).get("address")),
+            "ship_city": ((sh.get("delivery_address") or (creator.get("profile") or {}).get("address")) or {}).get("city")
+                         if isinstance(sh.get("delivery_address") or (creator.get("profile") or {}).get("address"), dict) else None,
+            # So ops can see at a glance who still owes an address.
+            "awaiting_creator_address": not bool(
+                sh.get("delivery_address") or (creator.get("profile") or {}).get("address")
+            ),
         })
     rows.sort(key=lambda r: r.get("requested_at") or "")
     return rows
