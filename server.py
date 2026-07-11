@@ -2045,7 +2045,12 @@ def normalize_shipment(campaign: dict, shipment: Optional[dict]) -> dict:
         "expected_delivery_at": shipment.get('expected_delivery_at') or shipment.get('expected_delivery'),
         # Surfaced so the brand/creator progress trackers can date the "Product Shipped" step.
         "shipped_at": shipment.get('shipped_at') or shipment.get('updated_at'),
-        "delivered_at": shipment.get('delivered_at')
+        "delivered_at": shipment.get('delivered_at'),
+        # Booleans ONLY — never the addresses themselves, so masked shipping still holds.
+        # The deal room needs these to know the creator has already confirmed; without them
+        # its primary action kept reading "Confirm Delivery Address" forever after submitting.
+        "creator_address_confirmed": bool(shipment.get('delivery_address')),
+        "brand_address_confirmed": bool(shipment.get('pickup_address')),
     }
 
 def normalize_receipt(shipment: Optional[dict], receipt: Optional[dict]) -> dict:
@@ -8695,12 +8700,28 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
             # the shipment — in which case the shipment was stored with an empty
             # delivery_address and awaiting_creator_address=True. Backfill it now so
             # ops can actually generate the label.
-            if sh and creator_addr and current_user["id"] == campaign.get("selected_creator"):
+            # The creator can confirm BEFORE the brand ships (no shipment doc exists yet) or
+            # AFTER (doc exists with awaiting_creator_address=True). Upsert in both cases —
+            # the old `if sh` guard meant an early confirmation was written nowhere
+            # deal-specific, so the deal room could never tell it had happened and its button
+            # still read "Confirm Delivery Address".
+            if creator_addr and current_user["id"] == campaign.get("selected_creator"):
                 await db.shipments.update_one(
                     {"campaign_id": data.campaign_id},
                     {"$set": {"delivery_address": creator_addr,
                               "awaiting_creator_address": False,
-                              "updated_at": now_iso()}},
+                              "updated_at": now_iso()},
+                     "$setOnInsert": {
+                         "id": str(uuid.uuid4()),
+                         "campaign_id": data.campaign_id,
+                         "business_id": campaign.get("business_id"),
+                         "creator_id": campaign.get("selected_creator"),
+                         # Not a courier state — compute_deal_state ignores it, so the deal
+                         # stays in "Accepted — Awaiting Shipment" until the brand ships.
+                         "status": "awaiting_pickup_address",
+                         "created_at": now_iso(),
+                     }},
+                    upsert=True,
                 )
 
             if both_ready and not in_flight:
@@ -8950,32 +8971,23 @@ async def get_payout_receipts(current_user: dict = Depends(get_current_user)):
         {"creator_id": current_user['id']}, {"_id": 0}
     ).sort("created_at", -1).to_list(1000)
 
-    # Resolve each distinct campaign once, not once per row.
-    missing = {r.get("campaign_id") for r in receipts
-               if r.get("campaign_id") and not r.get("brand_name")}
-    resolved: dict = {}
-    for cid in missing:
-        campaign = await db.campaigns.find_one({"id": cid}, {"_id": 0, "title": 1, "business_id": 1})
-        if not campaign:
-            continue
-        brand = await db.users.find_one({"id": campaign.get("business_id")},
-                                        {"_id": 0, "nickname": 1, "username": 1})
-        resolved[cid] = {
-            "campaign_title": campaign.get("title"),
-            "brand_id": campaign.get("business_id"),
-            "brand_name": brand_display_name(brand),
-        }
-
     for r in receipts:
-        info = resolved.get(r.get("campaign_id"))
-        if info:
-            r.setdefault("campaign_title", info["campaign_title"])
-            r.setdefault("brand_id", info["brand_id"])
-            r.setdefault("brand_name", info["brand_name"])
-            # setdefault won't overwrite an existing None
-            r["campaign_title"] = r.get("campaign_title") or info["campaign_title"]
-            r["brand_id"] = r.get("brand_id") or info["brand_id"]
-            r["brand_name"] = r.get("brand_name") or info["brand_name"]
+        if r.get("brand_name") or not r.get("campaign_id"):
+            continue
+        campaign = await db.campaigns.find_one(
+            {"id": r["campaign_id"]}, {"_id": 0, "title": 1, "business_id": 1})
+        brand_id = (campaign or {}).get("business_id")
+        # The campaign may have been deleted since. The escrow row that funded this
+        # payout still names the brand, so fall back to it rather than showing the
+        # creator a payment from nobody.
+        if not brand_id and r.get("reference_id"):
+            escrow = await db.escrow.find_one({"id": r["reference_id"]}, {"_id": 0, "business_id": 1})
+            brand_id = (escrow or {}).get("business_id")
+        brand = await db.users.find_one({"id": brand_id}, {"_id": 0, "nickname": 1, "username": 1}) if brand_id else None
+
+        r["campaign_title"] = r.get("campaign_title") or (campaign or {}).get("title")
+        r["brand_id"] = r.get("brand_id") or brand_id
+        r["brand_name"] = r.get("brand_name") or brand_display_name(brand)
     return receipts
 
 @api_router.get("/payouts/receipts/{receipt_id}")
