@@ -472,6 +472,12 @@ class BusinessWalletRechargeCreate(BaseModel):
     amount: float
     gateway: str = "razorpay"
 
+class CheckoutBriefCreate(BaseModel):
+    """Direct booking of a creator from their plan (PlanBrief modal)."""
+    creator_id: str
+    video_count: int = 1
+    brief: Dict[str, Any] = {}
+
 class DealReceiptSubmit(BaseModel):
     received_at: Optional[str] = None
     unboxing_video_url: str
@@ -3163,6 +3169,183 @@ async def recharge_business_wallet(
     if gateway["gateway_name"] == "razorpay":
         response["key_id"] = gateway["key_id"]
     return response
+
+
+# ---------------------------------------------------------------------------
+# Brand checkout — booking a creator straight from their plan (PlanBrief modal).
+#
+# The brand's wallet is a prepaid balance. Booking SPENDS it: the money leaves the
+# wallet and is held in the deal's escrow until the brand approves the content.
+# Nothing here trusts a price sent by the browser — every figure is recomputed from
+# the creator's rate card and the admin's commission setting.
+# ---------------------------------------------------------------------------
+def creator_plan_price(creator: dict) -> float:
+    """The creator's per-video rate, as set on their profile → rate_card."""
+    rate_card = (creator.get("profile") or {}).get("rate_card") or {}
+    raw = str(rate_card.get("expected_payout") or rate_card.get("last_salary") or "")
+    digits = re.sub(r"[^0-9]", "", raw)
+    return float(digits) if digits else 0.0
+
+
+def quote_brief(creator: dict, video_count) -> dict:
+    """Price a brief. Raises 400 if the creator never published a rate."""
+    try:
+        count = max(1, int(video_count or 1))
+    except (TypeError, ValueError):
+        count = 1
+    price = creator_plan_price(creator)
+    if price <= 0:
+        raise HTTPException(status_code=400, detail="This creator hasn't set a price yet. Message them to agree on one.")
+    subtotal = round(price * count, 2)
+    fee = brand_commission(subtotal)
+    return {
+        "video_count": count,
+        "unit_price": price,
+        "subtotal": subtotal,
+        "fee": fee,
+        "fee_percent": commission_percent(),
+        "total": round(subtotal + fee, 2),
+    }
+
+
+@api_router.get("/checkout/quote")
+async def checkout_quote(creator_id: str, video_count: int = 1,
+                         current_user: dict = Depends(get_approved_business_user)):
+    creator = await db.users.find_one({"id": creator_id}, {"_id": 0})
+    if not creator or creator.get("role") != UserRole.CREATOR:
+        raise HTTPException(status_code=404, detail="Creator not found")
+    q = quote_brief(creator, video_count)
+    balance = to_float(current_user.get("balance"))
+    return {
+        **q,
+        "wallet_balance": balance,
+        "sufficient": balance >= q["total"],
+        "shortfall": max(0.0, round(q["total"] - balance, 2)),
+    }
+
+
+@api_router.post("/checkout/brief", status_code=201)
+async def checkout_brief(data: CheckoutBriefCreate,
+                         current_user: dict = Depends(get_approved_business_user)):
+    creator = await db.users.find_one({"id": data.creator_id}, {"_id": 0})
+    if not creator or creator.get("role") != UserRole.CREATOR:
+        raise HTTPException(status_code=404, detail="Creator not found")
+    if creator.get("approval_status") != ApprovalStatus.APPROVED:
+        raise HTTPException(status_code=400, detail="This creator is not accepting briefs yet.")
+
+    q = quote_brief(creator, data.video_count)
+    total = q["total"]
+
+    # Debit and balance-check in ONE atomic update. A find-then-update would let two
+    # concurrent bookings both pass the check and overdraw the wallet.
+    debit = await db.users.update_one(
+        {"id": current_user["id"], "balance": {"$gte": total}},
+        {"$inc": {"balance": -total}},
+    )
+    if debit.modified_count != 1:
+        # The only reason the update matched nothing: not enough balance.
+        # Flat body (not HTTPException) so the checkout screen can read `shortfall`
+        # and `available` directly — FastAPI would nest them under `detail`.
+        from fastapi.responses import JSONResponse
+        fresh = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "balance": 1})
+        balance = to_float((fresh or {}).get("balance"))
+        return JSONResponse(status_code=402, content={
+            "detail": f"Not enough credits. This brief costs ₹{total:,.0f} but your wallet has ₹{balance:,.0f}.",
+            "code": "INSUFFICIENT_FUNDS",
+            "required": total,
+            "available": balance,
+            "shortfall": round(total - balance, 2),
+        })
+
+    # The money is out of the wallet. Any failure from here on MUST put it back.
+    now = datetime.now(timezone.utc).isoformat()
+    campaign_id = str(uuid.uuid4())
+    escrow_id = str(uuid.uuid4())
+    brief = data.brief or {}
+    profile = current_user.get("profile") or {}
+
+    campaign_doc = {
+        **brief,
+        "id": campaign_id,
+        "business_id": current_user["id"],
+        "business_nickname": current_user.get("nickname", ""),
+        "brand_name": profile.get("business_name") or current_user.get("nickname", ""),
+        "brand_logo_url": profile.get("logo") or "",
+        "brand_cover_image_url": profile.get("banner") or "",
+        "business_verified": True,
+        "selected_creator": data.creator_id,
+        # Paid up front, so it starts immediately — no admin approval gate, no bidding.
+        "status": CampaignStatus.IN_PROGRESS.value,
+        "escrow_id": escrow_id,
+        # The creator's take. The platform fee is charged on top and is NOT escrowed.
+        "budget_min": q["subtotal"],
+        "budget_max": q["subtotal"],
+        "amount_paid": total,
+        "platform_fee": q["fee"],
+        "fee_percent": q["fee_percent"],
+        "video_count": q["video_count"],
+        "bids": [],
+        "direct_booking": True,
+        "paid_at": now,
+        "work_started_at": now,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    try:
+        await db.campaigns.insert_one(dict(campaign_doc))
+        await db.escrow.insert_one({
+            "id": escrow_id,
+            "campaign_id": campaign_id,
+            "business_id": current_user["id"],
+            "creator_id": data.creator_id,
+            "amount": q["subtotal"],
+            "brand_commission_amount": q["fee"],
+            "brand_commission_percent": q["fee_percent"],
+            "brand_charged": total,
+            "funded": True,
+            "status": "held",
+            "created_at": now,
+        })
+    except Exception:
+        # Refund and undo — a campaign with no escrow is worse than no campaign, and
+        # the brand is owed their money back.
+        await db.users.update_one({"id": current_user["id"]}, {"$inc": {"balance": total}})
+        await db.campaigns.delete_one({"id": campaign_id})
+        await db.escrow.delete_one({"id": escrow_id})
+        raise HTTPException(status_code=500, detail="Checkout failed. You have not been charged.")
+
+    title = campaign_doc.get("title") or "your brief"
+    creator_name = creator.get("nickname") or "the creator"
+
+    await notify_user(
+        data.creator_id,
+        "🎉 You've been booked for a campaign!",
+        f"A brand booked you for '{title}'. ₹{q['subtotal']:,.0f} is held in escrow and is released once they approve your work.",
+        link="/creator-dashboard",
+        ntype="success",
+    )
+    await notify_user(
+        current_user["id"],
+        "Payment held in escrow",
+        f"₹{total:,.0f} was paid from your credits for '{title}'. It's released to {creator_name} once you approve their work.",
+        link="/dashboard/business/wallet",
+        ntype="success",
+    )
+
+    updated = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "balance": 1})
+    campaign_doc.pop("_id", None)
+    return {
+        "success": True,
+        "campaign_id": campaign_id,
+        "deal_id": make_deal_id(campaign_doc),
+        "amount_charged": total,
+        "subtotal": q["subtotal"],
+        "fee": q["fee"],
+        "fee_percent": q["fee_percent"],
+        "wallet_balance": to_float((updated or {}).get("balance")),
+    }
+
 
 @api_router.get("/business/dashboard")
 async def get_business_dashboard(current_user: dict = Depends(get_current_user)):
