@@ -7976,11 +7976,57 @@ async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict 
     if creator_amt > 0 and dispute.get("creator_id"):
         await db.users.update_one({"id": dispute["creator_id"]}, {"$inc": {"balance": creator_amt}})
         await create_payout_receipt(creator_id=dispute["creator_id"], receipt_type="earning", gross_amount=creator_amt, campaign_id=dispute["campaign_id"], reference_id=dispute_id, note=f"Dispute ruling ({data.ruling})", commission_amount=0)
+    # Escrow outcome must reflect where the money actually went. Marking a pure refund
+    # as "released" made the brand's wallet history show the amount as still locked
+    # (get_business_wallet only renders a "Budget Refund" credit for status=refunded),
+    # so a refunded brand saw their balance move with no matching transaction row.
+    money_back_to_brand = refund > 0 and creator_amt == 0
     if escrow:
-        await db.escrow.update_one({"id": escrow["id"]}, {"$set": {"status": "released", "payout_status": "released", "released_at": now_iso(), "dispute_resolution": data.ruling}})
-    if data.extension_days and campaign:
-        new_deadline = (datetime.now(timezone.utc) + timedelta(days=data.extension_days)).isoformat()
-        await db.campaigns.update_one({"id": campaign["id"]}, {"$set": {"final_delivery_by": new_deadline, "due_date": new_deadline}})
+        escrow_update = {
+            "dispute_resolution": data.ruling,
+            "refund_amount": refund,
+            "creator_amount": creator_amt,
+        }
+        if money_back_to_brand:
+            escrow_update.update({
+                "status": "refunded", "payout_status": "refunded",
+                "refunded_at": now_iso(), "refund_reason": f"Dispute ruling ({data.ruling})",
+            })
+        else:
+            escrow_update.update({
+                "status": "released", "payout_status": "released", "released_at": now_iso(),
+            })
+        await db.escrow.update_one({"id": escrow["id"]}, {"$set": escrow_update})
+
+    # The deal itself has to move, or both sides keep seeing an in-progress deal with
+    # no sign anything was decided. This was the "nothing happened" bug: only the
+    # dispute doc changed, so the Deal Room looked untouched on both sides.
+    if campaign:
+        campaign_update = {
+            "dispute_status": "resolved",
+            "dispute_ruling": data.ruling,
+            "dispute_resolved_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        if data.extension_days:
+            # Admin gave more time — the deal continues rather than ending.
+            new_deadline = (datetime.now(timezone.utc) + timedelta(days=data.extension_days)).isoformat()
+            campaign_update.update({"final_delivery_by": new_deadline, "due_date": new_deadline})
+        elif money_back_to_brand:
+            # Brand refunded in full, creator paid nothing → the deal is over.
+            campaign_update.update({"status": "cancelled", "cancelled_at": now_iso()})
+        elif creator_amt > 0:
+            # Creator was paid → the deal is finished.
+            campaign_update.update({"status": CampaignStatus.COMPLETED.value, "completed_at": now_iso()})
+        await db.campaigns.update_one({"id": campaign["id"]}, {"$set": campaign_update})
+
+        # Put the outcome in the Deal Room so both parties actually see it.
+        await insert_deal_system_message(
+            campaign,
+            f"⚖️ Dispute resolved — ruling: {data.ruling.replace('_', ' ')}.\n"
+            f"Refunded to brand: ₹{refund:,.0f} · Released to creator: ₹{creator_amt:,.0f}"
+            + (f"\nReason: {data.reasoning}" if data.reasoning else ""),
+        )
 
     await db.disputes.update_one({"id": dispute_id}, {"$set": {
         "status": "resolved", "ruling": data.ruling, "reasoning": data.reasoning,
@@ -7992,9 +8038,26 @@ async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict 
     await db.deal_action_cards.update_many({"campaign_id": dispute["campaign_id"], "type": "raise_dispute", "status": "open"}, {"$set": {"status": "resolved"}})
     # PRD 9.5: record outcome on both users' history.
     for uid, role in [(dispute.get("business_id"), "brand"), (dispute.get("creator_id"), "creator")]:
-        if uid:
-            await db.users.update_one({"id": uid}, {"$push": {"dispute_history": {"dispute_id": dispute_id, "ruling": data.ruling, "role": role, "at": now_iso()}}})
-            await notify_user(uid, "Your dispute has been resolved", f"Ruling: {data.ruling.replace('_',' ')}. {data.reasoning[:120]} You may appeal within 7 days.", link="/my-deals")
+        if not uid:
+            continue
+        await db.users.update_one({"id": uid}, {"$push": {"dispute_history": {"dispute_id": dispute_id, "ruling": data.ruling, "role": role, "at": now_iso()}}})
+        # Tell each side what happened to THEIR money, and link them somewhere that
+        # exists for their role (/my-deals is a creator-only route — brands landed
+        # on a 404, which is part of why this felt like "nothing happened").
+        if role == "brand":
+            money_line = f"₹{refund:,.0f} has been refunded to your wallet." if refund > 0 else "No refund was issued."
+            link = "/dashboard/business/wallet"
+        else:
+            money_line = f"₹{creator_amt:,.0f} has been released to you." if creator_amt > 0 else "No payment was released."
+            link = "/my-deals"
+        await notify_user(
+            uid,
+            "Your dispute has been resolved",
+            f"Ruling: {data.ruling.replace('_', ' ')}. {money_line} "
+            f"{(data.reasoning or '')[:120]} You may appeal within 7 days.",
+            link=link,
+            ntype="success" if (refund > 0 or creator_amt > 0) else "info",
+        )
     if reserve_gap > 0:
         await notify_admins("Dispute ruling exceeded escrow", f"Dispute {dispute_id} needed ₹{reserve_gap} from reserve. Finance audit required.")
     await log_admin_action(current_user, "dispute.ruling", target_type="dispute", target_id=dispute_id,
