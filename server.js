@@ -39,7 +39,14 @@ mongoose
     useNewUrlParser: true,
     useUnifiedTopology: true
   })
-  .then(() => console.log('MongoDB connected'))
+  .then(async () => {
+    console.log('MongoDB connected');
+    // Seed the default contact-filter rules (first boot only) and warm the cache,
+    // so the very first message is checked against the real rules.
+    const { initRules } = require('./utils/contactFilter');
+    const rules = await initRules();
+    console.log(`Contact filter: ${rules.length} active rule(s) loaded`);
+  })
   .catch(err => console.error('MongoDB connection error:', err));
 
 // Routes
@@ -2402,8 +2409,81 @@ app.get('/api/admin/financials/overview', adminAuth, requireCap('view_financials
   gross_revenue: 196000, platform_commission: 39200, creator_payouts: 156800,
   in_escrow: 47000, pending_withdrawals: 15500, tds_collected: 7840, gst_collected: 35280
 }));
-app.get('/api/admin/filter-rules', adminAuth, requireCap('content_moderation'), (req, res) => res.json(DEMO.filterRules));
-app.post('/api/admin/filter-rules/propose', adminAuth, requireCap('content_moderation'), (req, res) => res.json({ success: true }));
+// ── Contact-info filter rules (Admin → Chat oversight → Filter rules) ────────
+// These were fake: GET served a hardcoded DEMO array and propose was a no-op that
+// threw the request body away. Nothing was stored, and the filter never read them
+// — so an admin could add "call me" and "call me" would still send fine. They're
+// real rows now, and utils/contactFilter.js runs them against every message.
+const FilterRule = require('./models/FilterRule');
+const contactFilter = require('./utils/contactFilter');
+
+app.get('/api/admin/filter-rules', adminAuth, requireCap('content_moderation'), async (req, res) => {
+  try {
+    const rules = await FilterRule.find().sort({ createdAt: 1 }).lean();
+    res.json(rules.map((r) => ({ ...r, id: r.rule_id })));
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+app.post('/api/admin/filter-rules/propose', adminAuth, requireCap('content_moderation'), async (req, res) => {
+  try {
+    const { type, label, pattern } = req.body || {};
+    if (!String(label || '').trim() || !String(pattern || '').trim()) {
+      return res.status(400).json({ detail: 'A rule needs a label and a pattern.' });
+    }
+    const kind = type === 'regex' ? 'regex' : 'keyword';
+    // Reject a regex that won't compile here, rather than letting it throw inside
+    // the filter on every message afterwards.
+    if (kind === 'regex') {
+      try { new RegExp(pattern, 'i'); }
+      catch (e) { return res.status(400).json({ detail: `That regex is invalid: ${e.message}` }); }
+    }
+    // Whoever adds a rule here is already an admin holding content_moderation, so
+    // the old second approval step just stranded every new rule in "Awaiting
+    // review" with no UI to approve it. Rules now go live on save — which is what
+    // the panel promises — and a careless one is switched off with the toggle below.
+    const rule = await FilterRule.create({
+      rule_id: `fr_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e4)}`,
+      type: kind,
+      label: String(label).trim(),
+      pattern: String(pattern).trim(),
+      enabled: true,
+      status: 'active',
+      created_by: req.user.id,
+    });
+    // Bite on the very next message rather than waiting out the cache TTL.
+    await contactFilter.refreshRules();
+    await writeAdminLog(req, { action: 'filter_rule.create', module: 'moderation', target_type: 'filter_rule', target_id: rule.rule_id, after: rule.toObject() });
+    res.status(201).json({ success: true, ...rule.toObject(), id: rule.rule_id });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+// Turn a rule on or off. This is what makes a pending rule go live — and it bites
+// on the very next message, because the filter's cache is refreshed right here
+// rather than waiting for its TTL.
+app.post('/api/admin/filter-rules/:ruleId/toggle', adminAuth, requireCap('content_moderation'), async (req, res) => {
+  try {
+    const enabled = Boolean(req.body && req.body.enabled);
+    const rule = await FilterRule.findOneAndUpdate(
+      { rule_id: req.params.ruleId },
+      { $set: { enabled, status: enabled ? 'active' : 'disabled' } },
+      { new: true }
+    );
+    if (!rule) return res.status(404).json({ detail: 'Rule not found' });
+    await contactFilter.refreshRules();
+    await writeAdminLog(req, { action: enabled ? 'filter_rule.enable' : 'filter_rule.disable', module: 'moderation', target_type: 'filter_rule', target_id: rule.rule_id });
+    res.json({ success: true, ...rule.toObject(), id: rule.rule_id });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+app.delete('/api/admin/filter-rules/:ruleId', adminAuth, requireCap('content_moderation'), async (req, res) => {
+  try {
+    const rule = await FilterRule.findOneAndDelete({ rule_id: req.params.ruleId });
+    if (!rule) return res.status(404).json({ detail: 'Rule not found' });
+    await contactFilter.refreshRules();
+    await writeAdminLog(req, { action: 'filter_rule.delete', module: 'moderation', target_type: 'filter_rule', target_id: req.params.ruleId, before: rule.toObject() });
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
 app.post('/api/admin/message/moderate', adminAuth, requireCap('content_moderation'), (req, res) => res.json({ success: true }));
 
 // 404 handler

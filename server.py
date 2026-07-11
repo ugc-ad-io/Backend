@@ -478,6 +478,22 @@ class CheckoutBriefCreate(BaseModel):
     video_count: int = 1
     brief: Dict[str, Any] = {}
 
+class BookingRespond(BaseModel):
+    """Creator's answer to a booking request: accept / decline / revise the price."""
+    action: str                              # accept | decline | revise
+    amount: Optional[float] = None           # creator's proposed take (revise only)
+    message: Optional[str] = None
+
+class BookingPriceDecision(BaseModel):
+    """Brand's answer to the creator's counter-offer."""
+    action: str                              # accept | reject
+
+class BookingBriefSend(BaseModel):
+    """The brief the brand sends once the creator has accepted."""
+    brief_text: Optional[str] = None
+    deliverables: Optional[str] = None
+    attachment_urls: List[str] = []
+
 class DealReceiptSubmit(BaseModel):
     received_at: Optional[str] = None
     unboxing_video_url: str
@@ -2323,6 +2339,10 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
             })
 
     campaign_details = {key: value for key, value in campaign.items() if key != 'bids'}
+    # The brief typed at checkout is a DRAFT until the brand sends it (which they can
+    # only do once the creator accepts). The creator must not see it before then.
+    if viewer.get('id') == creator.get('id'):
+        campaign_details.pop('brief_draft', None)
     # Enable "Mark Received" whenever a real shipment exists and is shipped — not
     # only when the requires_shipment flag is set (some briefs carry shipment data
     # without the flag, which previously left the button permanently disabled).
@@ -3261,11 +3281,20 @@ async def checkout_brief(data: CheckoutBriefCreate,
     now = datetime.now(timezone.utc).isoformat()
     campaign_id = str(uuid.uuid4())
     escrow_id = str(uuid.uuid4())
-    brief = data.brief or {}
+    brief = dict(data.brief or {})
     profile = current_user.get("profile") or {}
 
+    # The brief the brand typed at checkout is held as a DRAFT. The creator must accept
+    # the booking first; only then can the brand send it (POST /bookings/{id}/brief).
+    # It is stripped from the creator's view of the deal until it's actually sent.
+    brief_draft = {
+        "brief_text": brief.pop("brief_text", "") or "",
+        "deliverables": brief.pop("deliverables", "") or "",
+        "attachment_urls": [],
+    }
+
     campaign_doc = {
-        **brief,
+        **brief,                       # title, delivery_date, delivery_slot, requires_shipment…
         "id": campaign_id,
         "business_id": current_user["id"],
         "business_nickname": current_user.get("nickname", ""),
@@ -3274,8 +3303,12 @@ async def checkout_brief(data: CheckoutBriefCreate,
         "brand_cover_image_url": profile.get("banner") or "",
         "business_verified": True,
         "selected_creator": data.creator_id,
-        # Paid up front, so it starts immediately — no admin approval gate, no bidding.
+        # Paid up front — no admin approval gate, no bidding. But the work does NOT
+        # start until the creator accepts the booking (booking_status below).
         "status": CampaignStatus.IN_PROGRESS.value,
+        "booking_status": "pending_creator",
+        "brief_sent": False,
+        "brief_draft": brief_draft,
         "escrow_id": escrow_id,
         # The creator's take. The platform fee is charged on top and is NOT escrowed.
         "budget_min": q["subtotal"],
@@ -3287,7 +3320,6 @@ async def checkout_brief(data: CheckoutBriefCreate,
         "bids": [],
         "direct_booking": True,
         "paid_at": now,
-        "work_started_at": now,
         "created_at": now,
         "updated_at": now,
     }
@@ -3317,18 +3349,26 @@ async def checkout_brief(data: CheckoutBriefCreate,
 
     title = campaign_doc.get("title") or "your brief"
     creator_name = creator.get("nickname") or "the creator"
+    brand_name = campaign_doc.get("brand_name") or "A brand"
 
+    await insert_deal_system_message(
+        campaign_doc,
+        f"📩 Booking request from {brand_name} — {q['video_count']} video(s) for ₹{q['subtotal']:,.0f}. "
+        f"Payment is held in escrow. Accept, decline, or propose a different price.",
+    )
     await notify_user(
         data.creator_id,
-        "🎉 You've been booked for a campaign!",
-        f"A brand booked you for '{title}'. ₹{q['subtotal']:,.0f} is held in escrow and is released once they approve your work.",
-        link="/creator-dashboard",
-        ntype="success",
+        "📩 New booking request",
+        f"{brand_name} booked you for '{title}' — ₹{q['subtotal']:,.0f} is already held in escrow. "
+        f"Accept it, decline it, or propose a different price.",
+        link="/deals",
+        ntype="info",
     )
     await notify_user(
         current_user["id"],
         "Payment held in escrow",
-        f"₹{total:,.0f} was paid from your credits for '{title}'. It's released to {creator_name} once you approve their work.",
+        f"₹{total:,.0f} was paid from your credits for '{title}'. "
+        f"It's held until {creator_name} accepts — you'll be refunded in full if they decline.",
         link="/dashboard/business/wallet",
         ntype="success",
     )
@@ -3339,12 +3379,243 @@ async def checkout_brief(data: CheckoutBriefCreate,
         "success": True,
         "campaign_id": campaign_id,
         "deal_id": make_deal_id(campaign_doc),
+        "booking_status": "pending_creator",
         "amount_charged": total,
         "subtotal": q["subtotal"],
         "fee": q["fee"],
         "fee_percent": q["fee_percent"],
         "wallet_balance": to_float((updated or {}).get("balance")),
     }
+
+
+# ---------------------------------------------------------------------------
+# Booking request lifecycle
+#
+#   brand pays  →  pending_creator
+#                    ├─ creator accepts  → accepted   → brand sends brief → work starts
+#                    ├─ creator declines → declined   → escrow refunded in full
+#                    └─ creator revises  → price_revision
+#                                            ├─ brand accepts → difference settled → accepted
+#                                            └─ brand rejects → declined → refunded
+# ---------------------------------------------------------------------------
+async def refund_booking(campaign: dict, reason: str) -> float:
+    """Return the whole escrowed amount to the brand's wallet and close the booking."""
+    escrow = await db.escrow.find_one({"campaign_id": campaign["id"]}, {"_id": 0})
+    if not escrow or escrow.get("status") == "refunded":
+        return 0.0
+    amount = to_float(escrow.get("brand_charged") or escrow.get("amount"))
+    await db.users.update_one({"id": campaign["business_id"]}, {"$inc": {"balance": amount}})
+    await db.escrow.update_one(
+        {"id": escrow["id"]},
+        {"$set": {"status": "refunded", "refunded_at": now_iso(), "refund_reason": reason}},
+    )
+    return amount
+
+
+async def get_booking(campaign_id: str, current_user: dict, *, role: str) -> dict:
+    """Load a booking and check the caller is the right party."""
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if role == "creator" and campaign.get("selected_creator") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="This booking isn't yours")
+    if role == "brand" and campaign.get("business_id") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="This booking isn't yours")
+    return campaign
+
+
+@api_router.post("/bookings/{campaign_id}/respond")
+async def respond_to_booking(campaign_id: str, data: BookingRespond,
+                             current_user: dict = Depends(get_current_user)):
+    """Creator accepts, declines, or counter-offers on a booking request."""
+    if current_user.get("role") != UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Only the booked creator can respond")
+    campaign = await get_booking(campaign_id, current_user, role="creator")
+
+    if campaign.get("booking_status") != "pending_creator":
+        raise HTTPException(status_code=400, detail="This booking has already been answered")
+
+    creator_name = current_user.get("nickname") or "The creator"
+    title = campaign.get("title") or "your booking"
+    brand_id = campaign["business_id"]
+    now = now_iso()
+
+    if data.action == "accept":
+        await db.campaigns.update_one({"id": campaign_id}, {"$set": {
+            "booking_status": "accepted",
+            "accepted_at": now,
+            "updated_at": now,
+        }})
+        await insert_deal_system_message(campaign, f"✅ {creator_name} accepted the booking. The brand can now send the brief.")
+        await notify_user(brand_id, "Booking accepted — send your brief",
+                          f"{creator_name} accepted '{title}'. Send them the brief to start the work.",
+                          link="/dashboard/business/deals", ntype="success")
+        return {"booking_status": "accepted"}
+
+    if data.action == "decline":
+        refunded = await refund_booking(campaign, f"Creator declined: {data.message or 'no reason given'}")
+        await db.campaigns.update_one({"id": campaign_id}, {"$set": {
+            "booking_status": "declined",
+            "status": "cancelled",
+            "declined_at": now,
+            "decline_reason": data.message or "",
+            "updated_at": now,
+        }})
+        await insert_deal_system_message(campaign, f"❌ {creator_name} declined the booking. The brand has been refunded in full.")
+        await notify_user(brand_id, "Booking declined — you've been refunded",
+                          f"{creator_name} declined '{title}'. ₹{refunded:,.0f} is back in your wallet."
+                          + (f" Reason: {data.message}" if data.message else ""),
+                          link="/dashboard/business/wallet", ntype="warning")
+        return {"booking_status": "declined", "refunded": refunded}
+
+    if data.action == "revise":
+        proposed = to_float(data.amount)
+        if proposed <= 0:
+            raise HTTPException(status_code=400, detail="Enter the price you want for this booking")
+        await db.campaigns.update_one({"id": campaign_id}, {"$set": {
+            "booking_status": "price_revision",
+            "proposed_amount": proposed,          # the creator's take, fee is added on top
+            "proposed_message": data.message or "",
+            "proposed_at": now,
+            "updated_at": now,
+        }})
+        fee = brand_commission(proposed)
+        await insert_deal_system_message(
+            campaign,
+            f"💬 {creator_name} proposed a new price: ₹{proposed:,.0f} (₹{proposed + fee:,.0f} incl. platform fee)."
+            + (f" — \"{data.message}\"" if data.message else ""),
+        )
+        await notify_user(brand_id, "Creator proposed a new price",
+                          f"{creator_name} wants ₹{proposed:,.0f} for '{title}'. Accept it or cancel the booking.",
+                          link="/dashboard/business/deals", ntype="info")
+        return {"booking_status": "price_revision", "proposed_amount": proposed, "new_total": round(proposed + fee, 2)}
+
+    raise HTTPException(status_code=400, detail="action must be accept, decline or revise")
+
+
+@api_router.post("/bookings/{campaign_id}/price")
+async def decide_booking_price(campaign_id: str, data: BookingPriceDecision,
+                               current_user: dict = Depends(get_approved_business_user)):
+    """Brand accepts or rejects the creator's counter-offer. Settles the difference."""
+    campaign = await get_booking(campaign_id, current_user, role="brand")
+    if campaign.get("booking_status") != "price_revision":
+        raise HTTPException(status_code=400, detail="There's no price proposal on this booking")
+
+    creator = await db.users.find_one({"id": campaign["selected_creator"]}, {"_id": 0, "nickname": 1})
+    creator_name = (creator or {}).get("nickname") or "The creator"
+    title = campaign.get("title") or "your booking"
+    now = now_iso()
+
+    if data.action == "reject":
+        refunded = await refund_booking(campaign, "Brand rejected the creator's price")
+        await db.campaigns.update_one({"id": campaign_id}, {"$set": {
+            "booking_status": "declined", "status": "cancelled", "declined_at": now, "updated_at": now,
+        }})
+        await insert_deal_system_message(campaign, "❌ The brand didn't accept the new price. The booking is cancelled and refunded.")
+        await notify_user(campaign["selected_creator"], "Booking cancelled",
+                          f"The brand didn't accept your price for '{title}'.", link="/deals", ntype="warning")
+        return {"booking_status": "declined", "refunded": refunded}
+
+    if data.action != "accept":
+        raise HTTPException(status_code=400, detail="action must be accept or reject")
+
+    old_total = to_float(campaign.get("amount_paid"))
+    new_subtotal = to_float(campaign.get("proposed_amount"))
+    new_fee = brand_commission(new_subtotal)
+    new_total = round(new_subtotal + new_fee, 2)
+    difference = round(new_total - old_total, 2)
+
+    if difference > 0:
+        # Charge only the gap, atomically — same overdraw guard as checkout.
+        debit = await db.users.update_one(
+            {"id": current_user["id"], "balance": {"$gte": difference}},
+            {"$inc": {"balance": -difference}},
+        )
+        if debit.modified_count != 1:
+            from fastapi.responses import JSONResponse
+            fresh = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "balance": 1})
+            balance = to_float((fresh or {}).get("balance"))
+            return JSONResponse(status_code=402, content={
+                "detail": f"The new price needs ₹{difference:,.0f} more in credits, but your wallet has ₹{balance:,.0f}.",
+                "code": "INSUFFICIENT_FUNDS",
+                "required": difference,
+                "available": balance,
+                "shortfall": round(difference - balance, 2),
+            })
+    elif difference < 0:
+        # Cheaper than booked — hand the surplus straight back.
+        await db.users.update_one({"id": current_user["id"]}, {"$inc": {"balance": -difference}})
+
+    await db.escrow.update_one({"campaign_id": campaign_id}, {"$set": {
+        "amount": new_subtotal,
+        "brand_commission_amount": new_fee,
+        "brand_charged": new_total,
+        "updated_at": now,
+    }})
+    await db.campaigns.update_one({"id": campaign_id}, {"$set": {
+        "booking_status": "accepted",
+        "budget_min": new_subtotal,
+        "budget_max": new_subtotal,
+        "amount_paid": new_total,
+        "platform_fee": new_fee,
+        "accepted_at": now,
+        "updated_at": now,
+    }, "$unset": {"proposed_amount": "", "proposed_message": "", "proposed_at": ""}})
+
+    await insert_deal_system_message(campaign, f"✅ The brand accepted ₹{new_subtotal:,.0f}. The booking is confirmed — the brief is next.")
+    await notify_user(campaign["selected_creator"], "Your price was accepted",
+                      f"The brand accepted ₹{new_subtotal:,.0f} for '{title}'. Wait for their brief to start.",
+                      link="/deals", ntype="success")
+
+    updated = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "balance": 1})
+    return {
+        "booking_status": "accepted",
+        "subtotal": new_subtotal,
+        "fee": new_fee,
+        "total": new_total,
+        "difference_charged": difference,
+        "wallet_balance": to_float((updated or {}).get("balance")),
+    }
+
+
+@api_router.post("/bookings/{campaign_id}/brief")
+async def send_booking_brief(campaign_id: str, data: BookingBriefSend,
+                             current_user: dict = Depends(get_approved_business_user)):
+    """Brand sends the brief. Only possible once the creator has accepted — this is
+    what actually starts the work."""
+    campaign = await get_booking(campaign_id, current_user, role="brand")
+    status = campaign.get("booking_status")
+    if status != "accepted":
+        raise HTTPException(status_code=400, detail={
+            "pending_creator": "The creator hasn't accepted this booking yet.",
+            "price_revision": "Answer the creator's price proposal first.",
+            "declined": "This booking was declined.",
+        }.get(status, "This booking isn't ready for a brief."))
+    if campaign.get("brief_sent"):
+        raise HTTPException(status_code=400, detail="The brief has already been sent")
+
+    draft = campaign.get("brief_draft") or {}
+    brief_text = (data.brief_text or draft.get("brief_text") or "").strip()
+    if not brief_text:
+        raise HTTPException(status_code=400, detail="The brief can't be empty")
+    enforce_brief_contact_policy({"brief_text": brief_text})
+
+    now = now_iso()
+    await db.campaigns.update_one({"id": campaign_id}, {"$set": {
+        "brief_text": brief_text,
+        "deliverables": data.deliverables or draft.get("deliverables") or "",
+        "brief_attachments": data.attachment_urls or [],
+        "brief_sent": True,
+        "brief_sent_at": now,
+        "work_started_at": now,
+        "updated_at": now,
+    }, "$unset": {"brief_draft": ""}})
+
+    await insert_deal_system_message(campaign, f"📋 Brief received. The work has started.\n\n{brief_text}")
+    await notify_user(campaign["selected_creator"], "📋 Brief received — you can start",
+                      f"The brand sent the brief for '{campaign.get('title') or 'your booking'}'. The work has officially started.",
+                      link="/deals", ntype="success")
+    return {"brief_sent": True, "brief_text": brief_text}
 
 
 @api_router.get("/business/dashboard")
@@ -7965,13 +8236,27 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
             is_party = current_user["id"] in [campaign.get("business_id"), campaign.get("selected_creator")]
             if not is_party:
                 raise HTTPException(status_code=403, detail="Not a party to this deal")
-            brand = await db.users.find_one({"id": campaign.get("business_id")}, {"_id": 0, "profile": 1}) or {}
             creator = await db.users.find_one({"id": campaign.get("selected_creator")}, {"_id": 0, "profile": 1}) or {}
-            brand_addr = (brand.get("profile") or {}).get("address")
             creator_addr = (creator.get("profile") or {}).get("address")
             sh = await db.shipments.find_one({"campaign_id": data.campaign_id}, {"_id": 0}) or {}
+            # The brand's side is their pickup address, submitted via the "Ship Product"
+            # form and stored on the shipment — NOT on their profile.
+            brand_addr = sh.get("pickup_address")
             in_flight = (sh.get("status") or sh.get("courier_status")) in ["shipped", "in_transit", "delivered", "received"]
             both_ready = bool(brand_addr and creator_addr)
+
+            # The creator may confirm their address AFTER the brand already requested
+            # the shipment — in which case the shipment was stored with an empty
+            # delivery_address and awaiting_creator_address=True. Backfill it now so
+            # ops can actually generate the label.
+            if sh and creator_addr and current_user["id"] == campaign.get("selected_creator"):
+                await db.shipments.update_one(
+                    {"campaign_id": data.campaign_id},
+                    {"$set": {"delivery_address": creator_addr,
+                              "awaiting_creator_address": False,
+                              "updated_at": now_iso()}},
+                )
+
             if both_ready and not in_flight:
                 await db.shipments.update_one(
                     {"campaign_id": data.campaign_id},
@@ -8018,12 +8303,14 @@ async def get_shipping_address(campaign_id: Optional[str] = None, current_user: 
     if current_user["id"] not in [campaign.get("business_id"), campaign.get("selected_creator")]:
         raise HTTPException(status_code=403, detail="Not a party to this deal")
 
-    brand = await db.users.find_one({"id": campaign.get("business_id")}, {"_id": 0, "profile": 1}) or {}
     creator = await db.users.find_one({"id": campaign.get("selected_creator")}, {"_id": 0, "profile": 1}) or {}
     sh = await db.shipments.find_one({"campaign_id": campaign["id"]}, {"_id": 0}) or {}
 
     out["my_role"] = "brand" if current_user["id"] == campaign.get("business_id") else "creator"
-    out["brand_confirmed"] = bool((brand.get("profile") or {}).get("address"))
+    # The brand submits their pickup address through the "Ship Product" form
+    # (/deals/{id}/request-shipment), which stores it on the SHIPMENT — not on their
+    # profile. So that's the source of truth for "the brand has given their details".
+    out["brand_confirmed"] = bool(sh.get("pickup_address"))
     out["creator_confirmed"] = bool((creator.get("profile") or {}).get("address"))
     out["both_ready"] = out["brand_confirmed"] and out["creator_confirmed"]
     out["shipment_status"] = sh.get("status") or sh.get("courier_status")
