@@ -8291,10 +8291,20 @@ async def archive_deal(deal_id: str, current_user: dict = Depends(get_current_us
 
 @api_router.get("/work/campaign/{campaign_id}")
 async def get_work_by_campaign(campaign_id: str, current_user: dict = Depends(get_current_user)):
-    work = await db.work_submissions.find_one(
-        {"campaign_id": campaign_id, "creator_id": current_user['id']},
-        {"_id": 0}
-    )
+    """Resolve the work submission for a campaign.
+
+    The creator sees their own submission. The BRAND that owns the campaign needs it
+    too — approve / request-revision / download are all keyed by work_id, and the
+    brand has no other way to learn it (it used to send the campaign id, which 404'd).
+    """
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0, "business_id": 1})
+    is_owner_brand = bool(campaign) and campaign.get("business_id") == current_user["id"]
+
+    query = {"campaign_id": campaign_id}
+    if not is_owner_brand:
+        query["creator_id"] = current_user["id"]
+
+    work = await db.work_submissions.find_one(query, {"_id": 0}, sort=[("submitted_at", -1)])
     return work or {}
 
 @api_router.get("/work/pending-review")
