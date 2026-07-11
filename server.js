@@ -1717,21 +1717,95 @@ app.post('/api/campaigns/:id/bid', auth, async (req, res) => {
 });
 
 // ── Brand: select a creator's bid (query or body creator_id) ─────────────────
+// Accepting a bid is a purchase: the UI has always told the brand "payment held in
+// escrow", but the money was never taken — the deal was created with escrow marked
+// `held` over nothing. This now debits the wallet first, like the brief checkout.
 app.post('/api/campaigns/:id/select-creator', auth, async (req, res) => {
   try {
     const creatorId = req.query.creator_id || req.body.creator_id;
+    if (!creatorId) return res.status(400).json({ detail: 'A creator must be selected.' });
+
     const c = await Campaign.findById(req.params.id);
     if (!c) return res.status(404).json({ detail: 'Campaign not found' });
-    c.selected_creator = creatorId;
-    c.status = 'in_progress';
-    const bid = (c.bids || []).find((b) => String(b.creator_id) === String(creatorId));
-    if (bid) { bid.status = 'selected'; c.escrow_amount = bid.amount || c.budget_max || 0; }
-    c.markModified('bids');
-    await c.save();
+    // This route spends req.user's wallet, so only the brand that owns the campaign
+    // may call it. Without this check any logged-in user could accept bids on
+    // someone else's campaign.
+    if (req.user.role !== 'business') return res.status(403).json({ detail: 'Only brands can select a creator.' });
+    if (String(c.business_id) !== String(req.user.id)) {
+      return res.status(403).json({ detail: 'This campaign belongs to another brand.' });
+    }
+
     const creator = await User.findById(creatorId).lean();
-    const amount = (bid && bid.amount) || c.budget_max || 0;
-    try { await ensureDealForCampaign(c, creatorId, req.user.id); } catch (e) { /* non-blocking */ }
-    res.json({ success: true, creator_nickname: (creator && (creator.username ? `@${creator.username}` : creator.nickname)) || 'Creator', amount });
+    if (!creator || creator.role !== 'creator') return res.status(404).json({ detail: 'Creator not found' });
+    const creatorLabel = (creator.username ? `@${creator.username}` : creator.nickname) || 'Creator';
+
+    const bid = (c.bids || []).find((b) => String(b.creator_id) === String(creatorId));
+    // What the creator gets. The platform fee is charged to the brand on top.
+    const amount = (bid && bid.amount) || c.budget_max || c.budget_min || 0;
+    if (!amount) return res.status(400).json({ detail: "This bid has no amount, so it can't be paid for." });
+
+    // Already bought? Return the existing deal rather than charging a second time
+    // (double-click, retry, two tabs).
+    const existingDeal = await Deal.findOne({ campaign_id: c._id, creator_id: creatorId });
+    if (existingDeal) {
+      return res.json({ success: true, creator_nickname: creatorLabel, amount, already_selected: true });
+    }
+
+    const pricing = require('./services/pricing');
+    const feePercent = await pricing.platformFeePercent();
+    const fee = Math.round(amount * (feePercent / 100));
+    const total = amount + fee;
+
+    // Atomic balance-check + debit — a read-then-save would let two concurrent
+    // accepts both pass the check and overdraw the wallet.
+    const brand = await User.findOneAndUpdate(
+      { _id: req.user.id, wallet_balance: { $gte: total } },
+      { $inc: { wallet_balance: -total } },
+      { new: true }
+    );
+    if (!brand) {
+      const current = await User.findById(req.user.id).lean();
+      const balance = (current && current.wallet_balance) || 0;
+      return res.status(402).json({
+        detail: `Not enough credits. Selecting ${creatorLabel} costs ₹${total.toLocaleString('en-IN')} but your wallet has ₹${balance.toLocaleString('en-IN')}.`,
+        code: 'INSUFFICIENT_FUNDS',
+        required: total,
+        available: balance,
+        shortfall: total - balance,
+      });
+    }
+
+    // Money is out of the wallet — from here, any failure must put it back.
+    try {
+      c.selected_creator = creatorId;
+      c.status = 'in_progress';
+      if (bid) bid.status = 'selected';
+      c.escrow_amount = amount;
+      // platform_fee / amount_paid / paid_at aren't declared on the schema (Campaign
+      // is strict:false). Mongoose only builds setters for declared paths, so a plain
+      // `c.platform_fee = fee` is silently dropped on save — .set() is what persists
+      // an undeclared path.
+      c.set('platform_fee', fee);
+      c.set('fee_percent', feePercent);
+      c.set('amount_paid', total);
+      c.set('paid_at', new Date());
+      c.markModified('bids');
+      await c.save();
+      await ensureDealForCampaign(c, creatorId, req.user.id);
+    } catch (e) {
+      await User.findByIdAndUpdate(req.user.id, { $inc: { wallet_balance: total } });
+      throw e;
+    }
+
+    res.json({
+      success: true,
+      creator_nickname: creatorLabel,
+      amount,
+      fee,
+      fee_percent: feePercent,
+      amount_charged: total,
+      wallet_balance: brand.wallet_balance,
+    });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
