@@ -2556,6 +2556,18 @@ def _auth_response(user: dict) -> dict:
     }
 
 
+@api_router.post("/auth/verify-password")
+async def verify_own_password(data: VerifyPasswordRequest, current_user: dict = Depends(get_current_user)):
+    """Re-authenticate the signed-in user with their own password. Used to gate
+    sensitive actions (e.g. a founder changing another admin's password)."""
+    stored = current_user.get("password")
+    if not stored:
+        raise HTTPException(status_code=400, detail="This account has no password set (Google sign-in only)")
+    if not verify_password(data.password or "", stored):
+        raise HTTPException(status_code=400, detail="Incorrect password")
+    return {"valid": True}
+
+
 @api_router.post("/auth/forgot-password")
 async def forgot_password(data: ForgotPasswordRequest):
     """Issue a 6-digit reset code (valid 15 min) and email it. Always returns the
