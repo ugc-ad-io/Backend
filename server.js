@@ -122,16 +122,16 @@ app.get('/api/business/creator-directory', auth, async (req, res) => {
   try {
     const User = require('./models/User');
     const creators = await User.find({ role: 'creator', approval_status: 'approved' }).lean();
-    // Pull the first usable media URL out of a portfolio (items may be strings or objects).
-    const pickMedia = (arr) => {
-      for (const it of (arr || [])) {
-        if (!it) continue;
-        if (typeof it === 'string') { if (/^https?:|^\//.test(it)) return it; continue; }
-        const u = it.url || it.video || it.videoUrl || it.link || (Array.isArray(it.urls) && it.urls[0]) || '';
-        if (u) return u;
-      }
-      return '';
+    // Portfolio items may be plain URL strings or rich objects — unwrap either.
+    const mediaUrl = (it) => {
+      if (!it) return '';
+      if (typeof it === 'string') return /^https?:|^\//.test(it) ? it : '';
+      return it.url || it.video || it.videoUrl || it.link || it.original_url
+        || (Array.isArray(it.urls) && it.urls[0]) || '';
     };
+    // Every usable clip, not just the first — the brand quick-preview lists them all.
+    const mediaList = (arr) => (arr || []).map(mediaUrl).filter((u) => u && !String(u).startsWith('blob:'));
+    const pickMedia = (arr) => mediaList(arr)[0] || '';
     res.json(creators.map(u => {
       const p = u.profile || {};
       const portfolio = (u.portfolio && u.portfolio.length ? u.portfolio : null) || p.portfolio_items || p.portfolio || [];
@@ -152,6 +152,7 @@ app.get('/api/business/creator-directory', auth, async (req, res) => {
         primary_category: u.category || p.category || p.niche
           || (Array.isArray(p.tags) && p.tags[0]) || (Array.isArray(p.skills) && p.skills[0]) || '',
         portfolio_preview: preview,
+        portfolio: mediaList(portfolio),
         premium: Boolean(preview) && /\.(mp4|webm|mov|m4v)$/i.test(String(preview).split('?')[0]),
       };
     }));
