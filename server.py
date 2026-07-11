@@ -2121,8 +2121,27 @@ def normalize_content_submission(campaign: dict, content_versions: List[dict], w
         "watermark_required_until_approval": True
     }
 
-def normalize_revision_tracker(work: Optional[dict], response: Optional[dict]) -> dict:
-    revisions = (work or {}).get('revisions') or []
+async def deal_revision_history(campaign_id: str, creator_id: Optional[str] = None) -> List[dict]:
+    """Every revision ever requested on this deal, across all versions, oldest first.
+
+    Revisions must be counted PER DEAL. Each resubmission inserts a *new*
+    work_submissions doc whose `revisions` list starts empty, so counting off the
+    latest doc alone reset the tally to 0 every round — the 2-free-then-₹500 rule
+    never fired and the brand could revise forever for free.
+    """
+    query = {"campaign_id": campaign_id}
+    if creator_id:
+        query["creator_id"] = creator_id
+    docs = await db.work_submissions.find(query, {"_id": 0, "revisions": 1}).to_list(100)
+    history = [rev for doc in docs for rev in (doc.get("revisions") or [])]
+    history.sort(key=lambda r: r.get("requested_at") or "")
+    return history
+
+
+def normalize_revision_tracker(work: Optional[dict], response: Optional[dict],
+                               all_revisions: Optional[List[dict]] = None) -> dict:
+    # Count across the whole deal (see deal_revision_history), not just the latest work doc.
+    revisions = all_revisions if all_revisions is not None else ((work or {}).get('revisions') or [])
     latest = revisions[-1] if revisions else {}
     requested_changes = latest.get('requested_changes')
     if not requested_changes and latest.get('feedback'):
@@ -2330,6 +2349,7 @@ async def get_deal_context(deal_id: str, current_user: dict) -> dict:
     )
     action_cards = await db.deal_action_cards.find({"campaign_id": campaign['id']}, {"_id": 0}).sort("created_at", 1).to_list(100)
     activity = await db.deal_activity.find({"campaign_id": campaign['id']}, {"_id": 0}).sort("timestamp", 1).to_list(200)
+    revision_history = await deal_revision_history(campaign['id'], creator['id'])
     return {
         "campaign": campaign,
         "creator": creator,
@@ -2342,7 +2362,8 @@ async def get_deal_context(deal_id: str, current_user: dict) -> dict:
         "content_versions": content_versions,
         "revision_response": revision_response,
         "action_cards": action_cards,
-        "activity": activity
+        "activity": activity,
+        "revision_history": revision_history
     }
 
 async def build_deal_response(context: dict, viewer: dict) -> dict:
@@ -2363,7 +2384,7 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
             cf.to_brand_facing_asset(version, approved=work_approved)
             for version in content_submission["versions"]
         ]
-    revision_tracker = normalize_revision_tracker(context['work'], context['revision_response'])
+    revision_tracker = normalize_revision_tracker(context['work'], context['revision_response'], context.get('revision_history'))
 
     legacy_messages = await db.messages.find({
         "$or": [
@@ -6895,11 +6916,24 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
                 "net_payable": (esc2 or {}).get('net_payable', 0),
             }
 
-    # Keep the creator's deal content view in sync — mark the submitted version approved.
-    await db.deal_content_submissions.update_many(
-        {"campaign_id": work['campaign_id'], "status": "submitted"},
-        {"$set": {"status": "approved", "approved_at": now}}
+    # Keep the creator's deal content view in sync — but stamp ONLY the version the brand
+    # actually approved. The old update_many() swept every row still marked "submitted",
+    # so v1..v3 (already sent back for revision) all flipped to Approved next to v4.
+    approved_version = await db.deal_content_submissions.find_one(
+        {"campaign_id": work['campaign_id']}, sort=[("version", -1)]
     )
+    if approved_version:
+        await db.deal_content_submissions.update_one(
+            {"id": approved_version['id']},
+            {"$set": {"status": "approved", "approved_at": now}}
+        )
+        # Anything older that never got a verdict is superseded, not approved.
+        await db.deal_content_submissions.update_many(
+            {"campaign_id": work['campaign_id'],
+             "version": {"$lt": approved_version.get('version', 1)},
+             "status": {"$nin": ["approved", "revision_requested"]}},
+            {"$set": {"status": "superseded"}}
+        )
 
     # Content approved — fund the creator instantly (no hold period).
     payout_info = await release_payout_now(campaign, work, source="approval")
@@ -7274,7 +7308,9 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
             raise HTTPException(status_code=400, detail="Add at least one revision item.")
 
     # PRD 8.5: hard maximum of 5 revisions per deliverable, then admin must step in.
-    used = len(work.get('revisions') or [])
+    # Counted across the whole deal — every resubmission creates a new work doc, so
+    # reading work['revisions'] alone restarted the count at 0 each round.
+    used = len(await deal_revision_history(work['campaign_id'], work['creator_id']))
     if used >= 5:
         await notify_admins("Revision limit reached", f"Campaign {work['campaign_id']} hit 5 revisions and needs admin review (PRD 8.5/8.9).", link="/dashboard/admin/disputes")
         raise HTTPException(status_code=400, detail="This deliverable has reached the 5-revision maximum. An admin must review before further revisions.")
@@ -7312,6 +7348,18 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
     )
     if claim.modified_count == 0:
         raise HTTPException(status_code=409, detail="This submission is no longer awaiting review — it was just approved or revised. Refresh to see the latest state.")
+
+    # Take the version row out of "submitted" too. Leaving it there is what let the
+    # approve sweep later stamp every past version as Approved.
+    sent_back = await db.deal_content_submissions.find_one(
+        {"campaign_id": work['campaign_id'], "creator_id": work['creator_id'], "status": "submitted"},
+        sort=[("version", -1)]
+    )
+    if sent_back:
+        await db.deal_content_submissions.update_one(
+            {"id": sent_back['id']},
+            {"$set": {"status": "revision_requested", "revision_requested_at": now_iso()}}
+        )
 
     # Charge the paid-revision fee only after the transition is secured.
     if fee > 0:
@@ -8753,6 +8801,17 @@ async def record_platform_revenue(campaign_id: str, escrow_id: str, *, deal_amou
     })
 
 
+def brand_display_name(brand: Optional[dict]) -> Optional[str]:
+    """What a creator should see as the payer: the brand's public handle."""
+    if not brand:
+        return None
+    nickname = (brand.get("nickname") or "").strip()
+    if nickname:
+        return nickname
+    username = (brand.get("username") or "").strip()
+    return f"@{username.lstrip('@')}" if username else None
+
+
 async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount: float,
                                 campaign_id: Optional[str] = None, reference_id: Optional[str] = None,
                                 note: Optional[str] = None, tds_amount: float = 0.0,
@@ -8769,6 +8828,20 @@ async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount
     penalty_amount = round(float(penalty_amount or 0), 2)
     net_amount = round(gross_amount - commission - tds_amount - penalty_amount, 2)
     seq = await db.payout_receipts.count_documents({}) + 1
+
+    # WHO paid, and for WHAT. A receipt used to carry only a raw campaign uuid, so
+    # the creator's earnings list could not say "Nike paid you ₹8,000" — there was no
+    # creator-reachable way to resolve that uuid to a brand. Stamp it at write time.
+    brand_id = brand_name = campaign_title = None
+    if campaign_id:
+        campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0, "title": 1, "business_id": 1})
+        if campaign:
+            campaign_title = campaign.get("title")
+            brand_id = campaign.get("business_id")
+            if brand_id:
+                brand = await db.users.find_one({"id": brand_id}, {"_id": 0, "nickname": 1, "username": 1})
+                brand_name = brand_display_name(brand)
+
     receipt = {
         "id": str(uuid.uuid4()),
         "receipt_number": f"PR-{datetime.now(timezone.utc).year}-{seq:05d}",
@@ -8782,11 +8855,35 @@ async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount
         "net_amount": net_amount,
         "currency": "INR",
         "campaign_id": campaign_id,
+        "campaign_title": campaign_title,
+        "brand_id": brand_id,
+        "brand_name": brand_name,
         "reference_id": reference_id,
         "note": note,
         "created_at": now_iso(),
     }
     await db.payout_receipts.insert_one(receipt)
+
+    # Mirror an earning into the wallet ledger. Nothing ever wrote a creator row
+    # here, which is why the admin's per-user transaction view was empty for every
+    # creator on the platform.
+    if receipt_type == "earning":
+        await db.wallet_ledger.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": creator_id,
+            "direction": "credit",
+            "amount": net_amount,
+            "type": "Payout",
+            "status": "completed",
+            "campaign_id": campaign_id,
+            "counterparty_id": brand_id,
+            "counterparty_name": brand_name,
+            "description": (f"Payout from {brand_name}" if brand_name else "Payout")
+                           + (f" for '{campaign_title}'" if campaign_title else ""),
+            "date": now_iso(),
+            "created_at": now_iso(),
+        })
+
     return {k: v for k, v in receipt.items() if k != "_id"}
 
 
@@ -8843,10 +8940,42 @@ async def get_withdrawal_history(current_user: dict = Depends(get_current_user))
 
 @api_router.get("/payouts/receipts")
 async def get_payout_receipts(current_user: dict = Depends(get_current_user)):
-    """All payout receipts (earnings + withdrawals) for the current creator."""
+    """All payout receipts (earnings + withdrawals) for the current creator.
+
+    Every earning says who paid it and for which campaign. Receipts written before
+    the payer was stamped on carry only a campaign uuid, so resolve those here —
+    otherwise the creator's history shows an amount with no idea where it came from.
+    """
     receipts = await db.payout_receipts.find(
         {"creator_id": current_user['id']}, {"_id": 0}
     ).sort("created_at", -1).to_list(1000)
+
+    # Resolve each distinct campaign once, not once per row.
+    missing = {r.get("campaign_id") for r in receipts
+               if r.get("campaign_id") and not r.get("brand_name")}
+    resolved: dict = {}
+    for cid in missing:
+        campaign = await db.campaigns.find_one({"id": cid}, {"_id": 0, "title": 1, "business_id": 1})
+        if not campaign:
+            continue
+        brand = await db.users.find_one({"id": campaign.get("business_id")},
+                                        {"_id": 0, "nickname": 1, "username": 1})
+        resolved[cid] = {
+            "campaign_title": campaign.get("title"),
+            "brand_id": campaign.get("business_id"),
+            "brand_name": brand_display_name(brand),
+        }
+
+    for r in receipts:
+        info = resolved.get(r.get("campaign_id"))
+        if info:
+            r.setdefault("campaign_title", info["campaign_title"])
+            r.setdefault("brand_id", info["brand_id"])
+            r.setdefault("brand_name", info["brand_name"])
+            # setdefault won't overwrite an existing None
+            r["campaign_title"] = r.get("campaign_title") or info["campaign_title"]
+            r["brand_id"] = r.get("brand_id") or info["brand_id"]
+            r["brand_name"] = r.get("brand_name") or info["brand_name"]
     return receipts
 
 @api_router.get("/payouts/receipts/{receipt_id}")
