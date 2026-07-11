@@ -1637,6 +1637,32 @@ async def reserve_campaign_budget(user: dict, campaign_doc: dict) -> Optional[di
     await db.escrow.insert_one(escrow_doc)
     return escrow_doc
 
+async def charge_listing_fee(user: dict, campaign_doc: dict) -> float:
+    """Charge the brand the platform listing fee (Settings → Listing fee) on publish."""
+    fee = to_float(platform_setting("listing_fee", 0))
+    if fee <= 0:
+        return 0.0
+    debit = await db.users.update_one(
+        {"id": user["id"], "balance": {"$gte": fee}},
+        {"$inc": {"balance": -fee}},
+    )
+    if debit.modified_count != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient wallet balance for the ₹{fee:,.0f} listing fee. Add funds and try again.",
+        )
+    await db.wallet_ledger.insert_one({
+        "id": str(uuid.uuid4()),
+        "user_id": user["id"],
+        "campaign_id": campaign_doc.get("id"),
+        "type": "listing_fee",
+        "amount": fee,
+        "direction": "debit",
+        "status": "success",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return fee
+
 async def refund_campaign_reservation(campaign_id: str, reason: str = "refund") -> None:
     """Refund a still-reserved (no creator selected yet) campaign budget to the wallet.
     No-op once a creator is engaged (status becomes 'held')."""
@@ -1983,7 +2009,7 @@ def normalize_revision_tracker(work: Optional[dict], response: Optional[dict]) -
         "revision_limit": (work or {}).get('revision_limit', cf.FREE_REVISION_LIMIT),
         "free_revision_limit": cf.FREE_REVISION_LIMIT,
         "free_revisions_remaining": max(0, cf.FREE_REVISION_LIMIT - used),
-        "next_revision_fee": cf.revision_fee_for(used),
+        "next_revision_fee": revision_fee_for(used),
         "latest_feedback": latest.get('feedback'),
         "requested_changes": requested_changes or [],
         "items": latest.get('items') or [],
@@ -2130,7 +2156,7 @@ async def settle_deal_lazily(campaign: dict) -> None:
     work = await db.work_submissions.find_one({"campaign_id": cid, "status": WorkStatus.SUBMITTED})
     if work:
         submitted = parse_iso(work.get('submitted_at') or work.get('created_at'))
-        if submitted and (now - submitted).days >= AUTO_APPROVE_DAYS:
+        if submitted and (now - submitted).days >= int(platform_setting("auto_approval_days", AUTO_APPROVE_DAYS)):
             cards = await db.deal_action_cards.find({"campaign_id": cid}, {"_id": 0}).to_list(100)
             disputed = any(c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open' for c in cards)
             if not disputed:
@@ -4290,9 +4316,21 @@ async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(g
     # Moderate the free-text "things to avoid" field for contact info
     enforce_brief_contact_policy(campaign)
 
+    # Restricted brand categories (Settings) may not be advertised.
+    blocked = is_restricted_category(campaign.get('category'), campaign.get('product_type'),
+                                     campaign.get('industry_category'), campaign.get('title'))
+    if blocked:
+        raise HTTPException(status_code=400, detail=f"'{blocked}' is a restricted category and cannot be advertised on this platform.")
+
     # Hold the campaign budget on the wallet now (shows as 'on hold' in Transaction
     # History). Raises 400 if the wallet can't cover it — the brief stays a draft.
     await reserve_campaign_budget(current_user, campaign)
+    # Platform listing fee (Settings → Listing fee). If it can't be paid, undo the hold.
+    try:
+        await charge_listing_fee(current_user, campaign)
+    except HTTPException:
+        await refund_campaign_reservation(campaign_id, reason="listing_fee_unpaid")
+        raise
 
     # Submitting sends the brief for admin approval — it goes live (ACTIVE) only after
     # an admin approves it, so creators never see un-reviewed campaigns.
@@ -4314,8 +4352,8 @@ async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(g
         update_fields['budget_hidden'] = True
         update_fields['admin_flags'] = campaign.get('admin_flags')
 
-    # PRD 5.2 Path B: brand requested an ops-curated shortlist
-    if campaign.get('match_requested'):
+    # PRD 5.2 Path B: brand requested an ops-curated shortlist (feature-flagged)
+    if campaign.get('match_requested') and feature_enabled('matching_v05'):
         update_fields['match_status'] = 'queued'
         await notify_admins(
             "New brief awaiting matches",
@@ -4458,16 +4496,27 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
     })
 
     if is_publish:
+        # Restricted brand categories (Settings) may not be advertised.
+        blocked = is_restricted_category(campaign_doc.get('category'), campaign_doc.get('product_type'),
+                                         campaign_doc.get('industry_category'), campaign_doc.get('title'))
+        if blocked:
+            raise HTTPException(status_code=400, detail=f"'{blocked}' is a restricted category and cannot be advertised on this platform.")
         # Hold the campaign budget on the wallet now (shows as 'on hold' in Transaction
         # History). Raises 400 if the wallet can't cover it — the campaign is not created.
         await reserve_campaign_budget(current_user, campaign_doc)
+        # Platform listing fee (Settings → Listing fee). If it can't be paid, undo the hold.
+        try:
+            await charge_listing_fee(current_user, campaign_doc)
+        except HTTPException:
+            await refund_campaign_reservation(campaign_doc['id'], reason="listing_fee_unpaid")
+            raise
         now_iso = datetime.now(timezone.utc).isoformat()
         campaign_doc['submitted_at'] = now_iso
         # Awaits admin approval before going live — no approved_at stamp yet.
         # Flag to admin if the budget is hidden from creators
         await flag_hidden_budget_if_needed(campaign_doc)
-        # PRD 5.2 Path B: brand requested an ops-curated shortlist
-        if campaign_doc.get('match_requested'):
+        # PRD 5.2 Path B: brand requested an ops-curated shortlist (feature-flagged)
+        if campaign_doc.get('match_requested') and feature_enabled('matching_v05'):
             campaign_doc['match_status'] = 'queued'
         await notify_admins(
             "New campaign awaiting approval",
@@ -4919,7 +4968,7 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
             "creator_id": creator_id,
             "amount": deal_amount,
             "brand_commission_amount": brand_fee,
-            "brand_commission_percent": BRAND_COMMISSION_PERCENT,
+            "brand_commission_percent": commission_percent(),
             "brand_charged": brand_total,
             "reserved_amount": reserved,
             "funded": funded,
@@ -4941,7 +4990,7 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
             "creator_id": creator_id,
             "amount": deal_amount,
             "brand_commission_amount": brand_fee,
-            "brand_commission_percent": BRAND_COMMISSION_PERCENT,
+            "brand_commission_percent": commission_percent(),
             "brand_charged": brand_total,
             "funded": debit.modified_count == 1,
             "status": "held",
@@ -5408,7 +5457,7 @@ async def activate_deal_from_card(card: dict) -> Optional[dict]:
             "creator_id": creator["id"],
             "amount": amount,
             "brand_commission_amount": brand_fee,
-            "brand_commission_percent": BRAND_COMMISSION_PERCENT,
+            "brand_commission_percent": commission_percent(),
             "brand_charged": brand_total,
             "status": "held",
             "wallet_funded": funded,
@@ -6161,7 +6210,7 @@ async def schedule_payout_for_deal(campaign: dict, work: dict, source: str = "ap
         return {"payout_scheduled_at": None, "net_payable": 0, "tds_amount": 0, "penalty_amount": 0}
     creator = await db.users.find_one({"id": work['creator_id']}, {"_id": 0, "level": 1, "tds_exempt": 1}) or {}
     gross = float(escrow.get('amount') or 0)
-    delay = cf.payout_delay_days(creator.get('level'))
+    delay = payout_delay_for(creator.get('level'))
     scheduled_at = (datetime.now(timezone.utc) + timedelta(days=delay)).isoformat()
     tds = cf.compute_tds(gross, exempt=bool(creator.get('tds_exempt')))
     late = await assess_late_delivery(work['creator_id'], campaign, work)
@@ -6181,7 +6230,7 @@ async def schedule_payout_for_deal(campaign: dict, work: dict, source: str = "ap
             "tds_amount": tds,
             "penalty_amount": penalty,
             "commission_amount": commission,
-            "commission_percent": CREATOR_COMMISSION_PERCENT,
+            "commission_percent": commission_percent(),
             "penalty_pct": late['penalty_pct'],
             "penalty_brand_credit": round(penalty * cf.LATE_PENALTY_BRAND_SHARE, 2),
             "late_severity": late['severity'],
@@ -6219,6 +6268,11 @@ async def release_payout_now(campaign: dict, work: dict, source: str = "approval
         return {"released": False, "net_payable": escrow.get('net_payable', 0),
                 "payout_scheduled_at": escrow.get('payout_scheduled_at')}
     payout_info = await schedule_payout_for_deal(campaign, work, source=source)
+    # Feature flag (Settings → instant_payout): when off, the payout is not released
+    # immediately — it stays on the normal hold period and the scheduler pays it out.
+    if not feature_enabled("instant_payout"):
+        payout_info["released"] = False
+        return payout_info
     escrow = await db.escrow.find_one({"campaign_id": campaign['id']})
     payout_info["released"] = bool(escrow and await release_scheduled_payout(escrow))
     return payout_info
@@ -6289,7 +6343,7 @@ AUTO_APPROVE_DAYS = 5  # PRD 8.4
 async def auto_approve_stale_submissions() -> int:
     """PRD 8.4: content auto-approves 5 days after submission if the brand never
     acts, protecting creators from ghosting brands."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=AUTO_APPROVE_DAYS)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=int(platform_setting("auto_approval_days", AUTO_APPROVE_DAYS)))).isoformat()
     stale = await db.work_submissions.find({
         "status": WorkStatus.SUBMITTED,
         "submitted_at": {"$lte": cutoff},
@@ -6305,7 +6359,7 @@ async def auto_approve_stale_submissions() -> int:
             continue
         await db.work_submissions.update_one({"id": work['id']}, {"$set": {"status": WorkStatus.APPROVED, "approved_at": now_iso(), "auto_approved": True}})
         await release_payout_now(campaign, work, source="auto_approval")
-        await insert_deal_system_message(campaign, f"Content auto-approved after {AUTO_APPROVE_DAYS} days with no brand review (PRD 8.4). The creator has been paid.")
+        await insert_deal_system_message(campaign, f"Content auto-approved after {int(platform_setting('auto_approval_days', AUTO_APPROVE_DAYS))} days with no brand review (PRD 8.4). The creator has been paid.")
         await notify_user(work['creator_id'], "Your content was auto-approved", "The brand didn't review in time, so your content was auto-approved and you've been paid.", link="/my-deals")
         approved += 1
     return approved
@@ -6507,7 +6561,7 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
 
     # PRD Section 8: first 2 revisions are free; each one thereafter costs the
     # brand a flat ₹500, debited from the wallet at request time.
-    fee = cf.revision_fee_for(used)
+    fee = revision_fee_for(used)
     paid = fee > 0
     if fee > 0:
         balance = float(current_user.get('balance') or 0)
@@ -7599,7 +7653,7 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
     if ship_by and not (existing or {}).get('late_fee_applied'):
         days_late = (datetime.now(timezone.utc) - ship_by).days
         if days_late >= 1:
-            fee = min(days_late * LATE_SHIP_FEE_PER_DAY, LATE_SHIP_FEE_CAP)
+            fee = min(days_late * to_float(platform_setting("late_ship_fee_per_day", LATE_SHIP_FEE_PER_DAY)), to_float(platform_setting("late_ship_fee_cap", LATE_SHIP_FEE_CAP)))
             creator_id = campaign.get('selected_creator')
             if creator_id and fee > 0:
                 await db.users.update_one({"id": creator_id}, {"$inc": {"balance": fee}})
@@ -7780,13 +7834,15 @@ CREATOR_COMMISSION_PERCENT = 20
 
 
 def brand_commission(amount) -> float:
-    """Platform fee added on top of the deal value when the brand funds."""
-    return round(float(amount or 0) * BRAND_COMMISSION_PERCENT / 100, 2)
+    """Platform fee added on top of the deal value when the brand funds.
+    Rate comes from Admin → Settings → Commission rate."""
+    return round(float(amount or 0) * commission_percent() / 100, 2)
 
 
 def creator_commission(amount) -> float:
-    """Platform fee deducted from the creator's payout."""
-    return round(float(amount or 0) * CREATOR_COMMISSION_PERCENT / 100, 2)
+    """Platform fee deducted from the creator's payout.
+    Rate comes from Admin → Settings → Commission rate."""
+    return round(float(amount or 0) * commission_percent() / 100, 2)
 
 
 async def record_platform_revenue(campaign_id: str, escrow_id: str, *, deal_amount: float,
@@ -7797,8 +7853,8 @@ async def record_platform_revenue(campaign_id: str, escrow_id: str, *, deal_amou
         "campaign_id": campaign_id,
         "escrow_id": escrow_id,
         "deal_amount": round(float(deal_amount or 0), 2),
-        "brand_commission_percent": BRAND_COMMISSION_PERCENT,
-        "creator_commission_percent": CREATOR_COMMISSION_PERCENT,
+        "brand_commission_percent": commission_percent(),
+        "creator_commission_percent": commission_percent(),
         "brand_fee": round(float(brand_fee or 0), 2),
         "creator_fee": round(float(creator_fee or 0), 2),
         "total_commission": round(float(brand_fee or 0) + float(creator_fee or 0), 2),
@@ -7828,7 +7884,7 @@ async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount
         "creator_id": creator_id,
         "type": receipt_type,
         "gross_amount": gross_amount,
-        "commission_percent": CREATOR_COMMISSION_PERCENT if receipt_type == "earning" else 0,
+        "commission_percent": commission_percent() if receipt_type == "earning" else 0,
         "commission_amount": commission,
         "tds_amount": tds_amount,
         "penalty_amount": penalty_amount,
@@ -10279,6 +10335,8 @@ async def admin_update_settings(data: Dict[str, Any] = Body(...), request: Reque
     await db.platform_settings.update_one(
         {"id": "platform"}, {"$set": {"id": "platform", "values": merged, "updated_at": now_iso()}}, upsert=True
     )
+    # Refresh the in-process cache so the new values take effect immediately.
+    await get_platform_settings()
     await log_admin_action(current_user, "settings.update", target_type="platform_settings", target_id="platform",
                            before={k: before.get(k) for k in overrides}, after=overrides, request=request)
     return {"settings": merged, "message": "Settings updated"}
@@ -10468,7 +10526,7 @@ async def admin_financials_revenue(period: Optional[str] = "month", current_user
     cutoff = _period_cutoff_iso(period)
 
     invoices = await db.invoices.find({"created_at": {"$gte": cutoff}}, {"_id": 0}).to_list(50000)
-    commission = round(sum(to_float(i.get("gross_amount")) * PLATFORM_COMMISSION_PERCENT / 100 for i in invoices), 2)
+    commission = round(sum(to_float(i.get("gross_amount")) * commission_percent() / 100 for i in invoices), 2)
 
     # Campaign listing fees and refunds — recorded as payment_transactions.
     txns = await db.payment_transactions.find({"created_at": {"$gte": cutoff}}, {"_id": 0}).to_list(50000)
@@ -10670,7 +10728,7 @@ async def export_pnl(period: Optional[str] = "month", current_user: dict = Depen
     cutoff = _period_cutoff_iso(period)
     invoices = await db.invoices.find({"created_at": {"$gte": cutoff}}, {"_id": 0}).to_list(50000)
     gross = round(sum(to_float(i.get("gross_amount")) for i in invoices), 2)
-    commission = round(gross * PLATFORM_COMMISSION_PERCENT / 100, 2)
+    commission = round(gross * commission_percent() / 100, 2)
     tds = round(sum(to_float(i.get("tds_amount")) for i in invoices), 2)
     creator_payouts = round(sum(to_float(i.get("net_to_creator")) for i in invoices), 2)
     released = await db.escrow.find({"payout_status": "released", "released_at": {"$gte": cutoff}}, {"_id": 0}).to_list(50000)
@@ -11289,6 +11347,12 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
 @app.on_event("startup")
 async def startup_initialization():
     """Initialize default data collections."""
+    # Warm the platform-settings cache so commission/fee helpers read live values.
+    try:
+        await get_platform_settings()
+    except Exception as exc:  # keep boot resilient — helpers fall back to defaults
+        print(f"⚠️  Could not load platform settings at startup: {exc}")
+
     # Seed payout ranges
     count = await db.payout_ranges.count_documents({})
     if count == 0:
