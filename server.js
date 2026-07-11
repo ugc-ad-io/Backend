@@ -121,7 +121,31 @@ app.get('/api/business/dashboard', auth, async (req, res) => {
 app.get('/api/business/creator-directory', auth, async (req, res) => {
   try {
     const User = require('./models/User');
+    const Deal = require('./models/Deal');
+    const { DEAL_STATES } = require('./utils/dealStateMachine');
+    const PAID = DEAL_STATES[DEAL_STATES.length - 1]; // 'Paid - Complete' — the only terminal state
     const creators = await User.find({ role: 'creator', approval_status: 'approved' }).lean();
+
+    // Deals a creator actually finished, for the "Deliverables" stat brands see.
+    // A completed Campaign gets mirrored into a PAID Deal (see backfillDeals.js),
+    // so key each finished job by its campaign and de-dupe — otherwise the same
+    // piece of work counts twice.
+    const creatorIds = creators.map((u) => u._id);
+    const [paidDeals, doneCampaigns] = await Promise.all([
+      Deal.find({ creator_id: { $in: creatorIds }, current_state: PAID })
+        .select('creator_id campaign_id deal_id').lean(),
+      Campaign.find({ selected_creator: { $in: creatorIds.map(String) }, status: 'completed' })
+        .select('selected_creator').lean(),
+    ]);
+    const jobsByCreator = new Map(); // creatorId -> Set of finished-job keys
+    const addJob = (creatorId, key) => {
+      const k = String(creatorId);
+      if (!jobsByCreator.has(k)) jobsByCreator.set(k, new Set());
+      jobsByCreator.get(k).add(String(key));
+    };
+    for (const d of paidDeals) addJob(d.creator_id, d.campaign_id || `deal:${d.deal_id}`);
+    for (const c of doneCampaigns) addJob(c.selected_creator, c._id);
+
     // Portfolio items may be plain URL strings or rich objects — unwrap either.
     const mediaUrl = (it) => {
       if (!it) return '';
@@ -153,6 +177,7 @@ app.get('/api/business/creator-directory', auth, async (req, res) => {
           || (Array.isArray(p.tags) && p.tags[0]) || (Array.isArray(p.skills) && p.skills[0]) || '',
         portfolio_preview: preview,
         portfolio: mediaList(portfolio),
+        deliverables_completed: (jobsByCreator.get(String(u._id)) || new Set()).size,
         premium: Boolean(preview) && /\.(mp4|webm|mov|m4v)$/i.test(String(preview).split('?')[0]),
       };
     }));

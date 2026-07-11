@@ -2796,6 +2796,9 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
     return {
         "id": creator.get("id"),
         "public_creator_id": creator.get("public_creator_id") or "",
+        # Brand-facing display handle. The real username stays private (strip_private_fields);
+        # brands see the auto-generated nickname, so cards/briefs don't read "Creator".
+        "nickname": creator.get("nickname") or "",
         "name": display_name,
         "nickname": creator.get("nickname") or "",
         "profile_photo": first_non_empty(creator.get("profile_photo"), creator.get("profile_picture"), profile.get("profile_photo"), profile.get("profile_picture")),
@@ -3628,7 +3631,9 @@ async def get_business_settings_billing(current_user: dict = Depends(get_current
     )
     return {
         "plan_name": billing.get("plan_name", "Pro"),
-        "commission_rate": billing.get("commission_rate", 20),
+        # The platform fee actually charged on top of a deal is the live global
+        # rate (see brand_commission()), so report that — not a stale stored copy.
+        "commission_rate": commission_percent(),
         "next_billing_date": billing.get("next_billing_date"),
         "monthly_budget_used": monthly_budget_used,
         "monthly_budget_limit": billing.get("monthly_budget_limit", 0),
