@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import time
 import asyncio
 import requests
 import logging
@@ -1004,10 +1005,81 @@ def brand_allowed_domains(*users: dict) -> List[str]:
                 domains.append(domain)
     return domains
 
+# ── Admin-managed filter rules (Admin → Chat oversight → Filter rules) ───────
+#
+# These rules used to live only in the admin UI: you could add "call me", the page
+# showed it as Active, and the filter below — which only ever checked the hardcoded
+# patterns above — happily delivered "call me". The rules are real rows now, and
+# this cache is what puts them in front of every message.
+#
+# check_contact_info_policy() is sync and called from a dozen places, so the rules
+# are held in a module-level cache that callers refresh (cheaply, TTL-guarded)
+# before checking.
+_filter_rules_cache: dict = {"rules": [], "at": 0.0}
+FILTER_RULES_TTL_SECONDS = 30.0
+
+
+def _compile_filter_rule(rule: dict):
+    """Turn a stored rule into a compiled matcher. A pattern that won't compile is
+    dropped rather than raised — one bad rule must never take chat down."""
+    try:
+        if rule.get("type") == "regex":
+            return {"id": rule.get("id"), "label": rule.get("label") or rule.get("id"),
+                    "re": re.compile(rule["pattern"], re.IGNORECASE)}
+        # keyword: a comma-separated list, matched on word boundaries so the rule
+        # "snap" doesn't fire on "snapshot".
+        words = [w.strip() for w in str(rule.get("pattern") or "").split(",") if w.strip()]
+        if not words:
+            return None
+        pattern = r"\b(" + "|".join(re.escape(w) for w in words) + r")\b"
+        return {"id": rule.get("id"), "label": rule.get("label") or rule.get("id"),
+                "re": re.compile(pattern, re.IGNORECASE)}
+    except re.error as exc:
+        logger.warning("Filter rule %s has an invalid pattern, skipping: %s", rule.get("id"), exc)
+        return None
+
+
+async def refresh_filter_rules(force: bool = False):
+    """Reload the enabled rules into the cache. Cheap and TTL-guarded, so callers
+    can await it on every message without hammering Mongo."""
+    now = time.time()
+    if not force and (now - _filter_rules_cache["at"]) < FILTER_RULES_TTL_SECONDS:
+        return _filter_rules_cache["rules"]
+    try:
+        docs = await db.filter_rules.find({"enabled": True}, {"_id": 0}).to_list(500)
+        _filter_rules_cache["rules"] = [c for c in (_compile_filter_rule(d) for d in docs) if c]
+        _filter_rules_cache["at"] = now
+    except Exception as exc:  # DB hiccup: keep the rules we already had
+        logger.warning("Could not reload filter rules: %s", exc)
+    return _filter_rules_cache["rules"]
+
+
+async def seed_filter_rules():
+    """Persist the built-in defaults once, so they're editable rows like any other
+    (they used to be merged into the API response but never stored — which is why
+    switching one off or deleting it 404'd: there was no row to act on)."""
+    try:
+        for rule in DEFAULT_FILTER_RULES:
+            await db.filter_rules.update_one(
+                {"id": rule["id"]},
+                {"$setOnInsert": {**rule, "hits": 0, "created_at": datetime.now(timezone.utc)}},
+                upsert=True,
+            )
+    except Exception as exc:
+        logger.warning("Could not seed default filter rules: %s", exc)
+    return await refresh_filter_rules(force=True)
+
+
 def check_contact_info_policy(message: str, allowed_domains: Optional[List[str]] = None) -> dict:
     text = message or ""
     violations = []
     allowed_domains = allowed_domains or []
+
+    # The admin's own rules. Callers await refresh_filter_rules() first; if the cache
+    # is cold this is simply empty and the built-in patterns below still apply.
+    for rule in _filter_rules_cache["rules"]:
+        if rule["re"].search(text):
+            violations.append({"type": rule["label"], "content": [rule["label"]], "severity": "high"})
 
     emails = EMAIL_PATTERN.findall(text)
     if emails:
@@ -1511,6 +1583,10 @@ async def validate_action_card_payload(data: ChatActionCardCreate, current_user:
         fields.setdefault("expires_at", (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat())
     elif data.type == "private_invitation":
         require_fields(fields, ["campaign_name", "deliverable_summary", "budget", "timeline", "usage_rights", "full_brief_link"], "private_invitation")
+        # require_fields() treats 0 as "present", and an empty budget box arrives as 0
+        # (JS Number('') === 0) — so a zero-budget invitation would otherwise go through.
+        if to_float(fields.get("budget")) <= 0:
+            raise HTTPException(status_code=400, detail="private_invitation requires a budget greater than zero")
         fields.setdefault("response_deadline", (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat())
     elif data.type == "counter_offer":
         require_fields(fields, ["modified_price", "revisions", "timeline", "usage_rights", "diff_vs_original"], "counter_offer")
@@ -5592,6 +5668,8 @@ async def send_message(data: ChatMessage, current_user: dict = Depends(get_curre
         raise HTTPException(status_code=400, detail="Message text or at least one attachment is required.")
     await validate_message_attachments(data.attachment_urls)
 
+    # Pick up any rule the admin added/enabled since the last message.
+    await refresh_filter_rules()
     safety_check = check_contact_info_policy(data.message, brand_allowed_domains(current_user, recipient))
     if not safety_check["safe"]:
         await log_chat_violation(current_user, data.recipient_id, data.message, safety_check["violations"], "message")
@@ -6311,6 +6389,10 @@ class FilterRulePropose(BaseModel):
     pattern: str
 
 
+class FilterRuleToggle(BaseModel):
+    enabled: bool
+
+
 async def _restore_strike_for_violation(violation: dict, reviewed_by: str) -> None:
     """Approve a false positive: invalidate its strike and recompute the user's
     active warning count (mirrors the false-positive-review endpoint)."""
@@ -6468,24 +6550,75 @@ async def propose_filter_rule(data: FilterRulePropose, current_user: dict = Depe
             re.compile(data.pattern)
         except re.error as exc:
             raise HTTPException(status_code=400, detail=f"Invalid regex: {exc}")
+    # Whoever adds a rule here already holds content_moderation, and the old second
+    # approval step just stranded every new rule in "Awaiting review" with nothing
+    # able to approve it. Rules go live on save — which is what the panel promises —
+    # and a careless one is switched off or deleted with the endpoints below.
     rule = {
         "id": str(uuid.uuid4()),
         "type": data.type,
         "label": data.label.strip(),
         "pattern": data.pattern.strip(),
-        "enabled": False,
-        "status": "pending_review",
+        "enabled": True,
+        "status": "active",
+        "hits": 0,
         "proposed_by": current_user["id"],
         "proposed_by_nickname": current_user.get("nickname"),
         "created_at": now_iso(),
     }
     await db.filter_rules.insert_one(rule)
+    # Bite on the very next message rather than waiting out the cache TTL.
+    await refresh_filter_rules(force=True)
     await notify_admins(
-        "New filter rule proposed",
-        f"{current_user.get('nickname', current_user['id'])} proposed a {data.type} rule \"{data.label}\" — senior admin review required.",
+        "New filter rule added",
+        f"{current_user.get('nickname', current_user['id'])} added a {data.type} rule \"{data.label}\" — it is now live.",
         link="/dashboard/admin/flagged-messages",
     )
-    return {"message": "Rule proposed — sent for senior admin review.", "rule": {k: v for k, v in rule.items() if k != "_id"}}
+    return {"message": "Rule added — live from the next message.", "rule": {k: v for k, v in rule.items() if k != "_id"}}
+
+
+@api_router.post("/admin/filter-rules/{rule_id}/toggle")
+async def toggle_filter_rule(rule_id: str, data: FilterRuleToggle,
+                             current_user: dict = Depends(require_cap("content_moderation"))):
+    """Switch a rule on or off. This is what promotes an older 'Awaiting review'
+    rule to live — and it takes effect immediately, not after the cache TTL."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    # The built-in defaults used to be virtual — merged into the list response but
+    # never stored — so there was no row to toggle and this 404'd. Materialise the
+    # rule on first touch.
+    existing = await db.filter_rules.find_one({"id": rule_id}, {"_id": 0})
+    if not existing:
+        default = next((r for r in DEFAULT_FILTER_RULES if r["id"] == rule_id), None)
+        if not default:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        await db.filter_rules.insert_one({**default, "hits": 0, "created_at": now_iso()})
+
+    await db.filter_rules.update_one(
+        {"id": rule_id},
+        {"$set": {"enabled": data.enabled, "status": "active" if data.enabled else "disabled"}},
+    )
+    await refresh_filter_rules(force=True)
+    rule = await db.filter_rules.find_one({"id": rule_id}, {"_id": 0})
+    return {"success": True, "rule": rule}
+
+
+@api_router.delete("/admin/filter-rules/{rule_id}")
+async def delete_filter_rule(rule_id: str, current_user: dict = Depends(require_cap("content_moderation"))):
+    """Delete a rule outright."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    result = await db.filter_rules.delete_one({"id": rule_id})
+    if result.deleted_count == 0:
+        # A built-in that was never materialised: store it disabled so it stops
+        # showing up as an active rule the admin can't get rid of.
+        default = next((r for r in DEFAULT_FILTER_RULES if r["id"] == rule_id), None)
+        if not default:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        await db.filter_rules.insert_one({**default, "enabled": False, "status": "disabled",
+                                          "hits": 0, "created_at": now_iso()})
+    await refresh_filter_rules(force=True)
+    return {"success": True}
 
 # Work Submission Routes
 async def ensure_ready_for_content(campaign: dict):
@@ -11884,6 +12017,16 @@ async def startup_initialization():
         await get_platform_settings()
     except Exception as exc:  # keep boot resilient — helpers fall back to defaults
         print(f"⚠️  Could not load platform settings at startup: {exc}")
+
+    # Persist the built-in contact-filter rules (first boot only) and warm the cache,
+    # so the very first message is checked against the real rules.
+    # (Plain ASCII on purpose: a Windows console is cp1252 and an emoji here raises
+    # UnicodeEncodeError inside the startup hook, which kills the whole app.)
+    try:
+        rules = await seed_filter_rules()
+        print(f"Contact filter: {len(rules)} active rule(s) loaded")
+    except Exception as exc:
+        print(f"WARNING: could not load contact-filter rules at startup: {exc}")
 
     # Seed payout ranges
     count = await db.payout_ranges.count_documents({})
