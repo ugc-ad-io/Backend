@@ -1943,6 +1943,8 @@ def normalize_shipment(campaign: dict, shipment: Optional[dict]) -> dict:
         "courier_tracking_url": shipment.get('courier_tracking_url') or shipment.get('tracking_url'),
         "courier_status": status_map.get(raw_status, raw_status),
         "expected_delivery_at": shipment.get('expected_delivery_at') or shipment.get('expected_delivery'),
+        # Surfaced so the brand/creator progress trackers can date the "Product Shipped" step.
+        "shipped_at": shipment.get('shipped_at') or shipment.get('updated_at'),
         "delivered_at": shipment.get('delivered_at')
     }
 
@@ -8112,10 +8114,14 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
         "expected_delivery": data.expected_delivery,
         "shipment_checklist": data.shipment_checklist,
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        "status": data.courier_status or "shipped"
+        "status": data.courier_status or "shipped",
     }
-    
-    existing = await db.shipments.find_one({"campaign_id": data.campaign_id}, {"_id": 0, "late_fee_applied": 1})
+
+    existing = await db.shipments.find_one({"campaign_id": data.campaign_id}, {"_id": 0, "late_fee_applied": 1, "shipped_at": 1})
+    # Stamp when it first left the brand so the progress trackers can date the
+    # "Product Shipped" step — but never overwrite the original ship date on re-edit.
+    shipment_doc["shipped_at"] = (existing or {}).get("shipped_at") or datetime.now(timezone.utc).isoformat()
+
     await db.shipments.update_one(
         {"campaign_id": data.campaign_id},
         {"$set": shipment_doc},
