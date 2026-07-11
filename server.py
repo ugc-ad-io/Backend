@@ -7388,11 +7388,27 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
                       "The brand requested changes on your submission. Open your deal to review the feedback and resubmit.",
                       link="/my-deals", ntype="info", email=True)
 
+    new_balance = float(current_user.get('balance') or 0) - fee
+    if paid:
+        # The brand's wallet was just debited. Telling nobody is not acceptable for a
+        # money movement — they only ever saw a "Revision requested" toast.
+        await notify_user(
+            current_user['id'],
+            f"₹{int(fee)} charged for a paid revision",
+            f"Revisions 1-{cf.FREE_REVISION_LIMIT} are free. This was revision #{used + 1} on "
+            f"'{campaign.get('title', 'your campaign')}', so ₹{int(fee)} was debited from your wallet. "
+            f"Remaining balance: ₹{int(new_balance)}.",
+            link="/dashboard/business/billing", ntype="warning", email=True,
+        )
+
     return {
         "message": "Revision requested",
         "revision_number": used + 1,
         "free_revisions_remaining": max(0, cf.FREE_REVISION_LIMIT - (used + 1)),
         "fee_charged": fee,
+        "paid": paid,
+        "new_balance": new_balance,
+        "next_revision_fee": revision_fee_for(used + 1),
     }
 
 @api_router.get("/deals/my")
