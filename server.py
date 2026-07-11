@@ -9646,16 +9646,20 @@ async def admin_get_categories(current_user: dict = Depends(get_current_user)):
 @api_router.post("/admin/staff/role")
 async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Request = None,
                                current_user: dict = Depends(require_cap("manage_roles"))):
-    """Assign / change an admin's sub-role, or grant admin to a new email
-    (creating the account with a one-time temp password). Founder-only."""
+    """Assign / change an admin's sub-role, or grant admin to a new email.
+    The founder SETS the password explicitly (no auto-generated temp password).
+    Passing `password` for an existing member changes their password. Founder-only."""
     if not _is_founder_admin(current_user):
         raise HTTPException(status_code=403, detail="Only the founder can assign admin roles")
 
     user_id = data.get("user_id")
     email = (data.get("email") or "").strip().lower()
     admin_role = data.get("admin_role")
+    password = (data.get("password") or "").strip()
     if admin_role not in admin_caps.ADMIN_ROLES:
         raise HTTPException(status_code=400, detail="Invalid role")
+    if password and len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
     # Custom admins carry an explicit capability list + data scope; other roles
     # derive their capabilities from the fixed CAPS matrix.
     is_custom = admin_role == "custom"
@@ -9668,19 +9672,22 @@ async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Reques
     elif email:
         user = await db.users.find_one({"email": email})
 
-    temp_password = None
+    created = False
+    password_set = False
     if not user:
         # A user_id that resolves to nothing, or no email at all, is a real 404.
         if user_id or not email:
             raise HTTPException(status_code=404, detail="User not found")
-        # Grant-by-email on a brand-new address → create the admin account so the
-        # founder can onboard staff without them pre-registering.
-        temp_password = f"Adm-{uuid.uuid4().hex[:6]}-{random.randint(1000, 9999)}"
+        # Creating a brand-new admin — the founder must set the password.
+        if not password:
+            raise HTTPException(status_code=400, detail="Set a password for the new admin (min 6 characters)")
+        created = True
+        password_set = True
         user = {
             "id": str(uuid.uuid4()),
             "email": email,
             "nickname": email.split("@")[0],
-            "password": hash_password(temp_password),
+            "password": hash_password(password),
             "role": UserRole.ADMIN,
             "admin_role": admin_role,
             "admin_caps": custom_caps,
@@ -9697,32 +9704,35 @@ async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Reques
     else:
         if (user.get("email") or "").lower() == FOUNDER_EMAIL and admin_role != "founder":
             raise HTTPException(status_code=400, detail="The founder account cannot be demoted")
-        await db.users.update_one(
-            {"id": user["id"]},
-            {"$set": {
-                "role": UserRole.ADMIN,
-                "admin_role": admin_role,
-                "admin_caps": custom_caps,
-                "admin_scope": custom_scope if is_custom else "all",
-                "approval_status": "approved",
-                "profile_completed": True,
-                "updated_at": now_iso(),
-            }},
-        )
+        update = {
+            "role": UserRole.ADMIN,
+            "admin_role": admin_role,
+            "admin_caps": custom_caps,
+            "admin_scope": custom_scope if is_custom else "all",
+            "approval_status": "approved",
+            "profile_completed": True,
+            "updated_at": now_iso(),
+        }
+        # A password on an existing member = "change password".
+        if password:
+            update["password"] = hash_password(password)
+            password_set = True
+        await db.users.update_one({"id": user["id"]}, {"$set": update})
         user = await db.users.find_one({"id": user["id"]})
 
     await log_admin_action(
         current_user,
-        "staff.created" if temp_password else "staff.role_changed",
+        "staff.created" if created else "staff.role_changed",
         target_type="user", target_id=user["id"],
-        after={"role": "admin", "admin_role": admin_role},
-        reason=f"{'Created' if temp_password else 'Set'} {user['email']} → {admin_caps.ROLE_LABELS.get(admin_role, admin_role)}",
+        after={"role": "admin", "admin_role": admin_role, "password_changed": password_set},
+        reason=f"{'Created' if created else 'Set'} {user['email']} → {admin_caps.ROLE_LABELS.get(admin_role, admin_role)}"
+               + (" (password set)" if password_set and not created else ""),
         request=request,
     )
     return {
         "success": True,
-        "created": bool(temp_password),
-        "temp_password": temp_password,
+        "created": created,
+        "password_set": password_set,
         "staff": _map_staff_row(user),
     }
 
