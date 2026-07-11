@@ -7667,7 +7667,12 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
 
     both_ready = False
     if data.campaign_id:
-        campaign = await db.campaigns.find_one({"id": data.campaign_id}, {"_id": 0})
+        # Accept either the campaign id or the deal id (they can differ).
+        campaign = await db.campaigns.find_one(
+            {"$or": [{"id": data.campaign_id}, {"deal_id": data.campaign_id}]}, {"_id": 0}
+        )
+        if campaign:
+            data.campaign_id = campaign["id"]  # normalise for the shipment lookups below
         if campaign and campaign.get("requires_shipment"):
             is_party = current_user["id"] in [campaign.get("business_id"), campaign.get("selected_creator")]
             if not is_party:
@@ -7694,6 +7699,48 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
                 await insert_deal_system_message(campaign, "Both shipping addresses received. The platform team will dispatch the product shortly.")
 
     return {"message": "Address saved", "address": address, "both_ready": both_ready}
+
+
+@api_router.get("/shipping/address")
+async def get_shipping_address(campaign_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    """Return MY saved address (for prefill) and, for a given deal, whether each
+    side has confirmed. Masked-shipping safe: never returns the OTHER party's
+    address — only a boolean that they've confirmed."""
+    me = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "profile": 1}) or {}
+    my_address = (me.get("profile") or {}).get("address")
+
+    out = {
+        "address": my_address,
+        "my_role": None,
+        "brand_confirmed": False,
+        "creator_confirmed": False,
+        "both_ready": False,
+        "shipment_status": None,
+        "requires_shipment": False,
+    }
+    if not campaign_id:
+        return out
+
+    # Accept either the campaign id or the deal id (they can differ).
+    campaign = await db.campaigns.find_one(
+        {"$or": [{"id": campaign_id}, {"deal_id": campaign_id}]}, {"_id": 0}
+    )
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    if current_user["id"] not in [campaign.get("business_id"), campaign.get("selected_creator")]:
+        raise HTTPException(status_code=403, detail="Not a party to this deal")
+
+    brand = await db.users.find_one({"id": campaign.get("business_id")}, {"_id": 0, "profile": 1}) or {}
+    creator = await db.users.find_one({"id": campaign.get("selected_creator")}, {"_id": 0, "profile": 1}) or {}
+    sh = await db.shipments.find_one({"campaign_id": campaign["id"]}, {"_id": 0}) or {}
+
+    out["my_role"] = "brand" if current_user["id"] == campaign.get("business_id") else "creator"
+    out["brand_confirmed"] = bool((brand.get("profile") or {}).get("address"))
+    out["creator_confirmed"] = bool((creator.get("profile") or {}).get("address"))
+    out["both_ready"] = out["brand_confirmed"] and out["creator_confirmed"]
+    out["shipment_status"] = sh.get("status") or sh.get("courier_status")
+    out["requires_shipment"] = bool(campaign.get("requires_shipment"))
+    return out
 
 # Withdrawal Routes
 PLATFORM_COMMISSION_PERCENT = 20  # Legacy single-rate constant (kept for reporting).
