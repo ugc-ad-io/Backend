@@ -7316,11 +7316,44 @@ async def submit_revision_response(deal_id: str, data: DealRevisionResponseSubmi
         "note": data.note,
         "created_at": now_iso()
     }
-    await db.deal_revision_responses.insert_one(response_doc)
+    # Upsert so a creator changing their mind replaces the previous response
+    # instead of leaving two conflicting records.
+    await db.deal_revision_responses.update_one(
+        {"campaign_id": campaign['id'], "creator_id": current_user['id']},
+        {"$set": response_doc},
+        upsert=True,
+    )
+
+    LABELS = {
+        "accepted": "accepted the revision request and will revise",
+        "scope_creep": "flagged the revision request as scope creep",
+        "partial_dispute": "partially accepted and disputed the remaining items",
+    }
+    label = LABELS.get(data.response, data.response)
     event_type = "revision_requested" if data.response == "accepted" else "dispute_raised"
-    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), event_type, f"Creator responded to revision: {data.response}.")
-    await insert_deal_system_message(campaign, f"Creator responded to revision request: {data.response}.")
-    return {"message": "Revision response submitted"}
+    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), event_type, f"Creator {label}.")
+    await insert_deal_system_message(campaign, f"Creator {label}.")
+
+    # Tell the brand — previously this was recorded silently and nothing happened.
+    if campaign.get('business_id'):
+        await notify_user(
+            campaign['business_id'],
+            "Creator responded to your revision request",
+            f"The creator {label}.",
+            link="/dashboard/business/all-campaigns",
+            ntype="warning" if data.response != "accepted" else "info",
+        )
+
+    # Pushing back on a revision must actually raise a dispute so the deal pauses
+    # and it lands in the admin queue — recording a row alone did nothing.
+    if data.response in ("scope_creep", "partial_dispute"):
+        reason = (data.note or "").strip() or f"Creator {label} on the latest revision request."
+        await create_issue_action(
+            deal_id, current_user, "raise_dispute", "Dispute raised", reason,
+            DealIssueSubmit(message=reason),
+        )
+
+    return {"message": "Revision response submitted", "response": data.response}
 
 @api_router.get("/deals/{deal_id}/chat")
 async def get_deal_chat(deal_id: str, current_user: dict = Depends(get_current_user)):
