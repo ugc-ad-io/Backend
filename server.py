@@ -1872,6 +1872,12 @@ def normalize_wallet_transaction(source: dict, default_type: str = "Wallet Recha
     elif tx_type in ["platform_fee", "listing_fee", "fee"]:
         tx_type = "Platform Fee"
         direction = "debit"
+    elif tx_type in ["revision_fee", "paid_revision"]:
+        tx_type = "Revision Fee"
+        direction = "debit"
+    elif tx_type in ["escrow_refund", "refund_escrow"]:
+        tx_type = "Escrow Refund"
+        direction = "credit"
     elif tx_type in ["refund", "wallet_refund"]:
         tx_type = "Refund"
         direction = "credit"
@@ -7372,7 +7378,12 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
         await db.wallet_ledger.insert_one({
             "id": str(uuid.uuid4()),
             "user_id": current_user['id'],
-            "type": "debit",
+            # `type` is the LABEL and `direction` is the sign — this row used to put the
+            # direction into `type` and omit `direction` entirely, so the wallet history
+            # printed a literal "debit" and, falling back to the credit default, showed the
+            # fee as +₹500 in green: a charge that looked like a top-up.
+            "type": "revision_fee",
+            "direction": "debit",
             "category": "revision_fee",
             "amount": fee,
             "campaign_id": work['campaign_id'],
