@@ -3828,6 +3828,15 @@ async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict 
         {"$set": update_fields}
     )
 
+    if was_approved:
+        # Stay live for brands, but let ops know there are edits to look at.
+        await notify_admins(
+            "Creator updated their profile",
+            f"{current_user.get('nickname') or 'A creator'} edited their approved profile — review the changes.",
+            link="/dashboard/admin/profiles",
+        )
+        return {"message": "Profile updated", "username": username or None}
+
     return {"message": "Profile submitted for review", "username": username or None}
 
 @api_router.patch("/profile/portfolio")
