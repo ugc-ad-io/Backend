@@ -201,6 +201,9 @@ class GoogleAuthRequest(BaseModel):
     credential: str                      # Google ID token (JWT) from GIS
     role: Optional[UserRole] = None      # used only when creating a new account
 
+class VerifyPasswordRequest(BaseModel):
+    password: str
+
 class ForgotPasswordRequest(BaseModel):
     email: str
 
@@ -9729,6 +9732,51 @@ async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Reques
                + (" (password set)" if password_set and not created else ""),
         request=request,
     )
+
+    # ---- Tell the person they've been made an admin (email + in-app) --------
+    # Fire-and-forget: a mail hiccup must never fail the role assignment.
+    try:
+        role_label = admin_caps.ROLE_LABELS.get(admin_role, admin_role)
+        frontend = (os.environ.get("FRONTEND_URL") or "https://www.ugcad.io").rstrip("/")
+        login_url = f"{frontend}/auth"
+
+        # For a custom admin, spell out exactly what they were granted.
+        feat_html = ""
+        if is_custom and custom_caps:
+            feat_html = (
+                "<p style='margin:18px 0 6px;font-size:13px;font-weight:700;color:#1f2340;'>Your access:</p>"
+                "<ul style='margin:0;padding-left:20px;color:#4a4f74;font-size:14px;line-height:1.7;'>"
+                + "".join(f"<li>{c.replace('_', ' ').capitalize()}</li>" for c in custom_caps)
+                + "</ul>"
+            )
+
+        if created:
+            subject = "You've been added as an admin on UGCad.io"
+            heading = "You're now an admin"
+            intro = (f"You've been added to the UGCad.io admin team as <strong>{role_label}</strong>. "
+                     "Sign in with this email address — your password was set by the founder who added you.")
+        else:
+            subject = "Your UGCad.io admin role was updated"
+            heading = "Your admin role changed"
+            intro = f"Your role on the UGCad.io admin team is now <strong>{role_label}</strong>."
+
+        content = f"""
+            <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">{heading}</h1>
+            <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">{intro}</p>
+            {feat_html}
+            <p style="margin:22px 0 0;">
+              <a href="{login_url}" style="display:inline-block;background:#5b6bff;color:#fff;text-decoration:none;font-weight:700;font-size:15px;padding:13px 28px;border-radius:10px;">Sign in to the admin panel</a>
+            </p>
+        """
+        await send_email(user["email"], subject, _email_base_template(subject, content))
+        await notify_user(
+            user["id"], subject,
+            f"You are now {role_label} on the UGCad.io admin team.",
+            link="/dashboard/admin", ntype="info",
+        )
+    except Exception as e:
+        logger.warning(f"[staff/role] admin notification failed: {e}")
+
     return {
         "success": True,
         "created": created,
