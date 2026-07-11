@@ -1988,6 +1988,24 @@ app.post('/api/shipment/update', auth, async (req, res) => {
         }
         d.shipment.updated_at = new Date();
         d.markModified('shipment');
+
+        // Move the DEAL itself along, not just its shipment sub-document. Every
+        // progress tracker (brand campaign detail, creator deal room, admin) keys
+        // off current_state, so writing only shipment.courier_status left the
+        // "Product Shipped" step stuck at "In progress" after the brand had
+        // entered a tracking number.
+        try {
+          const sm = require('./utils/dealStateMachine');
+          if (d.current_state === sm.STATES.AWAITING_SHIPMENT) {
+            sm.transition(d, sm.STATES.IN_TRANSIT, {
+              actor_type: 'brand',
+              actor_name: 'Brand',
+              event_type: 'shipped',
+              message: tracking_number ? `Brand uploaded tracking ID: ${tracking_number}` : 'Brand marked the product shipped.',
+            });
+          }
+        } catch (e) { console.error('[shipment/update] state transition failed:', e.message); }
+
         await d.save();
       }
     }
