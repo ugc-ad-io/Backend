@@ -149,6 +149,31 @@ userSchema.methods.toPublic = function () {
   };
 };
 
+// Keys inside the free-form `profile` blob that are PRIVATE to the user (and to
+// admins). `profile` is stored verbatim from the onboarding form, so toPublic()
+// spreading it wholesale would hand a creator's contact details — and their
+// bank/UPI info, which /profile/payment-info writes to profile.payment_info —
+// to any logged-in brand. Strip them for everyone else.
+const PRIVATE_PROFILE_KEYS = [
+  'payment_info', 'bank', 'bank_details', 'account_number', 'ifsc', 'upi', 'upi_id',
+  'phone', 'phone_number', 'mobile', 'whatsapp', 'dialCode', 'dial_code',
+  'address', 'pincode', 'pin_code', 'postal_code',
+  'email', 'full_name', 'fullName',
+  'aadhaar', 'aadhar', 'pan', 'gstin', 'id_proof',
+  'date_of_birth', 'dob',
+];
+
+// Projection for a viewer who is neither the user nor an admin — e.g. a brand
+// looking at a creator. Same shape as toPublic(), minus contact + payment PII.
+userSchema.methods.toRedacted = function () {
+  const pub = this.toPublic();
+  const profile = { ...(pub.profile || {}) };
+  PRIVATE_PROFILE_KEYS.forEach((k) => delete profile[k]);
+  delete pub.email;
+  delete pub.full_name;
+  return { ...pub, profile };
+};
+
 // Self projection (adds wallet + settings + chat policy snapshot)
 userSchema.methods.toSelf = function () {
   return {

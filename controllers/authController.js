@@ -284,7 +284,14 @@ exports.publicProfile = async (req, res, next) => {
   try {
     const user = await User.findById(req.params.userId);
     if (!user) return fail(res, 404, 'User not found');
-    res.json(user.toPublic());
+    // Contact + payment details are only ever returned to the user themselves
+    // or to an admin. Everyone else (e.g. a brand viewing a creator) gets the
+    // redacted projection — otherwise this endpoint hands out phone numbers,
+    // home addresses and bank details to any logged-in account.
+    const viewer = req.user || {};
+    const isSelf = String(viewer.id) === String(user._id);
+    const isAdmin = viewer.role === 'admin';
+    res.json(isSelf || isAdmin ? user.toPublic() : user.toRedacted());
   } catch (err) {
     next(err);
   }

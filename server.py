@@ -3782,12 +3782,21 @@ async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict 
         if not ok:
             raise HTTPException(status_code=400, detail=error)
 
+    now_str = datetime.now(timezone.utc).isoformat()
+    was_approved = current_user.get("approval_status") == ApprovalStatus.APPROVED
     update_fields = {
         "profile": profile_data,
         "profile_completed": True,
-        "approval_status": ApprovalStatus.PENDING,
-        "updated_at": datetime.now(timezone.utc).isoformat()
+        "updated_at": now_str,
     }
+    if was_approved:
+        # An already-approved creator editing their profile (details, new work) must NOT
+        # be knocked back to PENDING — that silently de-lists them from the brand
+        # directory. Keep them approved/discoverable and flag the edit for re-review.
+        update_fields["profile_review_status"] = "pending_review"
+        update_fields["profile_updated_at"] = now_str
+    else:
+        update_fields["approval_status"] = ApprovalStatus.PENDING
 
     # Mirror the portfolio to the top-level field so the Portfolio page (and the
     # creator directory) can read it — these read `user.portfolio`, while the
