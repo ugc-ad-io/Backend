@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Deal = require('../models/Deal');
 const sm = require('../utils/dealStateMachine');
 const { STATES: S } = sm;
@@ -12,9 +13,21 @@ function displayName(user) {
 /**
  * Load a deal by its human deal_id and authorise the caller. Returns
  * { deal, viewerParty } or sends an error response and returns null.
+ *
+ * The :dealId in the URL is also accepted as a CAMPAIGN id. The brand's Work
+ * Review page lists campaigns (it reads campaign.work_submission) and posts the
+ * campaign's id to these deal endpoints — which 404'd with "Deal not found",
+ * because a deal_id looks like "UGC-1234567-2", never an ObjectId. Resolving the
+ * campaign to its deal here fixes approve / request-revision from that page
+ * without every caller having to know which id it is holding.
  */
 async function loadDealForUser(req, res) {
-  const deal = await Deal.findOne({ deal_id: req.params.dealId });
+  const key = String(req.params.dealId || '');
+  let deal = await Deal.findOne({ deal_id: key });
+  if (!deal && mongoose.Types.ObjectId.isValid(key)) {
+    // Newest first: a campaign that was re-run would otherwise resolve to a stale deal.
+    deal = await Deal.findOne({ campaign_id: key }).sort({ createdAt: -1 });
+  }
   if (!deal) {
     fail(res, 404, 'Deal not found');
     return null;
@@ -44,6 +57,33 @@ function actorFrom(req, viewerParty) {
 // Auto-notification in chat for state changes (6.7).
 function systemChat(deal, message) {
   deal.messages.push({ sender_type: 'system', sender_name: 'System', message, created_at: new Date() });
+}
+
+/**
+ * Mirror a content decision onto the campaign's work_submission.
+ *
+ * Two parallel records track the same piece of work: Deal.content.versions (the
+ * deal state machine) and Campaign.work_submission (what the brand's Work Review
+ * list and the creator's dashboard actually read). server.js already syncs
+ * campaign -> deal; without this, a decision taken through a /api/deals endpoint
+ * left the campaign stale, so the creator was never told a revision was wanted.
+ * Best-effort: a bookkeeping miss must not fail the brand's action.
+ */
+async function syncCampaignWork(deal, { workStatus, campaignStatus, feedback, requestedChanges }) {
+  try {
+    if (!deal.campaign_id) return;
+    const Campaign = require('../models/Campaign');
+    const c = await Campaign.findById(deal.campaign_id);
+    if (!c || !c.work_submission) return;
+    c.work_submission.status = workStatus;
+    if (feedback !== undefined) c.work_submission.feedback = feedback;
+    if (requestedChanges !== undefined) c.work_submission.requested_changes = requestedChanges;
+    c.markModified('work_submission');
+    if (campaignStatus) c.status = campaignStatus;
+    await c.save();
+  } catch (e) {
+    console.error('[deals] could not sync campaign work_submission:', e.message);
+  }
 }
 
 // --- Reads ------------------------------------------------------------------
@@ -185,6 +225,7 @@ exports.approve = async (req, res, next) => {
     if (!watermarkFailed) systemChat(deal, `Payment released. Deal complete.`);
 
     await deal.save();
+    await syncCampaignWork(deal, { workStatus: 'approved', campaignStatus: 'completed' });
     res.json(sm.serializeDeal(deal, viewerParty));
   } catch (err) {
     next(err);
@@ -225,6 +266,14 @@ exports.requestRevision = async (req, res, next) => {
     systemChat(deal, `Brand requested revision (${deal.revision.revision_count_used} of ${limit} used).`);
 
     await deal.save();
+    // Put the feedback where the creator will actually see it (their dashboard
+    // and Work Review both read the campaign's work_submission, not the deal).
+    await syncCampaignWork(deal, {
+      workStatus: 'revision_requested',
+      campaignStatus: 'in_progress',
+      feedback,
+      requestedChanges: deal.revision.requested_changes,
+    });
     res.json(sm.serializeDeal(deal, viewerParty));
   } catch (err) {
     next(err);
