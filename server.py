@@ -1205,9 +1205,15 @@ async def notify_user(user_id: str, title: str, message: str, link: Optional[str
             addr = (u or {}).get("email")
             if addr:
                 html = _notification_email_html(title, message, link, (u.get("full_name") or u.get("nickname")))
-                await send_email(addr, title, html, message)
-        except Exception:
-            pass
+                res = await send_email(addr, title, html, message)
+                # Never let a dropped email be invisible. A bare `except: pass` here is how
+                # "emails aren't coming" stayed unnoticed while prod had no RESEND_API_KEY.
+                if isinstance(res, dict) and (res.get("skipped") or res.get("error")):
+                    logger.error(f"[email] NOT delivered to {addr} ('{title}'): {res}")
+            else:
+                logger.warning(f"[email] user {user_id} has no email on file — '{title}' not sent")
+        except Exception as e:
+            logger.exception(f"[email] failed sending '{title}' to user {user_id}: {e}")
 
 async def enforce_suspension(user: dict):
     """Block login for a suspended account, or auto-lift the suspension once its
@@ -11391,6 +11397,45 @@ async def get_platform_settings() -> dict:
     _PLATFORM_SETTINGS_CACHE.clear()
     _PLATFORM_SETTINGS_CACHE.update(merged)
     return merged
+
+
+@api_router.get("/admin/email/health")
+async def admin_email_health(current_user: dict = Depends(require_cap("edit_settings"))):
+    """Is transactional email actually configured ON THIS SERVER? Without this the only
+    symptom of a missing RESEND_API_KEY is silence — the send is skipped and nothing
+    surfaces. Reports config (never the key itself) plus the quiet-hours window."""
+    key = os.environ.get("RESEND_API_KEY", "")
+    return {
+        "configured": bool(key),
+        "key_hint": (key[:6] + "…") if key else None,
+        "from": os.environ.get("EMAIL_FROM", "UGCad.io <onboarding@resend.dev>"),
+        "reply_to": os.environ.get("EMAIL_REPLY_TO") or None,
+        "frontend_url": os.environ.get("FRONTEND_URL") or None,
+        "in_quiet_hours": _in_quiet_hours(),
+        "note": ("Email is DISABLED — RESEND_API_KEY is not set on this server, so every send is "
+                 "silently skipped. Add it to the environment and redeploy."
+                 if not key else "Email is configured."),
+    }
+
+
+@api_router.post("/admin/email/test")
+async def admin_email_test(data: Dict[str, Any] = Body(...),
+                           current_user: dict = Depends(require_cap("edit_settings"))):
+    """Send a real test email and return exactly what the provider said, so a failure is
+    diagnosable from the admin UI instead of guessing."""
+    to = (data.get("to") or current_user.get("email") or "").strip()
+    if not to:
+        raise HTTPException(status_code=400, detail="Provide a 'to' address")
+    result = await send_email(
+        to, "UGCad.io — test email",
+        _email_base_template("Test email", "<p>If you're reading this, transactional email works.</p>"),
+        "If you're reading this, transactional email works.",
+    )
+    if result.get("skipped"):
+        raise HTTPException(status_code=503, detail="RESEND_API_KEY is not set on this server — email is disabled.")
+    if result.get("error"):
+        raise HTTPException(status_code=502, detail=f"Provider rejected the send: {result['error']}")
+    return {"sent": True, "to": to, "provider_id": result.get("id")}
 
 
 @api_router.get("/admin/settings")
