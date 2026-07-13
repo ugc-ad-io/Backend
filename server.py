@@ -2625,6 +2625,11 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
         "assigned_categories": user.get('assigned_categories', []),
         "profile_completed": user.get('profile_completed', False),
         "approval_status": user.get('approval_status', ApprovalStatus.PENDING),
+        # The admin's "we need more info" message + checklist. Without it the
+        # more-info screen renders an empty box right after login (it only filled in
+        # later, once /auth/me happened to refresh the user).
+        "review": user.get('review', {}),
+        "approval_reason": user.get('approval_reason', ''),
         "profile_photo": user.get('profile_photo')
     }
 
@@ -2736,6 +2741,9 @@ async def google_auth(data: GoogleAuthRequest):
         "assigned_categories": user.get("assigned_categories", []),
         "profile_completed": user.get("profile_completed", False),
         "approval_status": user.get("approval_status", ApprovalStatus.PENDING),
+        # Same as /auth/login — the more-info gate needs the admin's request.
+        "review": user.get("review", {}),
+        "approval_reason": user.get("approval_reason", ""),
         "profile_photo": user.get("profile_photo"),
     }
 
@@ -2756,6 +2764,10 @@ def _auth_response(user: dict) -> dict:
         "assigned_categories": user.get("assigned_categories", []),
         "profile_completed": user.get("profile_completed", False),
         "approval_status": user.get("approval_status", ApprovalStatus.PENDING),
+        # Keep in step with /auth/login — the more-info gate reads review.* to tell
+        # the user what the admin actually asked for.
+        "review": user.get("review", {}),
+        "approval_reason": user.get("approval_reason", ""),
         "profile_photo": user.get("profile_photo"),
     }
 

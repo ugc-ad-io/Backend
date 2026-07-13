@@ -295,72 +295,22 @@ app.get('/api/admin/analytics', adminAuth, async (req, res) => {
 // ============================================================
 const agoH = (h) => new Date(Date.now() - h * 3600000).toISOString();
 const DEMO = {
-  withdrawals: [
-    { id: 'wd_1001', user_id: 'cr_swift', creator_nickname: 'SwiftFox', amount: 3500, status: 'pending', payment_method: 'UPI · aanya@okhdfc', requested_at: agoH(40) },
-    { id: 'wd_1002', user_id: 'cr_pixel', creator_nickname: 'Pixel Priya', amount: 12000, status: 'pending', payment_method: 'Bank · HDFC ****7890', requested_at: agoH(20) },
-    { id: 'wd_1003', user_id: 'cr_vikram', creator_nickname: 'Vlog Vikram', amount: 6800, status: 'approved', payment_method: 'UPI · vikram@okaxis', requested_at: agoH(120) },
-    { id: 'wd_1004', user_id: 'cr_freya', creator_nickname: 'Freya', amount: 2100, status: 'rejected', payment_method: 'Bank · ICICI ****5566', requested_at: agoH(72) }
-  ],
-  assignments: [
-    { manager_id: 'mgr_asha', manager_nickname: 'Ops · Asha', manager_email: 'asha@ugcad.io', campaign_count: 2, campaigns: [{ id: 'c1', title: 'Summer Glow Skincare UGC', status: 'active' }, { id: 'c2', title: 'Bolt Buds Pro Launch', status: 'in_progress' }] },
-    { manager_id: 'mgr_dev', manager_nickname: 'Ops · Dev', manager_email: 'dev@ugcad.io', campaign_count: 1, campaigns: [{ id: 'c4', title: 'Urban Thread Winter Haul', status: 'completed' }] }
-  ],
-  chats: [
-    { id: 'th_freya',
-      user1: { id: 'cr_freya', role: 'creator', nickname: 'Freya', username: 'freyas' },
-      user2: { id: 'br_glow', role: 'business', nickname: 'Glow Beauty', username: 'glowbeauty' },
-      last_message: 'lets move this to wa', last_message_at: agoH(20),
-      has_violations: true, violation_count: 2, report_count: 1, reported: true, on_strike_watch: true,
-      messages: [
-        { message: 'hey loved your product!', sender_nickname: 'Freya', sender_username: 'freyas', timestamp: agoH(73), filtered: false, reported: false },
-        { message: 'you can reach me at 98xxxxxxxx', sender_nickname: 'Freya', sender_username: 'freyas', timestamp: agoH(72), filtered: true, reported: true },
-        { message: 'lets move this to wa', sender_nickname: 'Freya', sender_username: 'freyas', timestamp: agoH(20), filtered: true, reported: false }
-      ] },
-    { id: 'th_rahul',
-      user1: { id: 'cr_rahul', role: 'creator', nickname: 'Reel Rahul', username: 'reelrahul' },
-      user2: { id: 'br_bolt', role: 'business', nickname: 'Bolt Audio', username: 'boltaudio' },
-      last_message: 'sounds good, thanks!', last_message_at: agoH(8),
-      has_violations: false, violation_count: 0, report_count: 1, reported: true, on_strike_watch: false,
-      messages: [
-        { message: 'can we do a quick call?', sender_nickname: 'Reel Rahul', sender_username: 'reelrahul', timestamp: agoH(9), filtered: false, reported: true },
-        { message: 'sounds good, thanks!', sender_nickname: 'Reel Rahul', sender_username: 'reelrahul', timestamp: agoH(8), filtered: false, reported: false }
-      ] },
-    { id: 'th_priya',
-      user1: { id: 'cr_priya', role: 'creator', nickname: 'Pixel Priya', username: 'pixelpriya' },
-      user2: { id: 'br_urban', role: 'business', nickname: 'Urban Thread', username: 'urbanthread' },
-      last_message: 'email me at priya@gmail.com', last_message_at: agoH(30),
-      has_violations: true, violation_count: 1, report_count: 0, reported: false, on_strike_watch: false,
-      messages: [
-        { message: 'loved the brief, starting now', sender_nickname: 'Pixel Priya', sender_username: 'pixelpriya', timestamp: agoH(31), filtered: false, reported: false },
-        { message: 'email me at priya@gmail.com', sender_nickname: 'Pixel Priya', sender_username: 'pixelpriya', timestamp: agoH(30), filtered: true, reported: false }
-      ] }
-  ],
+  // Emptied on request — these admin pages used to be seeded with fake records
+  // (SwiftFox/Pixel Priya withdrawals, Freya/Glow Beauty flagged chats, demo
+  // transactions). They now render real empty states. The gateway lists below
+  // are integration config, not records, so they stay.
+  withdrawals: [],
+  assignments: [],
+  chats: [],
+  paymentTransactions: [],
+  notificationLogs: [],
+  payouts: [],
+  filterRules: [],
   paymentGateways: [
     { id: 'gw_razorpay', name: 'Razorpay', enabled: true }, { id: 'gw_cashfree', name: 'Cashfree', enabled: true }, { id: 'gw_stripe', name: 'Stripe', enabled: false }
   ],
-  paymentTransactions: [
-    { id: 'txn_9001', amount: 9000, status: 'success', gateway: 'Razorpay', user: 'Glow Beauty', created_at: agoH(30) },
-    { id: 'txn_9002', amount: 15000, status: 'success', gateway: 'Cashfree', user: 'Bolt Audio', created_at: agoH(54) },
-    { id: 'txn_9003', amount: 4000, status: 'pending', gateway: 'Razorpay', user: 'Urban Thread', created_at: agoH(6) },
-    { id: 'txn_9004', amount: 6000, status: 'failed', gateway: 'Stripe', user: 'Fresh Roots', created_at: agoH(12) }
-  ],
   notificationGateways: [
     { id: 'msg91', name: 'MSG91', channel: 'sms', enabled: true }, { id: 'gupshup', name: 'Gupshup', channel: 'whatsapp', enabled: true }, { id: 'ses', name: 'Amazon SES', channel: 'email', enabled: true }
-  ],
-  notificationLogs: [
-    { id: 'nl_1', channel: 'email', status: 'delivered', recipient: 'aanya@demo.ugcad.io', template: 'payout_released', sent_at: agoH(20) },
-    { id: 'nl_2', channel: 'whatsapp', status: 'delivered', recipient: '+91 99300 22222', template: 'deal_update', sent_at: agoH(8) },
-    { id: 'nl_3', channel: 'sms', status: 'failed', recipient: '+91 99300 44444', template: 'otp', sent_at: agoH(2) }
-  ],
-  payouts: [
-    { id: 'po_1', creator_nickname: 'SwiftFox', amount: 7200, status: 'queued', scheduled_at: agoH(-48), deal_id: 'DEMO-0005' },
-    { id: 'po_2', creator_nickname: 'Pixel Priya', amount: 9600, status: 'on_hold', scheduled_at: agoH(-24), deal_id: 'DEMO-0008' },
-    { id: 'po_3', creator_nickname: 'Vlog Vikram', amount: 11200, status: 'released', scheduled_at: agoH(72), deal_id: 'DEMO-0003' }
-  ],
-  filterRules: [
-    { id: 'fr_1', pattern: '\\b\\d{10}\\b', label: 'Phone number', category: 'contact_info', enabled: true, hits: 42 },
-    { id: 'fr_2', pattern: 'whats ?app', label: 'WhatsApp mention', category: 'evasion', enabled: true, hits: 18 },
-    { id: 'fr_3', pattern: '@\\w+\\.(com|in)', label: 'Email address', category: 'contact_info', enabled: true, hits: 9 }
   ]
 };
 
@@ -377,7 +327,13 @@ app.get('/api/admin/pending-profiles', adminAuth, requireCap('review_application
     // All completed applications across every state (pending / more_info /
     // approved / rejected) so the admin list can filter by State. Incomplete
     // accounts (no submitted data) are still excluded. Oldest first.
-    let users = await User.find({ profile_completed: true, ...userScopeFilter(req.user) })
+    // Only creators and brands are ever reviewed — an admin account has no
+    // application to approve, and listing one made the admin review itself.
+    let users = await User.find({
+      role: { $in: ['creator', 'business'] },
+      profile_completed: true,
+      ...userScopeFilter(req.user),
+    })
       .sort({ submitted_at: 1, createdAt: 1 })
       .lean();
     // Work distribution: Ops (Regular) only see applications in their assigned
