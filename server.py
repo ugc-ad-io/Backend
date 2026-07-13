@@ -2630,6 +2630,9 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
         # later, once /auth/me happened to refresh the user).
         "review": user.get('review', {}),
         "approval_reason": user.get('approval_reason', ''),
+        # The saved profile, so the setup forms can prefill what's already on file
+        # instead of making the user retype it all on a resubmit.
+        "profile": user.get('profile', {}),
         "profile_photo": user.get('profile_photo')
     }
 
@@ -2741,9 +2744,11 @@ async def google_auth(data: GoogleAuthRequest):
         "assigned_categories": user.get("assigned_categories", []),
         "profile_completed": user.get("profile_completed", False),
         "approval_status": user.get("approval_status", ApprovalStatus.PENDING),
-        # Same as /auth/login — the more-info gate needs the admin's request.
+        # Same as /auth/login — the more-info gate needs the admin's request, and the
+        # setup forms prefill from profile.
         "review": user.get("review", {}),
         "approval_reason": user.get("approval_reason", ""),
+        "profile": user.get("profile", {}),
         "profile_photo": user.get("profile_photo"),
     }
 
@@ -2765,9 +2770,11 @@ def _auth_response(user: dict) -> dict:
         "profile_completed": user.get("profile_completed", False),
         "approval_status": user.get("approval_status", ApprovalStatus.PENDING),
         # Keep in step with /auth/login — the more-info gate reads review.* to tell
-        # the user what the admin actually asked for.
+        # the user what the admin actually asked for, and the setup forms prefill
+        # from profile.
         "review": user.get("review", {}),
         "approval_reason": user.get("approval_reason", ""),
+        "profile": user.get("profile", {}),
         "profile_photo": user.get("profile_photo"),
     }
 
