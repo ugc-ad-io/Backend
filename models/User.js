@@ -16,6 +16,12 @@ const strikeSchema = new mongoose.Schema(
 
 const userSchema = new mongoose.Schema(
   {
+    // The Python backend (which runs in production) looks users up by `id`, NOT `_id`.
+    // Mongoose only writes `_id`, so any account created through this Node service was
+    // born without an `id` and blew up Python with KeyError: 'id' (e.g. forgot-password
+    // 500'd, so the reset email was never sent). Persisted by the pre-save hook below as
+    // str(_id) — the same convention scripts/backfill_ids.py uses.
+    id: { type: String, index: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     // Password is required for local (email/password) accounts only. Google
     // accounts authenticate via `google_id` and never have a password.
@@ -107,6 +113,12 @@ const userSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+// Keep `id` in lockstep with `_id` so Python (which queries by `id`) can find the user.
+userSchema.pre('save', function (next) {
+  if (!this.id) this.id = this._id.toString();
+  next();
+});
 
 userSchema.pre('save', async function (next) {
   if (!this.isModified('password')) return next();
