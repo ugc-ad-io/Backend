@@ -748,10 +748,17 @@ app.post('/api/admin/user/level', adminAuth, requireCap('user_management'), asyn
     const u = await User.findById(user_id);
     if (!u) return res.status(404).json({ detail: 'User not found' });
     const before = u.level || 1;
-    u.level = Math.max(1, before + (direction === 'demote' ? -1 : 1));
+    // Clamp to the ladder — promoting past 'elite' used to keep incrementing a
+    // number no UI could render.
+    u.level = Math.min(User.MAX_LEVEL, Math.max(1, before + (direction === 'demote' ? -1 : 1)));
+    if (u.level === before) {
+      return res.status(400).json({
+        detail: direction === 'demote' ? 'Already at the lowest level (New).' : 'Already at the highest level (Elite).',
+      });
+    }
     await u.save();
     await writeAdminLog(req, { action: `user.${direction === 'demote' ? 'demote' : 'promote'}`, module: 'users', target_type: 'user', target_id: String(user_id), before: { level: before }, after: { level: u.level } });
-    res.json({ success: true, level: u.level });
+    res.json({ success: true, level: u.level, level_key: User.levelKeyOf(u.level), level_label: User.LEVEL_LABELS[User.levelKeyOf(u.level)] });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 

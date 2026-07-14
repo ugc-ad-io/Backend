@@ -2,6 +2,15 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const { MIN_CHAT_BALANCE } = require('../utils/chatPolicy');
 
+// Creator level ladder. The DB stores a NUMBER (1..5) because promote/demote is
+// just +1/-1, but every UI works in tier keys ('new', 'verified', …). Promoting
+// used to look broken because toPublic() never sent the level, and the client
+// then tried to read the number as a key. Both projections now carry all three.
+const LEVEL_KEYS = ['new', 'verified', 'l1', 'l2', 'elite'];
+const LEVEL_LABELS = { new: 'New', verified: 'Verified', l1: 'L1', l2: 'L2', elite: 'Elite' };
+const MAX_LEVEL = LEVEL_KEYS.length;
+const levelKeyOf = (n) => LEVEL_KEYS[Math.min(MAX_LEVEL, Math.max(1, Number(n) || 1)) - 1];
+
 const strikeSchema = new mongoose.Schema(
   {
     at: { type: Date, default: Date.now },
@@ -153,6 +162,10 @@ userSchema.methods.toPublic = function () {
     assigned_categories: this.assigned_categories || [],
     username: this.username,
     public_creator_id: this.public_creator_id,
+    // Creator level — number for the ladder, key + label for the UI.
+    level: this.level || 1,
+    level_key: levelKeyOf(this.level),
+    level_label: LEVEL_LABELS[levelKeyOf(this.level)],
     profile: this.profile || {},
     portfolio: this.portfolio || [],
     review: this.review || {},
@@ -196,4 +209,11 @@ userSchema.methods.toSelf = function () {
   };
 };
 
-module.exports = mongoose.model('User', userSchema);
+const User = mongoose.model('User', userSchema);
+
+User.LEVEL_KEYS = LEVEL_KEYS;
+User.LEVEL_LABELS = LEVEL_LABELS;
+User.MAX_LEVEL = MAX_LEVEL;
+User.levelKeyOf = levelKeyOf;
+
+module.exports = User;
