@@ -75,7 +75,14 @@ app.get('/api/campaigns', auth, async (req, res) => {
     // A creator's own campaigns = those they were selected for. Without this the
     // creator_id query param was ignored, so e.g. "completed deals" counted every
     // completed campaign on the platform, not just this creator's.
-    if (req.query.creator_id) filter.selected_creator = req.query.creator_id;
+    // Match the array (a brief can hire several creators) OR the legacy single
+    // field, so campaigns selected before the multi-creator change still show up.
+    if (req.query.creator_id) {
+      filter.$or = [
+        { selected_creators: String(req.query.creator_id) },
+        { selected_creator: String(req.query.creator_id) },
+      ];
+    }
     const campaigns = await Campaign.find(filter).lean();
     res.json(campaigns.map(c => ({ ...c, id: c._id })));
   } catch (e) { res.status(500).json({ detail: e.message }); }
@@ -1721,6 +1728,19 @@ app.post('/api/campaigns/:id/select-creator', auth, async (req, res) => {
       return res.json({ success: true, creator_nickname: creatorLabel, amount, already_selected: true });
     }
 
+    // A brief hires `creators_wanted` creators. Check the slot BEFORE touching the
+    // wallet — otherwise a full brief would debit and then refuse.
+    const already = (c.selected_creators || []).map(String);
+    const wanted = Math.max(1, Number(c.creators_wanted) || 1);
+    if (already.length >= wanted) {
+      return res.status(400).json({
+        detail: `This brief already has all ${wanted} creator${wanted === 1 ? '' : 's'} it asked for.`,
+        code: 'SLOTS_FULL',
+        selected: already.length,
+        wanted,
+      });
+    }
+
     const pricing = require('./services/pricing');
     const feePercent = await pricing.platformFeePercent();
     const fee = Math.round(amount * (feePercent / 100));
@@ -1747,17 +1767,23 @@ app.post('/api/campaigns/:id/select-creator', auth, async (req, res) => {
 
     // Money is out of the wallet — from here, any failure must put it back.
     try {
-      c.selected_creator = creatorId;
-      c.status = 'in_progress';
+      // Append — assigning selected_creator used to overwrite the previous pick,
+      // so a brief could only ever end up with one creator no matter how many
+      // bids the brand accepted (and the earlier creator's escrow was orphaned).
+      c.selected_creators = [...already, String(creatorId)];
+      c.selected_creator = c.selected_creators[0];   // legacy single-creator reads
+      // Stay open while there are slots left; only close once the brief is full.
+      c.status = c.selected_creators.length >= wanted ? 'in_progress' : 'active';
       if (bid) bid.status = 'selected';
-      c.escrow_amount = amount;
+      c.escrow_amount = (Number(c.escrow_amount) || 0) + amount;
       // platform_fee / amount_paid / paid_at aren't declared on the schema (Campaign
       // is strict:false). Mongoose only builds setters for declared paths, so a plain
       // `c.platform_fee = fee` is silently dropped on save — .set() is what persists
       // an undeclared path.
-      c.set('platform_fee', fee);
+      // These are running totals across every creator hired on this brief.
+      c.set('platform_fee', (Number(c.get('platform_fee')) || 0) + fee);
       c.set('fee_percent', feePercent);
-      c.set('amount_paid', total);
+      c.set('amount_paid', (Number(c.get('amount_paid')) || 0) + total);
       c.set('paid_at', new Date());
       c.markModified('bids');
       await c.save();
@@ -1775,6 +1801,11 @@ app.post('/api/campaigns/:id/select-creator', auth, async (req, res) => {
       fee_percent: feePercent,
       amount_charged: total,
       wallet_balance: brand.wallet_balance,
+      selected_creators: c.selected_creators,
+      selected_count: c.selected_creators.length,
+      creators_wanted: wanted,
+      slots_left: Math.max(0, wanted - c.selected_creators.length),
+      status: c.status,
     });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
@@ -2273,9 +2304,162 @@ app.post('/api/admin/escrow/:id/:action', adminAuth, requireCap('release_payouts
 app.post('/api/admin/payouts/:id/hold', adminAuth, requireCap('release_payouts'), (req, res) => res.json({ success: true }));
 app.post('/api/admin/payouts/:id/release', adminAuth, requireCap('release_payouts'), (req, res) => res.json({ success: true }));
 
+// ---- Creator KYC (Aadhaar + PAN) ----------------------------------------
+// Money only leaves the platform to an identity we have checked, so a creator
+// must be kyc.status === 'verified' before /withdrawal/request will take.
+//
+// Format checks only prove the number is well-formed, not that it belongs to
+// this person — that is what the uploaded documents and the admin review are
+// for. Never auto-verify on a regex pass.
+const PAN_RE = /^[A-Z]{5}[0-9]{4}[A-Z]$/;              // e.g. ABCDE1234F
+const AADHAAR_RE = /^[2-9][0-9]{11}$/;                 // 12 digits, never starts 0/1
+
+// Aadhaar's Verhoeff check digit — catches typos and made-up numbers that would
+// otherwise sail through a length check.
+const VERHOEFF_D = [
+  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], [1, 2, 3, 4, 0, 6, 7, 8, 9, 5], [2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
+  [3, 4, 0, 1, 2, 8, 9, 5, 6, 7], [4, 0, 1, 2, 3, 9, 5, 6, 7, 8], [5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
+  [6, 5, 9, 8, 7, 1, 0, 4, 3, 2], [7, 6, 5, 9, 8, 2, 1, 0, 4, 3], [8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
+  [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+];
+const VERHOEFF_P = [
+  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], [1, 5, 7, 6, 2, 8, 3, 0, 9, 4], [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
+  [8, 9, 1, 6, 0, 4, 3, 5, 2, 7], [9, 4, 5, 3, 1, 2, 6, 8, 7, 0], [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
+  [2, 7, 9, 3, 8, 0, 6, 4, 1, 5], [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
+];
+function aadhaarChecksumOk(num) {
+  let c = 0;
+  String(num).split('').reverse().forEach((d, i) => { c = VERHOEFF_D[c][VERHOEFF_P[i % 8][Number(d)]]; });
+  return c === 0;
+}
+
+app.get('/api/kyc/me', auth, async (req, res) => {
+  try {
+    const u = await User.findById(req.user.id);
+    if (!u) return res.status(404).json({ detail: 'User not found' });
+    res.json(u.toSelf().kyc);
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+app.post('/api/kyc/submit', auth, async (req, res) => {
+  try {
+    if (req.user.role !== 'creator') return res.status(403).json({ detail: 'Only creators submit KYC' });
+    const u = await User.findById(req.user.id);
+    if (!u) return res.status(404).json({ detail: 'User not found' });
+    if (u.kyc && u.kyc.status === 'verified') {
+      return res.status(409).json({ detail: 'Your KYC is already verified.' });
+    }
+    if (u.kyc && u.kyc.status === 'pending') {
+      return res.status(409).json({ detail: 'Your KYC is already under review.' });
+    }
+
+    const name_on_pan = String(req.body.name_on_pan || '').trim();
+    const pan = String(req.body.pan_number || '').toUpperCase().replace(/\s/g, '');
+    const aadhaar = String(req.body.aadhaar_number || '').replace(/\D/g, '');
+    const { pan_doc_url, aadhaar_front_url, aadhaar_back_url } = req.body;
+
+    if (!name_on_pan) return res.status(400).json({ detail: 'Enter your name exactly as printed on your PAN card.' });
+    if (!PAN_RE.test(pan)) return res.status(400).json({ detail: 'That PAN does not look right. It should be 10 characters, like ABCDE1234F.' });
+    if (!AADHAAR_RE.test(aadhaar) || !aadhaarChecksumOk(aadhaar)) {
+      return res.status(400).json({ detail: 'That Aadhaar number is not valid. Check the 12 digits and try again.' });
+    }
+    if (!pan_doc_url) return res.status(400).json({ detail: 'Upload a photo of your PAN card.' });
+    if (!aadhaar_front_url || !aadhaar_back_url) {
+      return res.status(400).json({ detail: 'Upload both the front and the back of your Aadhaar card.' });
+    }
+
+    // The same PAN cannot back two payout accounts — that is the usual shape of
+    // a duplicate-account payout fraud.
+    const clash = await User.findOne({ 'kyc.pan_number': pan, _id: { $ne: u._id }, 'kyc.status': { $in: ['pending', 'verified'] } }).select('_id').lean();
+    if (clash) return res.status(409).json({ detail: 'This PAN is already linked to another account.' });
+
+    u.kyc = {
+      status: 'pending',
+      name_on_pan,
+      pan_number: pan,
+      pan_doc_url,
+      aadhaar_number: aadhaar,
+      aadhaar_front_url,
+      aadhaar_back_url,
+      submitted_at: new Date(),
+      reviewed_at: null,
+      reviewed_by: '',
+      rejection_reason: '',
+    };
+    u.markModified('kyc');
+    await u.save();
+    res.status(201).json(u.toSelf().kyc);
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+// Admin review queue. Returns the FULL numbers + document URLs — the reviewer
+// has to compare the typed number against the uploaded card.
+app.get('/api/admin/kyc', adminAuth, requireCap('review_applications'), async (req, res) => {
+  try {
+    const status = req.query.status || 'pending';
+    const q = status === 'all' ? { 'kyc.status': { $ne: 'not_submitted' } } : { 'kyc.status': status };
+    const users = await User.find({ role: 'creator', ...q }).select('nickname username email kyc profile').lean();
+    res.json(users.map((u) => ({
+      id: u._id,
+      nickname: u.nickname || (u.profile && u.profile.fullName) || '',
+      username: u.username,
+      email: u.email,
+      kyc: u.kyc || { status: 'not_submitted' },
+    })));
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+app.post('/api/admin/kyc/:userId/review', adminAuth, requireCap('review_applications'), async (req, res) => {
+  try {
+    const { action, reason } = req.body || {};
+    if (!['approve', 'reject'].includes(action)) return res.status(400).json({ detail: 'action must be approve or reject' });
+    if (action === 'reject' && !String(reason || '').trim()) {
+      return res.status(400).json({ detail: 'A rejection needs a reason — the creator has to know what to fix.' });
+    }
+    const u = await User.findById(req.params.userId);
+    if (!u) return res.status(404).json({ detail: 'Creator not found' });
+    if (!u.kyc || u.kyc.status === 'not_submitted') return res.status(409).json({ detail: 'This creator has not submitted KYC.' });
+
+    u.kyc.status = action === 'approve' ? 'verified' : 'rejected';
+    u.kyc.reviewed_at = new Date();
+    u.kyc.reviewed_by = String(req.user.id);
+    u.kyc.rejection_reason = action === 'reject' ? String(reason).trim() : '';
+    u.markModified('kyc');
+    await u.save();
+
+    await writeAdminLog(req, {
+      action: action === 'approve' ? 'kyc.verified' : 'kyc.rejected',
+      module: 'users', target_type: 'user', target_id: String(u._id), reason_text: u.kyc.rejection_reason,
+    });
+    notifyUser(u._id, action === 'approve' ? 'kyc_verified' : 'kyc_rejected',
+      action === 'approve' ? 'KYC verified' : 'KYC not approved',
+      action === 'approve'
+        ? 'Your identity is verified — you can now withdraw your earnings.'
+        : `Your KYC was not approved: ${u.kyc.rejection_reason}`).catch(() => {});
+
+    res.json({ success: true, status: u.kyc.status });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
 // ---- Withdrawals / payouts ----
 app.get('/api/withdrawal/history', auth, (req, res) => res.json([]));
-app.post('/api/withdrawal/request', auth, (req, res) => res.status(201).json({ success: true, message: 'Withdrawal requested' }));
+app.post('/api/withdrawal/request', auth, async (req, res) => {
+  try {
+    // The KYC gate. Everything else about this endpoint is still a stub, but the
+    // gate is real — no payout leaves the platform on an unverified identity.
+    const u = await User.findById(req.user.id).select('kyc').lean();
+    const status = (u && u.kyc && u.kyc.status) || 'not_submitted';
+    if (status !== 'verified') {
+      return res.status(403).json({
+        detail: status === 'pending'
+          ? 'Your KYC is still under review. You can withdraw once it is verified.'
+          : 'Verify your KYC (Aadhaar + PAN) before withdrawing.',
+        kyc_status: status,
+      });
+    }
+    res.status(201).json({ success: true, message: 'Withdrawal requested' });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
 app.get('/api/payout/overview', auth, async (req, res) => {
   try {
     // Compute the creator's earnings from their deals so a "Paid - Complete"
@@ -2299,7 +2483,12 @@ app.get('/api/payout/overview', auth, async (req, res) => {
     const paidThisMonth = paid.filter(inThisMonth).reduce((s, d) => s + earn(d), 0);
     const pending = deals.filter(isEscrow).reduce((s, d) => s + earn(d), 0);
 
+    // The payout page needs this to decide whether Withdraw is even offered.
+    const me = await User.findById(req.user.id).select('kyc').lean();
+
     res.json({
+      kyc_status: (me && me.kyc && me.kyc.status) || 'not_submitted',
+      kyc_rejection_reason: (me && me.kyc && me.kyc.rejection_reason) || '',
       balance: allTime,           // available to withdraw (no withdrawals tracked yet)
       pending_release: pending,
       paid_this_month: paidThisMonth,

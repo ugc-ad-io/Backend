@@ -102,6 +102,27 @@ const userSchema = new mongoose.Schema(
     // Brand wallet — gate for chat initiation (10.2)
     wallet_balance: { type: Number, default: 0 },
 
+    // Creator KYC (Aadhaar + PAN). A creator cannot withdraw earnings until an
+    // admin has marked this `verified` — we are paying real money to a real
+    // person, so the identity behind the payout account has to be checked.
+    // Numbers are stored in full (an admin has to be able to match them to the
+    // uploaded document) but never leave the server for anyone but the owner and
+    // admins — toPublic()/toRedacted() do not include `kyc`.
+    kyc: {
+      // not_submitted -> pending -> verified | rejected  (rejected can resubmit)
+      status: { type: String, enum: ['not_submitted', 'pending', 'verified', 'rejected'], default: 'not_submitted' },
+      name_on_pan: { type: String, default: '' },
+      pan_number: { type: String, default: '' },
+      pan_doc_url: { type: String, default: '' },
+      aadhaar_number: { type: String, default: '' },
+      aadhaar_front_url: { type: String, default: '' },
+      aadhaar_back_url: { type: String, default: '' },
+      submitted_at: { type: Date, default: null },
+      reviewed_at: { type: Date, default: null },
+      reviewed_by: { type: String, default: '' },
+      rejection_reason: { type: String, default: '' },
+    },
+
     // Chat policy state (10.4)
     chat: {
       strikes: { type: [strikeSchema], default: [] },
@@ -174,6 +195,13 @@ userSchema.methods.toPublic = function () {
   };
 };
 
+// Show only the last N characters of an identity number ("XXXXXXXX4321").
+const maskTail = (v, keep = 4) => {
+  const s = String(v || '');
+  if (!s) return '';
+  return s.length <= keep ? s : `${'X'.repeat(s.length - keep)}${s.slice(-keep)}`;
+};
+
 // Keys inside the free-form `profile` blob that are PRIVATE to the user (and to
 // admins). `profile` is stored verbatim from the onboarding form, so toPublic()
 // spreading it wholesale would hand a creator's contact details — and their
@@ -199,13 +227,26 @@ userSchema.methods.toRedacted = function () {
   return { ...pub, profile };
 };
 
-// Self projection (adds wallet + settings + chat policy snapshot)
+// Self projection (adds wallet + settings + chat policy snapshot).
+// KYC lives here and NOT in toPublic()/toRedacted() — a brand looking at a
+// creator must never receive their Aadhaar/PAN. The number is masked even for
+// the owner (the UI only ever needs to confirm which document is on file).
 userSchema.methods.toSelf = function () {
+  const k = this.kyc || {};
   return {
     ...this.toPublic(),
     wallet_balance: this.wallet_balance,
     chat_unlocked: this.role !== 'business' || this.wallet_balance >= MIN_CHAT_BALANCE,
-    settings: this.settings
+    settings: this.settings,
+    kyc: {
+      status: k.status || 'not_submitted',
+      name_on_pan: k.name_on_pan || '',
+      pan_number: maskTail(k.pan_number, 4),
+      aadhaar_number: maskTail(k.aadhaar_number, 4),
+      submitted_at: k.submitted_at || null,
+      reviewed_at: k.reviewed_at || null,
+      rejection_reason: k.rejection_reason || '',
+    },
   };
 };
 
