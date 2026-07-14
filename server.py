@@ -473,6 +473,16 @@ class BusinessWalletRechargeCreate(BaseModel):
     amount: float
     gateway: str = "razorpay"
 
+
+class BusinessGSTSubmit(BaseModel):
+    gstin: str
+    legal_name: Optional[str] = ""
+
+
+class AdminGSTReview(BaseModel):
+    action: str                      # 'approve' | 'reject'
+    reason: Optional[str] = ""
+
 class CheckoutBriefCreate(BaseModel):
     """Direct booking of a creator from their plan (PlanBrief modal)."""
     creator_id: str
@@ -904,6 +914,69 @@ def hours_until(value: Optional[str]) -> Optional[int]:
 CONTACT_INFO_BLOCK_DETAIL = "Your message appears to contain contact information. This cannot be shared on UGCAD.IO to protect both parties."
 MIN_BRAND_CHAT_BALANCE = 2500
 WALLET_MIN_RECHARGE = 2500
+
+# ---- GST (GSTIN) verification -----------------------------------------------
+# A brand must have a VERIFIED GSTIN before it can put money into its wallet.
+# Statuses: not_submitted -> pending -> verified | rejected
+GST_STATUSES = ("not_submitted", "pending", "verified", "rejected")
+GSTIN_RE = re.compile(r'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$')
+_GSTIN_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+# State codes 01-38 plus 97 (other territory). Anything else is not a real state.
+_GST_STATE_CODES = {f"{i:02d}" for i in range(1, 39)} | {"97"}
+
+
+def gstin_checksum_ok(gstin: str) -> bool:
+    """Verify the 15th character — GSTIN's built-in mod-36 check digit.
+
+    This is real validation, not a regex: a mistyped or invented number fails here,
+    so we catch bad GSTINs offline without paying for a lookup API.
+    """
+    total = 0
+    for i, ch in enumerate(gstin[:14]):
+        value = _GSTIN_ALPHABET.index(ch)
+        factor = 2 if i % 2 else 1
+        product = value * factor
+        total += product // 36 + product % 36
+    expected = _GSTIN_ALPHABET[(36 - total % 36) % 36]
+    return expected == gstin[14]
+
+
+def validate_gstin(raw: str) -> tuple[bool, str]:
+    """Return (ok, reason). Reason is user-facing when ok is False."""
+    gstin = (raw or "").strip().upper().replace(" ", "")
+    if not gstin:
+        return False, "Enter your GSTIN."
+    if len(gstin) != 15:
+        return False, f"A GSTIN is 15 characters — you entered {len(gstin)}."
+    if not GSTIN_RE.match(gstin):
+        return False, "That doesn't look like a valid GSTIN (format: 22AAAAA0000A1Z5)."
+    if gstin[:2] not in _GST_STATE_CODES:
+        return False, f"'{gstin[:2]}' is not a valid GST state code."
+    if not gstin_checksum_ok(gstin):
+        return False, "GSTIN check digit failed — please re-check the number."
+    return True, ""
+
+
+def gst_status_of(user: dict) -> str:
+    """Current GST state for a brand. Mirrors the creator `kyc` sub-document shape."""
+    status = ((user or {}).get("gst") or {}).get("status")
+    return status if status in GST_STATUSES else "not_submitted"
+
+
+def gst_public(user: dict) -> dict:
+    """What the brand itself sees about its own GST record."""
+    gst = (user or {}).get("gst") or {}
+    status = gst_status_of(user)
+    return {
+        "status": status,
+        "gstin": gst.get("gstin") or "",
+        "legal_name": gst.get("legal_name") or "",
+        "submitted_at": gst.get("submitted_at"),
+        "reviewed_at": gst.get("reviewed_at"),
+        "rejection_reason": gst.get("rejection_reason") or "",
+        # The single source of truth the wallet UI keys off.
+        "can_recharge": status == "verified",
+    }
 WALLET_BONUS_TIERS = [
     {"amount": 10000, "bonus_percent": 3, "label": "₹10K"},
     {"amount": 25000, "bonus_percent": 7, "label": "₹25K"},
@@ -1898,6 +1971,83 @@ def normalize_wallet_transaction(source: dict, default_type: str = "Wallet Recha
         "status": status,
     }
 
+async def issue_wallet_receipt(transaction: dict, reference: str, amount: float,
+                               bonus_amount: float, credited_amount: float, now: str) -> None:
+    """Save a payment receipt and email it to the brand.
+
+    A wallet recharge is PREPAID CREDIT, not a taxable supply, so this is a payment
+    receipt — NOT a GST tax invoice. (GST would apply to the platform commission on a
+    completed deal, which is invoiced separately.)
+    """
+    user = await db.users.find_one({"id": transaction.get("user_id")}, {"_id": 0}) or {}
+
+    # Sequential-ish receipt number: UGC-RCP-<year>-<count>
+    year = now[:4]
+    seq = await db.deal_receipts.count_documents({"kind": "wallet_recharge", "year": year}) + 1
+    receipt_no = f"UGC-RCP-{year}-{seq:04d}"
+
+    receipt = {
+        "id": str(uuid.uuid4()),
+        "kind": "wallet_recharge",
+        "year": year,
+        "receipt_no": receipt_no,
+        "transaction_id": transaction["id"],
+        "user_id": transaction.get("user_id"),
+        "business_name": (user.get("profile") or {}).get("business_name") or user.get("nickname") or "",
+        "email": user.get("email"),
+        "gateway": transaction.get("gateway"),
+        "payment_id": reference,
+        "order_id": transaction.get("gateway_order_id"),
+        "amount_paid": amount,
+        "bonus_amount": bonus_amount,
+        "credited_amount": credited_amount,
+        "currency": transaction.get("currency", "INR"),
+        "status": "paid",
+        "created_at": now,
+    }
+    await db.deal_receipts.insert_one(receipt)
+
+    to_email = user.get("email")
+    if not to_email:
+        return
+
+    inr = lambda v: f"₹{float(v or 0):,.2f}"
+    bonus_row = (
+        f'<tr><td style="padding:8px 0;color:#4a4f74;">Recharge bonus</td>'
+        f'<td align="right" style="padding:8px 0;color:#16a34a;font-weight:600;">+ {inr(bonus_amount)}</td></tr>'
+    ) if bonus_amount > 0 else ""
+
+    content = f"""
+      <h1 style="margin:0 0 6px;font-size:22px;color:#1f2340;">Payment receipt</h1>
+      <p style="margin:0 0 18px;font-size:14px;color:#8a90a6;">{receipt_no} &nbsp;·&nbsp; {now[:10]}</p>
+      <p style="margin:0 0 18px;font-size:15px;color:#4a4f74;">
+        Thanks{(' ' + receipt['business_name']) if receipt['business_name'] else ''} — your payment was successful
+        and your wallet has been credited.
+      </p>
+      <table width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;border-top:1px solid #eceef5;">
+        <tr><td style="padding:8px 0;color:#4a4f74;">Amount paid</td>
+            <td align="right" style="padding:8px 0;color:#1f2340;font-weight:600;">{inr(amount)}</td></tr>
+        {bonus_row}
+        <tr><td style="padding:12px 0;border-top:1px solid #eceef5;color:#1f2340;font-weight:700;">Total credited to wallet</td>
+            <td align="right" style="padding:12px 0;border-top:1px solid #eceef5;color:#1f2340;font-weight:800;">{inr(credited_amount)}</td></tr>
+      </table>
+      <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:18px;font-size:13px;color:#8a90a6;">
+        <tr><td style="padding:4px 0;">Payment method</td><td align="right">Razorpay</td></tr>
+        <tr><td style="padding:4px 0;">Payment ID</td><td align="right">{reference or '—'}</td></tr>
+        <tr><td style="padding:4px 0;">Status</td><td align="right" style="color:#16a34a;font-weight:600;">Paid</td></tr>
+      </table>
+      <p style="margin:20px 0 0;font-size:12px;color:#9aa0b4;">
+        This is a payment receipt for prepaid wallet credit, not a tax invoice.
+        Wallet credits are non-refundable.
+      </p>"""
+
+    await send_email(to_email, f"Your UGCad.io payment receipt — {receipt_no}",
+                     _email_base_template("Payment receipt", content))
+    await notify_user(transaction.get("user_id"), "Wallet credited",
+                      f"{inr(credited_amount)} added to your wallet. Receipt {receipt_no} emailed to you.",
+                      link="/dashboard/business/wallet", ntype="success")
+
+
 async def credit_wallet_for_successful_transaction(transaction: dict, gateway_payment_id: Optional[str] = None) -> dict:
     if not transaction:
         raise HTTPException(status_code=404, detail="Transaction not found")
@@ -1961,6 +2111,14 @@ async def credit_wallet_for_successful_transaction(transaction: dict, gateway_pa
                 "created_at": now,
             })
         await db.wallet_ledger.insert_many(ledger_rows)
+        # Payment receipt — generated once, inside the idempotent credit branch, so the
+        # webhook and the frontend /payments/verify can't both email a duplicate.
+        # NOTE: a wallet recharge is prepaid credit, not a taxable supply — this is a
+        # payment RECEIPT, not a GST tax invoice.
+        try:
+            await issue_wallet_receipt(transaction, reference, amount, bonus_amount, credited_amount, now)
+        except Exception as receipt_error:
+            logger.error(f"[wallet-receipt] {receipt_error}")
     elif gateway_payment_id:
         await db.payment_transactions.update_one(
             {"id": transaction["id"]},
@@ -3196,6 +3354,52 @@ async def invite_creator_from_directory(
         "action_card": {key: value for key, value in action_card.items() if key != "_id"},
     }
 
+@api_router.get("/business/gst")
+async def get_business_gst(current_user: dict = Depends(get_approved_business_user)):
+    """The brand's own GST record + whether it may fund its wallet yet."""
+    return gst_public(current_user)
+
+
+@api_router.post("/business/gst")
+async def submit_business_gst(data: BusinessGSTSubmit, current_user: dict = Depends(get_approved_business_user)):
+    """Submit a GSTIN for verification. The number is checksum-validated here, so an
+    invented or mistyped GSTIN is rejected immediately rather than sitting in the
+    admin queue. A valid one goes to an admin to confirm it belongs to this brand."""
+    if gst_status_of(current_user) == "verified":
+        raise HTTPException(status_code=400, detail="Your GST is already verified.")
+
+    gstin = (data.gstin or "").strip().upper().replace(" ", "")
+    ok, reason = validate_gstin(gstin)
+    if not ok:
+        raise HTTPException(status_code=400, detail=reason)
+
+    # One GSTIN cannot back two brand accounts.
+    clash = await db.users.find_one({
+        "gst.gstin": gstin,
+        "gst.status": {"$in": ["pending", "verified"]},
+        "id": {"$ne": current_user["id"]},
+    })
+    if clash:
+        raise HTTPException(status_code=409, detail="This GSTIN is already registered to another account.")
+
+    record = {
+        "status": "pending",
+        "gstin": gstin,
+        "legal_name": (data.legal_name or "").strip(),
+        "submitted_at": now_iso(),
+        "reviewed_at": None,
+        "reviewed_by": "",
+        "rejection_reason": "",
+    }
+    await db.users.update_one({"id": current_user["id"]}, {"$set": {"gst": record, "gst_number": gstin}})
+    await notify_admins(
+        "GST verification pending",
+        f"{current_user.get('nickname') or current_user.get('email')} submitted GSTIN {gstin} for verification.",
+        link="/dashboard/admin/gst",
+    )
+    return {**gst_public({"gst": record}), "message": "GSTIN submitted for verification."}
+
+
 @api_router.get("/business/wallet")
 async def get_business_wallet(current_user: dict = Depends(get_approved_business_user)):
     if current_user.get("role") != UserRole.BUSINESS:
@@ -3282,6 +3486,18 @@ async def recharge_business_wallet(
         raise HTTPException(status_code=403, detail="Only business users can access this resource")
     if current_user.get("approval_status") != ApprovalStatus.APPROVED:
         raise HTTPException(status_code=403, detail="Business profile must be approved")
+
+    # A brand cannot put money in until its GST is verified. Enforced HERE (not just in
+    # the UI) — this is the endpoint that mints a real payment order.
+    gst_state = gst_status_of(current_user)
+    if gst_state != "verified":
+        detail = {
+            "not_submitted": "Verify your GST before adding funds. Submit your GSTIN on the Wallet page.",
+            "pending": "Your GSTIN is under review. You can add funds once it's verified.",
+            "rejected": "Your GST verification was rejected. Please resubmit a valid GSTIN on the Wallet page.",
+        }.get(gst_state, "Your GST must be verified before adding funds.")
+        raise HTTPException(status_code=403, detail=detail)
+
     if data.amount < WALLET_MIN_RECHARGE:
         raise HTTPException(status_code=400, detail="Minimum wallet recharge amount is INR 2,500")
 
@@ -5774,7 +5990,21 @@ async def send_message(data: ChatMessage, current_user: dict = Depends(get_curre
     }
     
     await db.messages.insert_one(message_doc)
-    
+
+    # Tell the recipient they have a new message. Works both ways (brand → creator and
+    # creator → brand) — sending a chat used to create no notification at all, so the
+    # other side only found out if they happened to open Messages.
+    sender_label = current_user.get("nickname") or current_user.get("full_name") or "Someone"
+    body = (data.message or "").strip()
+    preview = (body[:80] + "…") if len(body) > 80 else (body or "Sent an attachment")
+    await notify_user(
+        data.recipient_id,
+        f"New message from {sender_label}",
+        preview,
+        link="/messages",
+        ntype="message",
+    )
+
     return {
         "message": "Message sent",
         "filtered": False,
@@ -7434,7 +7664,7 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
             f"Revisions 1-{cf.FREE_REVISION_LIMIT} are free. This was revision #{used + 1} on "
             f"'{campaign.get('title', 'your campaign')}', so ₹{int(fee)} was debited from your wallet. "
             f"Remaining balance: ₹{int(new_balance)}.",
-            link="/dashboard/business/billing", ntype="warning", email=True,
+            link="/dashboard/business/wallet", ntype="warning", email=True,
         )
 
     return {
@@ -11416,6 +11646,80 @@ async def get_platform_settings() -> dict:
     _PLATFORM_SETTINGS_CACHE.clear()
     _PLATFORM_SETTINGS_CACHE.update(merged)
     return merged
+
+
+@api_router.get("/admin/gst")
+async def admin_list_gst(status: Optional[str] = None,
+                         current_user: dict = Depends(require_cap("review_applications"))):
+    """Brands awaiting (or holding) GST verification. Defaults to the pending queue."""
+    query: Dict[str, Any] = {"role": UserRole.BUSINESS, "gst.status": {"$exists": True}}
+    if status and status != "all":
+        query["gst.status"] = status
+    elif not status:
+        query["gst.status"] = "pending"
+
+    rows = await db.users.find(
+        query, {"_id": 0, "id": 1, "email": 1, "nickname": 1, "full_name": 1, "profile": 1, "gst": 1}
+    ).sort("gst.submitted_at", 1).to_list(200)
+
+    out = []
+    for u in rows:
+        gst = u.get("gst") or {}
+        out.append({
+            "user_id": u.get("id"),
+            "email": u.get("email"),
+            "brand_name": (u.get("profile") or {}).get("business_name") or u.get("nickname") or u.get("full_name") or u.get("email"),
+            "gstin": gst.get("gstin"),
+            "legal_name": gst.get("legal_name"),
+            "status": gst.get("status"),
+            "submitted_at": gst.get("submitted_at"),
+            "reviewed_at": gst.get("reviewed_at"),
+            "rejection_reason": gst.get("rejection_reason"),
+        })
+    return out
+
+
+@api_router.post("/admin/gst/{user_id}")
+async def admin_review_gst(user_id: str, data: AdminGSTReview,
+                           current_user: dict = Depends(require_cap("review_applications"))):
+    """Approve or reject a brand's GSTIN. Approving is what unlocks wallet funding."""
+    user = await db.users.find_one({"id": user_id})
+    if not user or user.get("role") != UserRole.BUSINESS:
+        raise HTTPException(status_code=404, detail="Brand not found")
+    if not admin_caps.in_scope(current_user, user):
+        raise HTTPException(status_code=403, detail="This account is outside your assigned scope")
+
+    gst = user.get("gst") or {}
+    if not gst.get("gstin"):
+        raise HTTPException(status_code=400, detail="This brand has not submitted a GSTIN.")
+
+    action = (data.action or "").lower()
+    if action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+
+    reason = (data.reason or "").strip()
+    if action == "reject" and not reason:
+        raise HTTPException(status_code=400, detail="Give a reason so the brand knows what to fix.")
+
+    status = "verified" if action == "approve" else "rejected"
+    await db.users.update_one({"id": user_id}, {"$set": {
+        "gst.status": status,
+        "gst.reviewed_at": now_iso(),
+        "gst.reviewed_by": current_user.get("id"),
+        "gst.rejection_reason": reason if action == "reject" else "",
+    }})
+
+    if action == "approve":
+        await notify_user(user_id, "GST verified — you can now add funds",
+                          f"Your GSTIN {gst['gstin']} has been verified. You can now recharge your wallet and start booking creators.",
+                          link="/dashboard/business/wallet", ntype="success", email=True)
+    else:
+        await notify_user(user_id, "GST verification rejected",
+                          f"Your GSTIN could not be verified: {reason}. Please resubmit a correct GSTIN on the Wallet page.",
+                          link="/dashboard/business/wallet", ntype="warning", email=True)
+
+    await log_admin_action(current_user, f"gst.{action}", target_type="user", target_id=user_id)
+    return {"user_id": user_id, "status": status}
 
 
 @api_router.get("/admin/email/health")
