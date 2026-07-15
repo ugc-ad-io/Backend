@@ -3736,7 +3736,7 @@ async def checkout_brief(data: CheckoutBriefCreate,
         "📩 New booking request",
         f"{brand_name} booked you for '{title}' — ₹{q['subtotal']:,.0f} is already held in escrow. "
         f"Accept it, decline it, or propose a different price.",
-        link="/deals",
+        link="/my-deals",
         ntype="info",
     )
     await notify_user(
@@ -3824,7 +3824,7 @@ async def respond_to_booking(campaign_id: str, data: BookingRespond,
         await insert_deal_system_message(campaign, f"✅ {creator_name} accepted the booking. The brand can now send the brief.")
         await notify_user(brand_id, "Booking accepted — send your brief",
                           f"{creator_name} accepted '{title}'. Send them the brief to start the work.",
-                          link="/dashboard/business/deals", ntype="success")
+                          link="/dashboard/business/all-campaigns", ntype="success")
         return {"booking_status": "accepted"}
 
     if data.action == "decline":
@@ -3862,7 +3862,7 @@ async def respond_to_booking(campaign_id: str, data: BookingRespond,
         )
         await notify_user(brand_id, "Creator proposed a new price",
                           f"{creator_name} wants ₹{proposed:,.0f} for '{title}'. Accept it or cancel the booking.",
-                          link="/dashboard/business/deals", ntype="info")
+                          link="/dashboard/business/all-campaigns", ntype="info")
         return {"booking_status": "price_revision", "proposed_amount": proposed, "new_total": round(proposed + fee, 2)}
 
     raise HTTPException(status_code=400, detail="action must be accept, decline or revise")
@@ -3888,7 +3888,7 @@ async def decide_booking_price(campaign_id: str, data: BookingPriceDecision,
         }})
         await insert_deal_system_message(campaign, "❌ The brand didn't accept the new price. The booking is cancelled and refunded.")
         await notify_user(campaign["selected_creator"], "Booking cancelled",
-                          f"The brand didn't accept your price for '{title}'.", link="/deals", ntype="warning")
+                          f"The brand didn't accept your price for '{title}'.", link="/my-deals", ntype="warning")
         return {"booking_status": "declined", "refunded": refunded}
 
     if data.action != "accept":
@@ -3940,7 +3940,7 @@ async def decide_booking_price(campaign_id: str, data: BookingPriceDecision,
     await insert_deal_system_message(campaign, f"✅ The brand accepted ₹{new_subtotal:,.0f}. The booking is confirmed — the brief is next.")
     await notify_user(campaign["selected_creator"], "Your price was accepted",
                       f"The brand accepted ₹{new_subtotal:,.0f} for '{title}'. Wait for their brief to start.",
-                      link="/deals", ntype="success")
+                      link="/my-deals", ntype="success")
 
     updated = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "balance": 1})
     return {
@@ -3989,7 +3989,7 @@ async def send_booking_brief(campaign_id: str, data: BookingBriefSend,
     await insert_deal_system_message(campaign, f"📋 Brief received. The work has started.\n\n{brief_text}")
     await notify_user(campaign["selected_creator"], "📋 Brief received — you can start",
                       f"The brand sent the brief for '{campaign.get('title') or 'your booking'}'. The work has officially started.",
-                      link="/deals", ntype="success")
+                      link="/my-deals", ntype="success")
     return {"brief_sent": True, "brief_text": brief_text}
 
 
@@ -5195,7 +5195,7 @@ async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(g
     await notify_admins(
         "New campaign awaiting approval",
         f"'{campaign.get('title', '')}' was submitted and needs admin approval before it goes live to creators.",
-        link="/admin/campaigns",
+        link="/dashboard/admin/campaigns",
     )
 
     # Flag to admin if the budget is hidden from creators
@@ -5210,7 +5210,7 @@ async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(g
         await notify_admins(
             "New brief awaiting matches",
             f"'{campaign.get('title', '')}' was published with Request Matches and needs an ops shortlist.",
-            link="/admin/match-queue",
+            link="/dashboard/admin/campaigns",
         )
 
     # Submit the brief for approval
@@ -5373,7 +5373,7 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
         await notify_admins(
             "New campaign awaiting approval",
             f"'{campaign_doc.get('title', '')}' was submitted and needs admin approval before it goes live to creators.",
-            link="/admin/campaigns",
+            link="/dashboard/admin/campaigns",
         )
 
     await db.campaigns.insert_one(campaign_doc)
@@ -5537,7 +5537,7 @@ async def invite_shortlist_candidate(campaign_id: str, creator_id: str, data: Sh
         {"id": campaign_id},
         {"$set": {"shortlist": shortlist, "match_status": "fulfilled", "updated_at": created_at}},
     )
-    await notify_user(creator_id, "You've received a brief invitation", f"{current_user.get('nickname', 'A brand')} invited you to '{campaign.get('title', '')}'.", link="/dashboard/creator/inbox")
+    await notify_user(creator_id, "You've received a brief invitation", f"{current_user.get('nickname', 'A brand')} invited you to '{campaign.get('title', '')}'.", link="/messages")
     return {"message": "Invitation sent", "campaign_id": campaign_id, "creator_id": creator_id, "action_card": {k: v for k, v in action_card.items() if k != "_id"}}
 
 
@@ -5557,7 +5557,7 @@ async def request_new_shortlist(campaign_id: str, current_user: dict = Depends(g
     await notify_admins(
         "Brand requested a new shortlist",
         f"'{campaign.get('title', '')}' requested new matches (request #{count}).",
-        link="/admin/match-queue",
+        link="/dashboard/admin/campaigns",
     )
     return {"campaign_id": campaign_id, "match_status": "queued", "shortlist_request_count": count}
 
@@ -6041,8 +6041,20 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
             unread_per_partner[other_id] = unread_per_partner.get(other_id, 0) + 1
 
         if other_id not in conversations or item_timestamp > conversations[other_id]['timestamp']:
-            other_user = await db.users.find_one({"id": other_id}, {"_id": 0, "nickname": 1, "role": 1, "profile_picture": 1})
-            if other_user:  # Only add if user exists
+            other_user = await db.users.find_one({"id": other_id}, {"_id": 0, "nickname": 1, "role": 1, "profile_photo": 1})
+            # Fall back to _id — a partner created through the Node backend may carry only
+            # `_id`, and looking up by `id` alone silently DROPPED the whole conversation
+            # (the "I got a message notification but Messages is empty" bug).
+            if not other_user:
+                try:
+                    from bson import ObjectId
+                    other_user = await db.users.find_one({"_id": ObjectId(other_id)}, {"_id": 0, "nickname": 1, "role": 1, "profile_photo": 1})
+                except Exception:
+                    other_user = None
+            # Never drop a real message. Show the thread even if the account can't be
+            # resolved, rather than making the conversation disappear.
+            if True:
+                other_user = other_user or {"nickname": "Unknown user", "role": ""}
                 deal = await find_chat_deal(current_user['id'], other_id)
                 deal_status = deal.get("status") if deal else None
                 if deal_status in ACTIVE_DEAL_STATUSES:
@@ -6056,7 +6068,7 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
                     "user_id": other_id,
                     "nickname": other_user.get('nickname', 'Unknown'),
                     "role": other_user.get('role', ''),
-                    "profile_picture": other_user.get('profile_picture'),
+                    "profile_picture": other_user.get('profile_photo') or other_user.get('profile_picture'),
                     "last_message": item,
                     "last_item_snippet": snippet[:120],
                     "timestamp": item_timestamp,
@@ -6476,7 +6488,7 @@ async def revoke_chat_action_card(card_id: str, current_user: dict = Depends(get
         card.get("recipient_id"),
         "An invitation was withdrawn",
         f"{current_user.get('nickname', 'The brand')} withdrew their {card.get('type', 'offer').replace('_', ' ')}.",
-        link="/dashboard/creator/inbox",
+        link="/messages",
     )
     await record_match_event(f"{card.get('type')}_revoked", None, None, card_id=card_id, campaign_id=card.get("deal_id"))
     updated = await db.chat_action_cards.find_one({"id": card_id}, {"_id": 0})
@@ -6967,7 +6979,7 @@ async def propose_filter_rule(data: FilterRulePropose, current_user: dict = Depe
     await notify_admins(
         "New filter rule added",
         f"{current_user.get('nickname', current_user['id'])} added a {data.type} rule \"{data.label}\" — it is now live.",
-        link="/dashboard/admin/flagged-messages",
+        link="/dashboard/admin/flagged",
     )
     return {"message": "Rule added — live from the next message.", "rule": {k: v for k, v in rule.items() if k != "_id"}}
 
@@ -7339,7 +7351,7 @@ async def release_scheduled_payout(escrow: dict) -> bool:
     await db.campaigns.update_one({"id": campaign['id']}, {"$set": {"status": CampaignStatus.COMPLETED, "payout_status": "released", "updated_at": now}})
     await insert_deal_activity(campaign, "system", "UGCAD.IO", "payment_released", f"Payout of ₹{int(net)} released to the creator.")
     if creator_id:
-        await notify_user(creator_id, "Payment released", f"₹{int(net)} has been released to your wallet.", link="/payouts")
+        await notify_user(creator_id, "Payment released", f"₹{int(net)} has been released to your wallet.", link="/withdrawal")
     return True
 
 
@@ -8870,7 +8882,7 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
             if creator_id and fee > 0:
                 await db.users.update_one({"id": creator_id}, {"$inc": {"balance": fee}})
                 await db.shipments.update_one({"campaign_id": data.campaign_id}, {"$set": {"late_fee_applied": fee, "late_fee_days": days_late}})
-                await notify_user(creator_id, "Late-shipping fee credited", f"₹{fee} was credited to you because the brand shipped {days_late} day(s) late.", link="/payouts")
+                await notify_user(creator_id, "Late-shipping fee credited", f"₹{fee} was credited to you because the brand shipped {days_late} day(s) late.", link="/withdrawal")
                 await insert_deal_system_message(campaign, f"Brand shipped {days_late} day(s) late — ₹{fee} late-shipping fee credited to the creator (PRD 8.9).")
 
     return {"message": "Shipment details updated"}
@@ -9792,7 +9804,7 @@ async def admin_set_level(data: Dict[str, Any] = Body(...), current_user: dict =
             user_id,
             "🎉 You've been promoted!",
             f"Congratulations! An admin promoted you to {new_label}. New perks and higher visibility are now unlocked.",
-            link="/creator-dashboard",
+            link="/dashboard/creator",
             ntype="success",
         )
     else:
@@ -9800,7 +9812,7 @@ async def admin_set_level(data: Dict[str, Any] = Body(...), current_user: dict =
             user_id,
             "Your creator level changed",
             f"Your account level is now {new_label}. Reach out to support if you think this is a mistake.",
-            link="/creator-dashboard",
+            link="/dashboard/creator",
             ntype="warning",
         )
 
@@ -12135,7 +12147,7 @@ async def admin_release_escrow(escrow_id: str, data: Dict[str, Any] = Body(...),
             await create_payout_receipt(creator_id=creator_id, receipt_type="earning", gross_amount=gross,
                                         campaign_id=escrow.get("campaign_id"), reference_id=escrow_id,
                                         note=f"Manual escrow release: {reason}", tds_amount=tds)
-            await notify_user(creator_id, "Payment released", f"₹{int(net)} has been released to your wallet.", link="/payouts")
+            await notify_user(creator_id, "Payment released", f"₹{int(net)} has been released to your wallet.", link="/withdrawal")
     await log_admin_action(current_user, "escrow.release", target_type="escrow", target_id=escrow_id, reason=reason, request=request)
     return {"message": "Escrow released to creator", "escrow_id": escrow_id}
 
@@ -12600,6 +12612,48 @@ async def admin_my_assigned(current_user: dict = Depends(require_cap("my_users")
         if assigned:
             users = [u for u in users if any(a and (a in _user_category(u) or _user_category(u) in a) for a in assigned)]
     return {"scoped": assigned is not None, "assigned_categories": assigned or [], "users": users}
+
+
+# --- Creator KYC review queue (PAN / Aadhaar for withdrawals) --------------------
+# The admin KYC page called /admin/kyc which never existed → 404. KYC lives as a
+# `kyc` sub-doc on the creator ({status, name_on_pan, pan_number, aadhaar_number,
+# submitted_at, *_url, rejection_reason}). Until a creator submission flow is wired,
+# the queue simply returns whatever has been submitted (empty is fine — no more 404).
+@api_router.get("/admin/kyc")
+async def admin_list_kyc(status: str = "pending", current_user: dict = Depends(require_cap("review_applications"))):
+    query = {"role": UserRole.CREATOR, "kyc": {"$exists": True, "$ne": None}}
+    if status and status != "all":
+        query["kyc.status"] = status
+    users = await db.users.find(query, {"_id": 0, "password": 0}).to_list(2000)
+    users.sort(key=lambda u: (u.get("kyc") or {}).get("submitted_at") or "", reverse=True)
+    return _json_safe(users)
+
+
+@api_router.post("/admin/kyc/{user_id}/review")
+async def admin_review_kyc(user_id: str, data: Dict[str, Any] = Body(...),
+                           current_user: dict = Depends(require_cap("review_applications"))):
+    action = str(data.get("action") or "").lower()
+    if action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "kyc": 1})
+    if not user or not user.get("kyc"):
+        raise HTTPException(status_code=404, detail="No KYC submission for this user")
+    now = now_iso()
+    if action == "approve":
+        set_fields = {"kyc.status": "verified", "kyc.verified_at": now,
+                      "kyc.reviewed_by": current_user["id"], "kyc_verified": True}
+        title, msg, ntype = "KYC verified ✅", "Your KYC has been verified — you can now withdraw your earnings.", "success"
+    else:
+        reason = str(data.get("reason") or "").strip()
+        if not reason:
+            raise HTTPException(status_code=400, detail="A rejection reason is required")
+        set_fields = {"kyc.status": "rejected", "kyc.rejection_reason": reason,
+                      "kyc.reviewed_at": now, "kyc.reviewed_by": current_user["id"], "kyc_verified": False}
+        title, msg, ntype = "KYC needs attention", f"Your KYC was not approved. Reason: {reason}", "warning"
+    await db.users.update_one({"id": user_id}, {"$set": set_fields})
+    await notify_user(user_id, title, msg, link="/settings", ntype=ntype, email=True)
+    await log_admin_action(current_user, f"kyc.{action}", target_type="user", target_id=user_id)
+    return {"success": True, "status": set_fields["kyc.status"]}
 
 
 @api_router.get("/reviews")
