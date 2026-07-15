@@ -3487,16 +3487,7 @@ async def recharge_business_wallet(
     if current_user.get("approval_status") != ApprovalStatus.APPROVED:
         raise HTTPException(status_code=403, detail="Business profile must be approved")
 
-    # A brand cannot put money in until its GST is verified. Enforced HERE (not just in
-    # the UI) — this is the endpoint that mints a real payment order.
-    gst_state = gst_status_of(current_user)
-    if gst_state != "verified":
-        detail = {
-            "not_submitted": "Verify your GST before adding funds. Submit your GSTIN on the Wallet page.",
-            "pending": "Your GSTIN is under review. You can add funds once it's verified.",
-            "rejected": "Your GST verification was rejected. Please resubmit a valid GSTIN on the Wallet page.",
-        }.get(gst_state, "Your GST must be verified before adding funds.")
-        raise HTTPException(status_code=403, detail=detail)
+    # (GST-verification gate removed — brands can add funds without a verified GSTIN.)
 
     if data.amount < WALLET_MIN_RECHARGE:
         raise HTTPException(status_code=400, detail="Minimum wallet recharge amount is INR 2,500")
