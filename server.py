@@ -594,6 +594,10 @@ class DisputeInfoRequest(BaseModel):
     party: str                 # brand / creator
     message: str
 
+class DisputeInfoResponse(BaseModel):
+    message: str               # the party's answer to the admin's info request
+    evidence_urls: List[str] = []   # optional supporting files
+
 class DisputeAppeal(BaseModel):
     new_evidence_urls: List[str] = []
     grounds: str               # new evidence / points not previously considered
@@ -8261,7 +8265,7 @@ async def dispute_request_info(dispute_id: str, data: DisputeInfoRequest, curren
     target = dispute.get("business_id") if data.party == "brand" else dispute.get("creator_id")
     await db.disputes.update_one({"id": dispute_id}, {"$set": {"status": "info_requested", "info_requested_from": data.party, "info_request_due_at": (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(), "info_request_message": data.message}})
     if target:
-        await notify_user(target, "More information needed for your dispute", data.message + " Please respond within 72 hours.", link="/my-deals")
+        await notify_user(target, "More information needed for your dispute", data.message + " Please respond within 72 hours.", link=f"/disputes/{dispute_id}")
     return {"message": "Info requested", "dispute_id": dispute_id}
 
 
@@ -8472,6 +8476,73 @@ async def appeal_dispute(dispute_id: str, data: DisputeAppeal, current_user: dic
 async def get_my_disputes(current_user: dict = Depends(get_current_user)):
     disputes = await db.disputes.find({"$or": [{"business_id": current_user["id"]}, {"creator_id": current_user["id"]}]}, {"_id": 0}).sort("created_at", -1).to_list(200)
     return disputes
+
+
+@api_router.get("/disputes/{dispute_id}")
+async def get_my_dispute_detail(dispute_id: str, current_user: dict = Depends(get_current_user)):
+    """A party's own view of one dispute — powers the creator/brand dispute page.
+    Only the two parties (and admins) may read it; everyone else gets a 404 so a
+    dispute id can't be probed."""
+    dispute = await db.disputes.find_one({"id": dispute_id}, {"_id": 0})
+    if not dispute:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    uid = current_user["id"]
+    is_party = uid in (dispute.get("creator_id"), dispute.get("business_id"))
+    if not is_party and current_user.get("role") not in OPS_ROLES:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    # Which side is THIS user, and is the admin currently waiting on them?
+    my_party = "creator" if uid == dispute.get("creator_id") else ("brand" if uid == dispute.get("business_id") else None)
+    dispute["my_party"] = my_party
+    dispute["awaiting_my_response"] = (
+        dispute.get("status") == "info_requested" and dispute.get("info_requested_from") == my_party
+    )
+    # Attach the campaign title if we can, so the page isn't just a bare deal id.
+    if not dispute.get("campaign_title") and dispute.get("campaign_id"):
+        camp = await db.campaigns.find_one({"id": dispute["campaign_id"]}, {"_id": 0, "title": 1})
+        if camp:
+            dispute["campaign_title"] = camp.get("title")
+    return dispute
+
+
+@api_router.post("/disputes/{dispute_id}/respond")
+async def respond_to_dispute_info(dispute_id: str, data: DisputeInfoResponse, current_user: dict = Depends(get_current_user)):
+    """PRD 9.4: the party the admin asked answers the info request. Records the
+    response, lifts the 'info_requested' hold, and pings the ops team to re-review."""
+    dispute = await db.disputes.find_one({"id": dispute_id}, {"_id": 0})
+    if not dispute:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    uid = current_user["id"]
+    my_party = "creator" if uid == dispute.get("creator_id") else ("brand" if uid == dispute.get("business_id") else None)
+    if my_party is None:
+        raise HTTPException(status_code=403, detail="You are not a party to this dispute")
+    if dispute.get("status") != "info_requested" or dispute.get("info_requested_from") != my_party:
+        raise HTTPException(status_code=400, detail="There is no open information request for you on this dispute.")
+    if not (data.message or "").strip():
+        raise HTTPException(status_code=400, detail="Please type your response before submitting.")
+
+    response_entry = {
+        "id": str(uuid.uuid4()),
+        "party": my_party,
+        "by": uid,
+        "message": data.message.strip(),
+        "evidence_urls": data.evidence_urls or [],
+        "at": now_iso(),
+    }
+    await db.disputes.update_one(
+        {"id": dispute_id},
+        {
+            "$push": {"info_responses": response_entry},
+            # Back to 'open' for the ops team, and clear the pending-request fields.
+            "$set": {"status": "open", "info_requested_from": None, "info_request_due_at": None, "info_request_message": None},
+        },
+    )
+    who = current_user.get("nickname") or current_user.get("username") or my_party
+    await notify_admins(
+        "Dispute info response received",
+        f"{who} responded to the info request on dispute {dispute.get('deal_id', dispute_id)}.",
+        link="/dashboard/admin/disputes",
+    )
+    return {"message": "Response submitted", "dispute_id": dispute_id, "status": "open"}
 
 # --- Brand-side deal actions (Deal Room) ---
 class DealTrackingSubmit(BaseModel):
