@@ -9775,10 +9775,38 @@ async def admin_set_level(data: Dict[str, Any] = Body(...), current_user: dict =
     i = keys.index(cur) if cur in keys else 0
     ni = min(len(keys) - 1, i + 1) if direction == "promote" else max(0, i - 1)
     new_level = keys[ni]
+
+    # Already at the ceiling / floor — nothing moved, so don't lie to the creator
+    # with a "you've been promoted" popup.
+    if new_level == cur:
+        edge = "top" if direction == "promote" else "starting"
+        raise HTTPException(status_code=400, detail=f"This creator is already at the {edge} level.")
+
     await db.users.update_one({"id": user_id}, {"$set": {"level": new_level, "updated_at": now_iso()}})
+    new_label = cf.CREATOR_LEVELS[new_level]["label"]
+
+    # Tell the creator — they see this as a toast/popup the next time they load, and
+    # in their notifications list. Promotion is a celebration; demotion is a heads-up.
+    if direction == "promote":
+        await notify_user(
+            user_id,
+            "🎉 You've been promoted!",
+            f"Congratulations! An admin promoted you to {new_label}. New perks and higher visibility are now unlocked.",
+            link="/creator-dashboard",
+            ntype="success",
+        )
+    else:
+        await notify_user(
+            user_id,
+            "Your creator level changed",
+            f"Your account level is now {new_label}. Reach out to support if you think this is a mistake.",
+            link="/creator-dashboard",
+            ntype="warning",
+        )
+
     await log_admin_action(current_user, f"user.level_{direction}", target_type="user", target_id=user_id,
                            before={"level": cur}, after={"level": new_level})
-    return {"message": f"Creator {direction}d", "level": new_level, "level_label": cf.CREATOR_LEVELS[new_level]["label"]}
+    return {"message": f"Creator {direction}d", "level": new_level, "level_label": new_label}
 
 @api_router.post("/admin/user/payout-schedule")
 async def admin_payout_schedule(data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("user_management"))):
