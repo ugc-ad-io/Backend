@@ -7873,6 +7873,21 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
     }})
     await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", f"Content version {version} submitted for review.")
     await insert_deal_system_message(campaign, f"Content version {version} was submitted and is awaiting brand review.")
+
+    # Notify the brand that content is ready for review. The sibling /work/submit
+    # path did this; this deal-room path (the one the Deal Room actually uses) did
+    # not, so a brand got no bell/email when a creator submitted their final video.
+    # email=True: payment is waiting on their review, so it warrants an email too.
+    if campaign.get("business_id"):
+        await notify_user(
+            campaign["business_id"],
+            "Content submitted for review",
+            f"{current_user.get('nickname', 'The creator')} submitted content for '{campaign.get('title', 'your campaign')}'. Review it to release payment.",
+            link="/dashboard/business/work-review",
+            ntype="info",
+            email=True,
+        )
+
     return {"message": "Content submitted", "version": version}
 
 @api_router.post("/deals/{deal_id}/revision-response")
