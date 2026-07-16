@@ -981,6 +981,50 @@ def gst_public(user: dict) -> dict:
         # The single source of truth the wallet UI keys off.
         "can_recharge": status == "verified",
     }
+
+
+# ---- Creator KYC field validation -------------------------------------------
+# We pay real money to whoever passes KYC, so identity + payout fields are validated
+# on the SERVER — the client checks are only a courtesy. Numbers that don't check out
+# never reach the review queue.
+PAN_RE = re.compile(r'^[A-Z]{5}[0-9]{4}[A-Z]$')
+IFSC_RE = re.compile(r'^[A-Z]{4}0[A-Z0-9]{6}$')   # 4 letters, a 0, then 6 alphanumerics
+UPI_RE = re.compile(r'^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$')
+
+# Aadhaar's Verhoeff checksum — the same algorithm the frontend runs.
+_VERHOEFF_D = [
+    [0,1,2,3,4,5,6,7,8,9],[1,2,3,4,0,6,7,8,9,5],[2,3,4,0,1,7,8,9,5,6],
+    [3,4,0,1,2,8,9,5,6,7],[4,0,1,2,3,9,5,6,7,8],[5,9,8,7,6,0,4,3,2,1],
+    [6,5,9,8,7,1,0,4,3,2],[7,6,5,9,8,2,1,0,4,3],[8,7,6,5,9,3,2,1,0,4],
+    [9,8,7,6,5,4,3,2,1,0],
+]
+_VERHOEFF_P = [
+    [0,1,2,3,4,5,6,7,8,9],[1,5,7,6,2,8,3,0,9,4],[5,8,0,3,7,9,6,1,4,2],
+    [8,9,1,6,0,4,3,5,2,7],[9,4,5,3,1,2,6,8,7,0],[4,2,8,6,5,7,3,9,0,1],
+    [2,7,9,3,8,0,6,4,1,5],[7,0,4,6,9,1,3,2,5,8],
+]
+
+
+def aadhaar_valid(raw: str) -> bool:
+    n = re.sub(r"\D", "", raw or "")
+    if not re.match(r'^[2-9][0-9]{11}$', n):
+        return False
+    c = 0
+    for i, d in enumerate(reversed(n)):
+        c = _VERHOEFF_D[c][_VERHOEFF_P[i % 8][int(d)]]
+    return c == 0
+
+
+def age_years(dob_iso: str) -> Optional[int]:
+    """Whole years between dob (YYYY-MM-DD) and today, or None if unparseable."""
+    try:
+        dob = datetime.fromisoformat(str(dob_iso)[:10]).date()
+    except Exception:
+        return None
+    today = datetime.now(timezone.utc).date()
+    return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+
 WALLET_BONUS_TIERS = [
     {"amount": 10000, "bonus_percent": 3, "label": "₹10K"},
     {"amount": 25000, "bonus_percent": 7, "label": "₹25K"},
@@ -5121,22 +5165,91 @@ async def submit_kyc(data: Dict[str, Any] = Body(...), current_user: dict = Depe
     existing = current_user.get("kyc") or {}
     if existing.get("status") in ("pending", "verified"):
         raise HTTPException(status_code=400, detail=f"KYC already {existing['status']}")
-    required = ["name_on_pan", "pan_number", "aadhaar_number", "pan_doc_url", "aadhaar_front_url", "aadhaar_back_url"]
-    missing = [f for f in required if not str(data.get(f) or "").strip()]
-    if missing:
-        raise HTTPException(status_code=400, detail=f"KYC requires: {', '.join(missing)}")
+
+    # --- Identity ---
+    name = str(data.get("full_legal_name") or data.get("name_on_pan") or "").strip()
+    pan = str(data.get("pan_number") or "").strip().upper()
+    aadhaar = re.sub(r"\D", "", str(data.get("aadhaar_number") or ""))
+    dob = str(data.get("date_of_birth") or "").strip()[:10]
+    gender = str(data.get("gender") or "").strip().lower()
+    if not name:
+        raise HTTPException(status_code=400, detail="Enter your full legal name.")
+    if not PAN_RE.match(pan):
+        raise HTTPException(status_code=400, detail="PAN must look like ABCDE1234F.")
+    # Aadhaar is optional per spec; if given it must be valid.
+    if aadhaar and not aadhaar_valid(aadhaar):
+        raise HTTPException(status_code=400, detail="That Aadhaar number is not valid.")
+    age = age_years(dob)
+    if age is None:
+        raise HTTPException(status_code=400, detail="Enter a valid date of birth.")
+    if age < 18:
+        raise HTTPException(status_code=400, detail="You must be at least 18 to receive payouts.")
+    if gender not in ("male", "female", "other", "prefer_not_to_say"):
+        raise HTTPException(status_code=400, detail="Select your gender.")
+
+    # --- Residential address ---
+    addr = data.get("address") or {}
+    addr_line = str(addr.get("line") or data.get("address_line") or "").strip()
+    city = str(addr.get("city") or data.get("city") or "").strip()
+    state = str(addr.get("state") or data.get("state") or "").strip()
+    pincode = re.sub(r"\D", "", str(addr.get("pincode") or data.get("pincode") or ""))
+    if not (addr_line and city and state):
+        raise HTTPException(status_code=400, detail="Enter your full residential address.")
+    if len(pincode) != 6:
+        raise HTTPException(status_code=400, detail="Enter a valid 6-digit pincode.")
+
+    # --- Payout: UPI OR bank+IFSC (exactly one is enough) ---
+    upi = str(data.get("upi_id") or "").strip()
+    bank = data.get("bank_details") or {}
+    acct = str(bank.get("account_number") or "").strip()
+    ifsc = str(bank.get("ifsc_code") or "").strip().upper()
+    holder = str(bank.get("account_holder_name") or "").strip()
+    has_bank = bool(acct and ifsc)
+    if not upi and not has_bank:
+        raise HTTPException(status_code=400, detail="Add a payout method — a UPI ID or a bank account with IFSC.")
+    if upi and not UPI_RE.match(upi):
+        raise HTTPException(status_code=400, detail="That UPI ID doesn't look right (e.g. name@bank).")
+    if has_bank:
+        if not IFSC_RE.match(ifsc):
+            raise HTTPException(status_code=400, detail="That IFSC code is not valid (e.g. HDFC0001234).")
+        if not re.match(r'^\d{9,18}$', acct):
+            raise HTTPException(status_code=400, detail="Enter a valid bank account number.")
+        if not holder:
+            raise HTTPException(status_code=400, detail="Enter the account holder's name.")
+
+    # --- Documents ---
+    pan_doc = str(data.get("pan_doc_url") or "").strip()
+    selfie = str(data.get("selfie_url") or "").strip()
+    if not pan_doc:
+        raise HTTPException(status_code=400, detail="Upload a photo of your PAN card.")
+    if not selfie:
+        raise HTTPException(status_code=400, detail="Upload a selfie holding your ID.")
+
     kyc = {
         "status": "pending",
-        "name_on_pan": str(data["name_on_pan"]).strip(),
-        "pan_number": str(data["pan_number"]).strip().upper(),
-        "aadhaar_number": str(data["aadhaar_number"]).strip(),
-        "pan_doc_url": data["pan_doc_url"],
-        "aadhaar_front_url": data["aadhaar_front_url"],
-        "aadhaar_back_url": data["aadhaar_back_url"],
+        "full_legal_name": name,
+        "name_on_pan": name,
+        "date_of_birth": dob,
+        "gender": gender,
+        "pan_number": pan,
+        "aadhaar_number": aadhaar,
+        "address": {"line": addr_line, "city": city, "state": state, "pincode": pincode},
+        "payout_method": "upi" if upi else "bank",
+        "pan_doc_url": pan_doc,
+        "aadhaar_front_url": str(data.get("aadhaar_front_url") or "").strip(),
+        "aadhaar_back_url": str(data.get("aadhaar_back_url") or "").strip(),
+        "selfie_url": selfie,
         "submitted_at": now_iso(),
         "rejection_reason": None,
     }
-    await db.users.update_one({"id": current_user["id"]}, {"$set": {"kyc": kyc, "kyc_verified": False}})
+    # Payout account lives at the top level too (that's where withdrawals read it).
+    payout_set = {"upi_id": upi or None}
+    if has_bank:
+        payout_set["bank_details"] = {
+            "account_holder_name": holder, "bank_name": str(bank.get("bank_name") or "").strip(),
+            "account_number": acct, "ifsc_code": ifsc,
+        }
+    await db.users.update_one({"id": current_user["id"]}, {"$set": {"kyc": kyc, "kyc_verified": False, **payout_set}})
     await notify_admins("New KYC submission", f"{current_user.get('nickname', current_user['id'])} submitted KYC for review.")
     return _json_safe(kyc)
 
@@ -8069,7 +8182,8 @@ async def get_my_deals(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Only creators can access this")
 
     campaigns = await db.campaigns.find({
-        "selected_creator": current_user['id']
+        "selected_creator": current_user['id'],
+        "archived_by_creator": {"$ne": True},  # hide what the creator has archived
     }, {"_id": 0}).to_list(100)
 
     result = []
@@ -8087,6 +8201,7 @@ async def get_business_deals(current_user: dict = Depends(get_current_user)):
     campaigns = await db.campaigns.find({
         "business_id": _brand_ws_id(current_user),  # team members see the owner's deals
         "selected_creator": {"$nin": [None, ""]},
+        "archived_by_brand": {"$ne": True},  # hide what the brand has archived
     }, {"_id": 0}).to_list(200)
 
     result = []
@@ -9172,10 +9287,18 @@ async def request_deal_revision(deal_id: str, data: DealRevisionRequest, current
 
 @api_router.post("/deals/{deal_id}/archive")
 async def archive_deal(deal_id: str, current_user: dict = Depends(get_current_user)):
-    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    # Either party can archive a completed deal, and it's PER-PARTY: archiving only
+    # hides it from your own list, not the other side's. This used to be brand-only
+    # (a creator got a 403) and it wrote a flag no list query ever read — so the
+    # creator's "Archive Deal" did nothing and the deal kept coming back.
+    campaign = await get_campaign_by_deal_id(deal_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    ensure_deal_access(campaign, current_user)
+    field = "archived_by_creator" if current_user.get("role") == UserRole.CREATOR else "archived_by_brand"
     await db.campaigns.update_one(
         {"id": campaign['id']},
-        {"$set": {"archived_by_brand": True, "archived_at": now_iso()}},
+        {"$set": {field: True, "archived_at": now_iso()}},
     )
     return {"message": "Deal archived"}
 
