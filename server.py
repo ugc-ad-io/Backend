@@ -1260,10 +1260,28 @@ def _in_quiet_hours() -> bool:
     return ist_hour >= 22 or ist_hour < 8
 
 
-async def notify_user(user_id: str, title: str, message: str, link: Optional[str] = None, ntype: str = "info", email: bool = False, critical: bool = False):
+async def _email_category_allowed(user: dict, category: Optional[str]) -> bool:
+    """Whether the recipient still wants EMAIL for this notification category.
+    Creator prefs live on user.notification_prefs; brand prefs in business_settings.
+    Unknown category / no pref set → allowed (don't silently drop)."""
+    if not category or not user:
+        return True
+    prefs = user.get("notification_prefs") or {}
+    if category in prefs:
+        return bool(prefs[category])
+    if user.get("role") == UserRole.BUSINESS:
+        s = await db.business_settings.find_one({"business_id": user["id"]}, {"_id": 0, "notifications": 1})
+        n = (s or {}).get("notifications") or {}
+        if category in n:
+            return bool(n[category])
+    return True
+
+
+async def notify_user(user_id: str, title: str, message: str, link: Optional[str] = None, ntype: str = "info", email: bool = False, critical: bool = False, category: Optional[str] = None):
     """Send an in-app notification to a single user. Set email=True to ALSO send an
     email (best-effort — a mail failure never breaks the in-app notification/action).
-    Set critical=True for SLA/security emails that must bypass quiet hours."""
+    Set critical=True for SLA/security emails that must bypass quiet hours + prefs.
+    Set category to honor the recipient's per-category email preference."""
     await db.in_app_notifications.insert_one({
         "id": str(uuid.uuid4()),
         "user_id": user_id,
@@ -1278,7 +1296,10 @@ async def notify_user(user_id: str, title: str, message: str, link: Optional[str
     # Non-critical email is suppressed during quiet hours (the in-app record still shows).
     if email and (critical or not _in_quiet_hours()):
         try:
-            u = await db.users.find_one({"id": user_id}, {"_id": 0, "email": 1, "nickname": 1, "full_name": 1})
+            u = await db.users.find_one({"id": user_id}, {"_id": 0, "email": 1, "nickname": 1, "full_name": 1, "role": 1, "notification_prefs": 1})
+            # Honor the recipient's per-category email preference (critical bypasses it).
+            if not critical and not await _email_category_allowed(u or {}, category):
+                return
             addr = (u or {}).get("email")
             if addr:
                 html = _notification_email_html(title, message, link, (u.get("full_name") or u.get("nickname")))
@@ -4869,6 +4890,94 @@ async def update_profile_info(
 
     return {"message": "Profile updated successfully"}
 
+
+@api_router.put("/profile/payment-info")
+async def update_payment_info(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+    """Save a creator's payout account (bank + UPI). Read back via /payout/overview."""
+    bank = data.get("bank_details") or {}
+    await db.users.update_one(
+        {"id": current_user["id"]},
+        {"$set": {
+            "bank_details": {
+                "account_holder_name": (bank.get("account_holder_name") or "").strip(),
+                "bank_name": (bank.get("bank_name") or "").strip(),
+                "account_number": (bank.get("account_number") or "").strip(),
+                "ifsc_code": (bank.get("ifsc_code") or "").strip().upper(),
+            },
+            "upi_id": (data.get("upi_id") or "").strip() or None,
+            "updated_at": now_iso(),
+        }},
+    )
+    return {"message": "Payment details saved"}
+
+
+@api_router.get("/kyc/me")
+async def get_my_kyc(current_user: dict = Depends(get_current_user)):
+    """Current creator's KYC submission/status (mirrors what the admin queue reads)."""
+    kyc = current_user.get("kyc")
+    if not kyc:
+        return {"status": "not_submitted"}
+    return _json_safe(kyc)
+
+
+@api_router.post("/kyc/submit")
+async def submit_kyc(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+    """Creator submits PAN + Aadhaar for verification. Stored on user.kyc with
+    status 'pending' so it shows up in the admin KYC review queue (/admin/kyc)."""
+    if current_user["role"] != UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Only creators submit KYC")
+    existing = current_user.get("kyc") or {}
+    if existing.get("status") in ("pending", "verified"):
+        raise HTTPException(status_code=400, detail=f"KYC already {existing['status']}")
+    required = ["name_on_pan", "pan_number", "aadhaar_number", "pan_doc_url", "aadhaar_front_url", "aadhaar_back_url"]
+    missing = [f for f in required if not str(data.get(f) or "").strip()]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"KYC requires: {', '.join(missing)}")
+    kyc = {
+        "status": "pending",
+        "name_on_pan": str(data["name_on_pan"]).strip(),
+        "pan_number": str(data["pan_number"]).strip().upper(),
+        "aadhaar_number": str(data["aadhaar_number"]).strip(),
+        "pan_doc_url": data["pan_doc_url"],
+        "aadhaar_front_url": data["aadhaar_front_url"],
+        "aadhaar_back_url": data["aadhaar_back_url"],
+        "submitted_at": now_iso(),
+        "rejection_reason": None,
+    }
+    await db.users.update_one({"id": current_user["id"]}, {"$set": {"kyc": kyc, "kyc_verified": False}})
+    await notify_admins("New KYC submission", f"{current_user.get('nickname', current_user['id'])} submitted KYC for review.")
+    return _json_safe(kyc)
+
+
+@api_router.put("/profile/preferences")
+async def update_profile_preferences(data: Dict[str, Any] = Body(...), current_user: dict = Depends(get_current_user)):
+    """Persist a creator's notification + privacy preferences (were localStorage-only)."""
+    update = {"updated_at": now_iso()}
+    if isinstance(data.get("notification_prefs"), dict):
+        update["notification_prefs"] = data["notification_prefs"]
+    if isinstance(data.get("privacy"), dict):
+        update["privacy"] = data["privacy"]
+    await db.users.update_one({"id": current_user["id"]}, {"$set": update})
+    return {"message": "Preferences saved", "notification_prefs": update.get("notification_prefs"), "privacy": update.get("privacy")}
+
+
+# ---- Saved briefs (was localStorage-only) ---------------------------------
+@api_router.get("/saved-briefs")
+async def list_saved_briefs(current_user: dict = Depends(get_current_user)):
+    return {"campaign_ids": current_user.get("saved_briefs") or []}
+
+
+@api_router.post("/saved-briefs/{campaign_id}")
+async def add_saved_brief(campaign_id: str, current_user: dict = Depends(get_current_user)):
+    await db.users.update_one({"id": current_user["id"]}, {"$addToSet": {"saved_briefs": campaign_id}})
+    return {"saved": True}
+
+
+@api_router.delete("/saved-briefs/{campaign_id}")
+async def remove_saved_brief(campaign_id: str, current_user: dict = Depends(get_current_user)):
+    await db.users.update_one({"id": current_user["id"]}, {"$pull": {"saved_briefs": campaign_id}})
+    return {"saved": False}
+
 @api_router.post("/profile/change-password")
 async def change_password(old_password: str, new_password: str, current_user: dict = Depends(get_current_user)):
     """Change user password"""
@@ -7185,6 +7294,33 @@ async def assess_late_delivery(creator_id: str, campaign: dict, work: dict) -> d
         "created_at": now_iso(),
     })
     return {"is_late": True, "severity": severity, "penalty_pct": pct, "offense_number": offense_number, "hours_late": round(hours_late, 1)}
+
+
+@api_router.get("/work/{work_id}/download")
+async def download_work(work_id: str, current_user: dict = Depends(get_current_user)):
+    """Download the delivered file. Allowed for the brand on the campaign, the
+    creator, or an admin — and (for the brand) only once the work is approved."""
+    work = await db.work_submissions.find_one({"id": work_id}, {"_id": 0})
+    if not work:
+        raise HTTPException(status_code=404, detail="Work not found")
+    campaign = await db.campaigns.find_one({"id": work.get("campaign_id")}, {"_id": 0}) or {}
+    uid, role = current_user["id"], current_user.get("role")
+    is_brand = uid == campaign.get("business_id")
+    is_creator = uid == campaign.get("selected_creator") or uid == work.get("creator_id")
+    if not (is_brand or is_creator or role == UserRole.ADMIN):
+        raise HTTPException(status_code=403, detail="Not authorized to download this work")
+    if is_brand and role != UserRole.ADMIN and work.get("status") != WorkStatus.APPROVED:
+        raise HTTPException(status_code=403, detail="Download unlocks after you approve the work")
+    versions = work.get("versions") or []
+    latest = versions[-1] if versions else {}
+    url = latest.get("original_url") or latest.get("video_url") or work.get("video_url") or work.get("original_url")
+    if not url:
+        raise HTTPException(status_code=404, detail="No downloadable file for this work")
+    # Files live on Cloudinary or /uploads — hand back the URL to stream from.
+    from fastapi.responses import RedirectResponse
+    if not str(url).startswith("http"):
+        url = f"/{str(url).lstrip('/')}"
+    return RedirectResponse(url)
 
 
 @api_router.post("/work/{work_id}/approve")
@@ -12835,6 +12971,9 @@ async def payout_overview(current_user: dict = Depends(get_current_user)):
         "all_time_earnings": all_time,
         "last_month": 0,
         "deals_paid": len(released),
+        # Saved payout account (prefilled into the withdrawal form).
+        "bank_details": current_user.get("bank_details") or {},
+        "upi_id": current_user.get("upi_id") or "",
     }
 
 
