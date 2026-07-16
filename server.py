@@ -4420,7 +4420,8 @@ async def invite_business_settings_team_member(
     data: BusinessTeamInvite,
     current_user: dict = Depends(get_current_business_user)
 ):
-    validate_choice(data.role, ["admin", "editor", "viewer"], "role")
+    # Accept "member" (what the invite modal sends) alongside the legacy "editor".
+    validate_choice(data.role, ["admin", "editor", "member", "viewer"], "role")
     existing = await db.business_team_members.find_one({"business_id": current_user["id"], "email": data.email})
     if existing:
         raise HTTPException(status_code=400, detail="Team member already exists")
@@ -4449,7 +4450,7 @@ async def update_business_settings_team_member(
     update_data = {key: value for key, value in data.dict().items() if value is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields provided")
-    validate_choice(update_data.get("role"), ["admin", "editor", "viewer"], "role")
+    validate_choice(update_data.get("role"), ["admin", "editor", "member", "viewer"], "role")
     validate_choice(update_data.get("status"), ["active", "invited", "disabled"], "status")
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     result = await db.business_team_members.update_one(
