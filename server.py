@@ -5729,6 +5729,40 @@ async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Dep
 
     return {"message": "Bid submitted successfully"}
 
+@api_router.post("/campaigns/{campaign_id}/bids/{bid_id}/decline")
+async def decline_bid(campaign_id: str, bid_id: str, current_user: dict = Depends(get_current_user)):
+    """Brand declines a creator's bid. Persists status on the bid (so it stays
+    declined after a refresh) and notifies the creator."""
+    campaign = await db.campaigns.find_one({"id": campaign_id})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get("business_id") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="This campaign belongs to another brand")
+    # Match by bid id OR creator_id — the UI falls back to creator_id when a bid
+    # has no id, so accept either as the identifier.
+    bid = next((b for b in campaign.get("bids", []) if b.get("id") == bid_id or b.get("creator_id") == bid_id), None)
+    if not bid:
+        raise HTTPException(status_code=404, detail="Bid not found")
+    if bid.get("status") == "declined":
+        return {"message": "Bid already declined"}
+
+    await db.campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {"bids.$[b].status": "declined", "bids.$[b].declined_at": now_iso()}},
+        array_filters=[{"$or": [{"b.id": bid_id}, {"b.creator_id": bid_id}]}],
+    )
+
+    creator_id = bid.get("creator_id")
+    if creator_id:
+        await notify_user(
+            creator_id,
+            "Your bid was declined",
+            f"The brand declined your bid on '{campaign.get('title', 'a campaign')}'. Keep an eye out — plenty of other briefs are open.",
+            link="/browse-briefs",
+            ntype="info",
+        )
+    return {"message": "Bid declined"}
+
 @api_router.get("/bids/my")
 async def get_my_bids(current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
@@ -8876,6 +8910,16 @@ async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_
 @api_router.post("/reviews")
 async def submit_review(data: ReviewSubmit, current_user: dict = Depends(get_current_user)):
     rates_brand = bool(data.business_id) and current_user.get('role') == UserRole.CREATOR
+    # A review is one-time and immutable: once you've reviewed the other party for
+    # a campaign you can't add another (and there's no edit/undo). Block a repeat
+    # so a double-submit / re-open can't stack or silently change the rating.
+    already = await db.reviews.find_one({
+        "campaign_id": data.campaign_id,
+        "reviewer_id": current_user['id'],
+        "reviewee_role": "business" if rates_brand else "creator",
+    })
+    if already:
+        raise HTTPException(status_code=409, detail="You have already reviewed this. Reviews can't be changed once submitted.")
     review_doc = {
         "id": str(uuid.uuid4()),
         "campaign_id": data.campaign_id,

@@ -354,6 +354,35 @@ exports.createActionCard = async (req, res, next) => {
     const allowed = ACTION_CARDS_BY_ROLE[sender.role] || [];
     if (!allowed.includes(type)) return fail(res, 403, `Your role cannot send a ${type.replace(/_/g, ' ')}.`);
 
+    // Deal-bound cards only make sense against a LIVE deal in the right state.
+    // Without this, a brand could send a "Revision Request" on a Paid - Complete
+    // deal (the money's already released), or a milestone update with no deal at
+    // all — both of which are meaningless and confusing to the other side.
+    if (['revision_request', 'milestone_update'].includes(type)) {
+      const deal = await Deal.findOne({
+        $or: [
+          { brand_id: sender._id, creator_id: recipient._id },
+          { brand_id: recipient._id, creator_id: sender._id },
+        ],
+      }).sort({ updatedAt: -1 });
+
+      if (!deal) return fail(res, 409, 'There is no active deal with this user yet.');
+      const state = deal.current_state;
+      const done = state === sm.STATES.PAID;
+
+      if (type === 'revision_request') {
+        // A revision can only be asked for while the brand is reviewing submitted
+        // content. Once it's approved/paid, revisions go through a new deal.
+        if (done) return fail(res, 409, 'This deal is already complete — you can’t request a revision. Start a new deal for more work.');
+        if (state !== sm.STATES.AWAITING_REVIEW && state !== sm.STATES.REVISION_REQUESTED) {
+          return fail(res, 409, 'You can only request a revision after the creator submits content for review.');
+        }
+      } else if (type === 'milestone_update') {
+        // No point posting milestones on a wrapped-up deal.
+        if (done) return fail(res, 409, 'This deal is already complete.');
+      }
+    }
+
     let thread;
     try {
       ({ thread } = await getOrCreateThread(sender, recipient));
