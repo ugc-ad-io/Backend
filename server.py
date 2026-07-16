@@ -2508,7 +2508,7 @@ def ensure_deal_access(campaign: dict, current_user: dict):
     role = current_user.get('role')
     if role == UserRole.CREATOR and campaign.get('selected_creator') == current_user['id']:
         return
-    if role == UserRole.BUSINESS and campaign.get('business_id') == current_user['id']:
+    if role == UserRole.BUSINESS and campaign.get('business_id') == _brand_ws_id(current_user):
         return
     if role in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
         return
@@ -3329,12 +3329,12 @@ async def invite_creator_from_directory(
         raise HTTPException(status_code=404, detail="Creator is not available in the brand directory")
 
     if data.campaign_id:
-        campaign = await db.campaigns.find_one({"id": data.campaign_id, "business_id": current_user["id"]}, {"_id": 0})
+        campaign = await db.campaigns.find_one({"id": data.campaign_id, "business_id": _brand_ws_id(current_user)}, {"_id": 0})
         if not campaign:
             raise HTTPException(status_code=404, detail="Campaign not found")
 
     duplicate_query = {
-        "business_id": current_user["id"],
+        "business_id": _brand_ws_id(current_user),
         "creator_id": creator_id,
         "status": {"$in": ["open", "pending", "sent"]},
     }
@@ -3348,7 +3348,7 @@ async def invite_creator_from_directory(
     created_at = now_iso()
     invitation = {
         "id": str(uuid.uuid4()),
-        "business_id": current_user["id"],
+        "business_id": _brand_ws_id(current_user),
         "business_nickname": current_user.get("nickname"),
         "creator_id": creator_id,
         "creator_nickname": creator.get("nickname"),
@@ -3457,7 +3457,7 @@ async def get_business_wallet(current_user: dict = Depends(get_approved_business
         raise HTTPException(status_code=403, detail="Business profile must be approved")
 
     balance = to_float(current_user.get("balance"))
-    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    settings = await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0})
     plan_name = (
         ((settings or {}).get("billing") or {}).get("plan_name") or
         current_user.get("plan_name") or
@@ -3476,7 +3476,7 @@ async def get_business_wallet(current_user: dict = Depends(get_approved_business
         transactions.append(normalize_wallet_transaction(row, tx_type, "credit"))
 
     brand_campaigns = await db.campaigns.find(
-        {"business_id": current_user["id"]},
+        {"business_id": _brand_ws_id(current_user)},
         {"_id": 0, "id": 1, "title": 1, "status": 1, "budget": 1, "budget_min": 1, "budget_max": 1, "created_at": 1, "submitted_at": 1},
     ).to_list(10000)
     campaign_ids = [campaign.get("id") for campaign in brand_campaigns if campaign.get("id")]
@@ -3711,7 +3711,7 @@ async def checkout_brief(data: CheckoutBriefCreate,
     campaign_doc = {
         **brief,                       # title, delivery_date, delivery_slot, requires_shipment…
         "id": campaign_id,
-        "business_id": current_user["id"],
+        "business_id": _brand_ws_id(current_user),
         "business_nickname": current_user.get("nickname", ""),
         "brand_name": profile.get("business_name") or current_user.get("nickname", ""),
         "brand_logo_url": profile.get("logo") or "",
@@ -3744,7 +3744,7 @@ async def checkout_brief(data: CheckoutBriefCreate,
         await db.escrow.insert_one({
             "id": escrow_id,
             "campaign_id": campaign_id,
-            "business_id": current_user["id"],
+            "business_id": _brand_ws_id(current_user),
             "creator_id": data.creator_id,
             "amount": q["subtotal"],
             "brand_commission_amount": q["fee"],
@@ -3834,7 +3834,7 @@ async def get_booking(campaign_id: str, current_user: dict, *, role: str) -> dic
         raise HTTPException(status_code=404, detail="Booking not found")
     if role == "creator" and campaign.get("selected_creator") != current_user["id"]:
         raise HTTPException(status_code=403, detail="This booking isn't yours")
-    if role == "brand" and campaign.get("business_id") != current_user["id"]:
+    if role == "brand" and campaign.get("business_id") != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="This booking isn't yours")
     return campaign
 
@@ -4038,7 +4038,7 @@ async def get_business_dashboard(current_user: dict = Depends(get_current_user))
     if current_user.get('role') != UserRole.BUSINESS:
         raise HTTPException(status_code=403, detail="Only business users can access this dashboard")
 
-    business_id = current_user['id']
+    business_id = _brand_ws_id(current_user)  # team members see the owner's workspace
     campaigns = await db.campaigns.find({"business_id": business_id}, {"_id": 0}).to_list(10000)
     campaign_ids = [campaign.get("id") for campaign in campaigns if campaign.get("id")]
 
@@ -4264,7 +4264,7 @@ async def get_business_dashboard(current_user: dict = Depends(get_current_user))
 # Business Settings Routes
 @api_router.get("/business/settings/profile")
 async def get_business_settings_profile(current_user: dict = Depends(get_current_business_user)):
-    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    settings = await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0})
     return business_profile_defaults(current_user, (settings or {}).get("profile"))
 
 @api_router.put("/business/settings/profile")
@@ -4277,9 +4277,9 @@ async def update_business_settings_profile(
 
     now = datetime.now(timezone.utc).isoformat()
     await db.business_settings.update_one(
-        {"business_id": current_user["id"]},
+        {"business_id": _brand_ws_id(current_user)},
         {
-            "$set": {"business_id": current_user["id"], "profile": profile_data, "updated_at": now},
+            "$set": {"business_id": _brand_ws_id(current_user), "profile": profile_data, "updated_at": now},
             "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
         },
         upsert=True
@@ -4296,7 +4296,7 @@ async def update_business_settings_profile(
         }}
     )
     await db.campaigns.update_many(
-        {"business_id": current_user["id"]},
+        {"business_id": _brand_ws_id(current_user)},
         {"$set": {
             "brand_name": profile_data["brand_name"],
             "brand_logo_url": profile_data.get("logo_url", ""),
@@ -4328,42 +4328,42 @@ async def upload_business_settings_logo(
         cloud_folder="ugcad/logos",
     )
     now = datetime.now(timezone.utc).isoformat()
-    existing = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    existing = await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0})
     profile_data = business_profile_defaults(current_user, (existing or {}).get("profile"))
     profile_data["logo_url"] = logo_url
     await db.business_settings.update_one(
-        {"business_id": current_user["id"]},
+        {"business_id": _brand_ws_id(current_user)},
         {
-            "$set": {"business_id": current_user["id"], "profile": profile_data, "updated_at": now},
+            "$set": {"business_id": _brand_ws_id(current_user), "profile": profile_data, "updated_at": now},
             "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
         },
         upsert=True
     )
     await db.users.update_one({"id": current_user["id"]}, {"$set": {"profile.logo": logo_url, "updated_at": now}})
-    await db.campaigns.update_many({"business_id": current_user["id"]}, {"$set": {"brand_logo_url": logo_url, "updated_at": now}})
+    await db.campaigns.update_many({"business_id": _brand_ws_id(current_user)}, {"$set": {"brand_logo_url": logo_url, "updated_at": now}})
     return {"logo_url": logo_url}
 
 @api_router.delete("/business/settings/logo")
 async def delete_business_settings_logo(current_user: dict = Depends(get_current_business_user)):
     now = datetime.now(timezone.utc).isoformat()
-    existing = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    existing = await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0})
     profile_data = business_profile_defaults(current_user, (existing or {}).get("profile"))
     profile_data["logo_url"] = ""
     await db.business_settings.update_one(
-        {"business_id": current_user["id"]},
+        {"business_id": _brand_ws_id(current_user)},
         {
-            "$set": {"business_id": current_user["id"], "profile": profile_data, "updated_at": now},
+            "$set": {"business_id": _brand_ws_id(current_user), "profile": profile_data, "updated_at": now},
             "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
         },
         upsert=True
     )
     await db.users.update_one({"id": current_user["id"]}, {"$set": {"profile.logo": "", "updated_at": now}})
-    await db.campaigns.update_many({"business_id": current_user["id"]}, {"$set": {"brand_logo_url": "", "updated_at": now}})
+    await db.campaigns.update_many({"business_id": _brand_ws_id(current_user)}, {"$set": {"brand_logo_url": "", "updated_at": now}})
     return {"logo_url": ""}
 
 @api_router.get("/business/settings/company")
 async def get_business_settings_company(current_user: dict = Depends(get_current_business_user)):
-    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    settings = await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0})
     return business_company_defaults(current_user, (settings or {}).get("company"))
 
 @api_router.put("/business/settings/company")
@@ -4379,9 +4379,9 @@ async def update_business_settings_company(
 
     now = datetime.now(timezone.utc).isoformat()
     await db.business_settings.update_one(
-        {"business_id": current_user["id"]},
+        {"business_id": _brand_ws_id(current_user)},
         {
-            "$set": {"business_id": current_user["id"], "company": company_data, "updated_at": now},
+            "$set": {"business_id": _brand_ws_id(current_user), "company": company_data, "updated_at": now},
             "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
         },
         upsert=True
@@ -4397,33 +4397,50 @@ async def update_business_settings_company(
     )
     return company_data
 
+# ── Brand team / shared workspace helpers ────────────────────────────────────
+# A brand team member logs in with their own account but operates on the OWNER's
+# brand data. `team_of` on their user doc points at the owner; brand-scoped
+# queries resolve through _brand_ws_id() so a member sees the owner's campaigns,
+# deals and work. Their own id still keys chat / notifications / audit.
+def _brand_ws_id(user: dict) -> str:
+    return user.get("team_of") or user.get("id")
+
+def _can_manage_team(user: dict) -> bool:
+    # The owner (no team_of) or a team admin can invite / remove members.
+    return (not user.get("team_of")) or user.get("team_role") == "admin"
+
+def _hash_invite_token(token: str) -> str:
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+async def _team_payload(owner_id: str) -> dict:
+    owner = await db.users.find_one({"id": owner_id}, {"_id": 0}) or {}
+    members = [{
+        "id": owner_id,
+        "name": (owner.get("profile") or {}).get("business_name") or owner.get("nickname") or owner.get("email", ""),
+        "email": owner.get("email", ""),
+        "avatar_url": owner.get("profile_photo") or "",
+        "role": "owner",
+        "status": "active",
+        "is_owner": True,
+    }]
+    rows = await db.business_team_members.find({"business_id": owner_id}, {"_id": 0}).sort("created_at", 1).to_list(1000)
+    for m in rows:
+        members.append({
+            "id": m.get("id"),
+            "name": m.get("name") or m.get("email", ""),
+            "email": m.get("email", ""),
+            "avatar_url": m.get("avatar_url", ""),
+            "role": m.get("role", "viewer"),
+            "status": m.get("status", "invited"),
+        })
+    settings = await db.business_settings.find_one({"business_id": owner_id}, {"_id": 0})
+    seat_limit = ((settings or {}).get("team") or {}).get("seat_limit", 10)
+    return {"members": members, "seat_limit": seat_limit, "seats_used": len(members)}
+
 @api_router.get("/business/settings/team")
 async def get_business_settings_team(current_user: dict = Depends(get_current_business_user)):
-    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
-    team_settings = (settings or {}).get("team") or {}
-    members = [{
-        "id": current_user["id"],
-        "name": current_user.get("nickname") or current_user.get("email", ""),
-        "email": current_user.get("email", ""),
-        "avatar_url": current_user.get("profile_photo") or current_user.get("avatar_url") or "",
-        "role": "admin",
-        "status": "active"
-    }]
-    invited_members = await db.business_team_members.find({"business_id": current_user["id"]}, {"_id": 0}).sort("created_at", 1).to_list(1000)
-    for member in invited_members:
-        members.append({
-            "id": member.get("id"),
-            "name": member.get("name") or member.get("email", ""),
-            "email": member.get("email", ""),
-            "avatar_url": member.get("avatar_url", ""),
-            "role": member.get("role", "viewer"),
-            "status": member.get("status", "invited")
-        })
-    return {
-        "members": members,
-        "seat_limit": team_settings.get("seat_limit", 5),
-        "seats_used": len([member for member in members if member.get("status") in ["active", "invited"]])
-    }
+    # Resolve to the workspace owner so a team member sees the real team, not just themselves.
+    return await _team_payload(_brand_ws_id(current_user))
 
 @api_router.post("/business/settings/team/invite")
 async def invite_business_settings_team_member(
@@ -4432,24 +4449,68 @@ async def invite_business_settings_team_member(
 ):
     # Accept "member" (what the invite modal sends) alongside the legacy "editor".
     validate_choice(data.role, ["admin", "editor", "member", "viewer"], "role")
-    existing = await db.business_team_members.find_one({"business_id": current_user["id"], "email": data.email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Team member already exists")
+    if not _can_manage_team(current_user):
+        raise HTTPException(status_code=403, detail="Only the workspace owner or an admin can invite members.")
+    owner_id = _brand_ws_id(current_user)
+    owner = await db.users.find_one({"id": owner_id}, {"_id": 0}) or {}
+    email = str(data.email).lower().strip()
 
+    if email == str(owner.get("email", "")).lower():
+        raise HTTPException(status_code=409, detail="That is the workspace owner.")
+    existing = await db.business_team_members.find_one({"business_id": owner_id, "email": email})
+    if existing:
+        raise HTTPException(status_code=409, detail="That person is already on your team.")
+    # Someone can't be a member of two brand workspaces.
+    other_ws = await db.users.find_one({"email": email, "team_of": {"$nin": [None, ""]}}, {"_id": 0})
+    if other_ws and other_ws.get("team_of") != owner_id:
+        raise HTTPException(status_code=409, detail="That email already belongs to another brand workspace.")
+
+    # Seat check (owner + members).
+    payload = await _team_payload(owner_id)
+    if payload["seats_used"] >= payload["seat_limit"]:
+        raise HTTPException(status_code=409, detail=f"Seat limit reached ({payload['seat_limit']}). Remove a member first.")
+
+    raw_token = uuid.uuid4().hex + uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
+    expires = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
     member_doc = {
         "id": str(uuid.uuid4()),
-        "business_id": current_user["id"],
-        "name": data.name or str(data.email).split("@")[0],
-        "email": data.email,
+        "business_id": owner_id,
+        "name": data.name or email.split("@")[0],
+        "email": email,
         "avatar_url": "",
         "role": data.role,
         "status": "invited",
+        "invite_token_hash": _hash_invite_token(raw_token),
+        "invite_expires": expires,
+        "invited_by": current_user["id"],
         "created_at": now,
-        "updated_at": now
+        "updated_at": now,
     }
     await db.business_team_members.insert_one(member_doc)
-    return {key: member_doc[key] for key in ["id", "name", "email", "avatar_url", "role", "status"]}
+
+    # Email the invite with a set-password link.
+    brand_name = (owner.get("profile") or {}).get("business_name") or owner.get("nickname") or "a brand"
+    frontend = (os.environ.get("FRONTEND_URL") or "https://www.ugcad.io").rstrip("/")
+    link = f"{frontend}/team/accept?token={raw_token}"
+    try:
+        await send_email(
+            to=email,
+            subject=f"You've been invited to join {brand_name} on UGCad.io",
+            html=_email_base_template(
+                "Team invitation",
+                f'<h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Join {brand_name} on UGCad.io</h1>'
+                f'<p style="margin:0 0 8px;font-size:15px;line-height:1.6;color:#4a4f74;">You\'ve been invited as a <strong>{data.role}</strong>. '
+                'Set a password to access the workspace. This link expires in 7 days.</p>'
+                + _email_button("Accept invitation", link)
+                + f'<p style="margin:22px 0 0;font-size:12.5px;color:#9296ba;word-break:break-all;">Or paste this link: {link}</p>'
+            ),
+        )
+    except Exception as e:
+        logger.error(f"[team/invite] email failed: {e}")
+    logger.info(f"[team/invite] {email} invited to workspace {owner_id}: {link}")
+
+    return await _team_payload(owner_id)
 
 @api_router.patch("/business/settings/team/{member_id}")
 async def update_business_settings_team_member(
@@ -4462,36 +4523,134 @@ async def update_business_settings_team_member(
         raise HTTPException(status_code=400, detail="No fields provided")
     validate_choice(update_data.get("role"), ["admin", "editor", "member", "viewer"], "role")
     validate_choice(update_data.get("status"), ["active", "invited", "disabled"], "status")
+    if not _can_manage_team(current_user):
+        raise HTTPException(status_code=403, detail="Only the workspace owner or an admin can change members.")
+    owner_id = _brand_ws_id(current_user)
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     result = await db.business_team_members.update_one(
-        {"id": member_id, "business_id": current_user["id"]},
+        {"id": member_id, "business_id": owner_id},
         {"$set": update_data}
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Team member not found")
-    member = await db.business_team_members.find_one({"id": member_id, "business_id": current_user["id"]}, {"_id": 0})
-    return {
-        "id": member.get("id"),
-        "name": member.get("name") or member.get("email", ""),
-        "email": member.get("email", ""),
-        "avatar_url": member.get("avatar_url", ""),
-        "role": member.get("role", "viewer"),
-        "status": member.get("status", "invited")
-    }
+    # Keep the member's linked user role in step when their team role changes.
+    member = await db.business_team_members.find_one({"id": member_id, "business_id": owner_id}, {"_id": 0})
+    if member and member.get("user_id") and update_data.get("role"):
+        await db.users.update_one({"id": member["user_id"]}, {"$set": {"team_role": update_data["role"]}})
+    return await _team_payload(owner_id)
 
 @api_router.delete("/business/settings/team/{member_id}")
 async def delete_business_settings_team_member(member_id: str, current_user: dict = Depends(get_current_business_user)):
-    result = await db.business_team_members.delete_one({"id": member_id, "business_id": current_user["id"]})
-    if result.deleted_count == 0:
+    if not _can_manage_team(current_user):
+        raise HTTPException(status_code=403, detail="Only the workspace owner or an admin can remove members.")
+    owner_id = _brand_ws_id(current_user)
+    member = await db.business_team_members.find_one({"id": member_id, "business_id": owner_id})
+    if not member:
         raise HTTPException(status_code=404, detail="Team member not found")
-    return {"message": "Team member removed"}
+    # If they already accepted and have a login, unlink it from the workspace so
+    # their access is cut (their account itself survives).
+    if member.get("user_id"):
+        await db.users.update_one({"id": member["user_id"]}, {"$set": {"team_of": None, "team_role": "owner"}})
+    await db.business_team_members.delete_one({"id": member_id, "business_id": owner_id})
+    return await _team_payload(owner_id)
+
+# ── Public team-invite accept flow (no auth) ─────────────────────────────────
+class TeamAcceptRequest(BaseModel):
+    token: str
+    password: str
+    name: Optional[str] = None
+
+async def _find_team_invite(token: str):
+    return await db.business_team_members.find_one({"invite_token_hash": _hash_invite_token(token)}, {"_id": 0})
+
+@api_router.get("/team/invite/{token}")
+async def get_team_invite(token: str):
+    inv = await _find_team_invite(token)
+    if not inv or inv.get("status") != "invited":
+        raise HTTPException(status_code=404, detail="This invitation is invalid or has expired.")
+    exp = inv.get("invite_expires")
+    if exp and datetime.fromisoformat(exp) < datetime.now(timezone.utc):
+        raise HTTPException(status_code=404, detail="This invitation is invalid or has expired.")
+    owner = await db.users.find_one({"id": inv.get("business_id")}, {"_id": 0}) or {}
+    return {
+        "email": inv.get("email"),
+        "role": inv.get("role", "member"),
+        "brand_name": (owner.get("profile") or {}).get("business_name") or owner.get("nickname") or "a brand",
+    }
+
+@api_router.post("/team/accept")
+async def accept_team_invite(data: TeamAcceptRequest):
+    if not data.token or not data.password:
+        raise HTTPException(status_code=400, detail="Token and password are required.")
+    if len(data.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
+    inv = await _find_team_invite(data.token)
+    if not inv or inv.get("status") != "invited":
+        raise HTTPException(status_code=404, detail="This invitation is invalid or has expired.")
+    exp = inv.get("invite_expires")
+    if exp and datetime.fromisoformat(exp) < datetime.now(timezone.utc):
+        raise HTTPException(status_code=404, detail="This invitation is invalid or has expired.")
+
+    owner_id = inv.get("business_id")
+    owner = await db.users.find_one({"id": owner_id}, {"_id": 0})
+    if not owner:
+        raise HTTPException(status_code=404, detail="The inviting brand no longer exists.")
+
+    email = str(inv.get("email")).lower().strip()
+    existing = await db.users.find_one({"email": email}, {"_id": 0})
+    if existing and existing.get("team_of") and existing.get("team_of") != owner_id:
+        raise HTTPException(status_code=409, detail="This email already belongs to another workspace.")
+    if existing and not existing.get("team_of") and existing.get("role") != UserRole.BUSINESS:
+        # An existing creator/other account can't be converted into a brand member.
+        raise HTTPException(status_code=409, detail="An account with this email already exists. Sign in instead.")
+
+    now = datetime.now(timezone.utc).isoformat()
+    if existing:
+        user_id = existing["id"]
+        await db.users.update_one({"id": user_id}, {"$set": {
+            "password": hash_password(data.password),
+            "team_of": owner_id,
+            "team_role": inv.get("role", "member"),
+            "role": UserRole.BUSINESS,
+            "approval_status": ApprovalStatus.APPROVED,
+            "active": True,
+            "updated_at": now,
+        }})
+    else:
+        user_id = str(uuid.uuid4())
+        await db.users.insert_one({
+            "id": user_id,
+            "email": email,
+            "password": hash_password(data.password),
+            "role": UserRole.BUSINESS,
+            "nickname": (data.name or inv.get("name") or email.split("@")[0]),
+            "full_name": data.name or "",
+            "profile_completed": True,
+            "approval_status": ApprovalStatus.APPROVED,
+            "active": True,
+            "team_of": owner_id,
+            "team_role": inv.get("role", "member"),
+            "balance": 0.0,
+            "created_at": now,
+            "updated_at": now,
+        })
+
+    # Mark the invite consumed + link it to the login.
+    await db.business_team_members.update_one(
+        {"id": inv["id"]},
+        {"$set": {"status": "active", "user_id": user_id, "updated_at": now},
+         "$unset": {"invite_token_hash": "", "invite_expires": ""}},
+    )
+
+    fresh = await db.users.find_one({"id": user_id}, {"_id": 0})
+    return _auth_response(fresh)
 
 @api_router.get("/business/settings/billing")
 async def get_business_settings_billing(current_user: dict = Depends(get_current_business_user)):
-    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    settings = await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0})
     billing = (settings or {}).get("billing") or {}
     transactions = await db.payment_transactions.find({"user_id": current_user["id"]}, {"_id": 0}).sort("created_at", -1).limit(20).to_list(20)
-    campaigns = await db.campaigns.find({"business_id": current_user["id"]}, {"_id": 0}).to_list(10000)
+    campaigns = await db.campaigns.find({"business_id": _brand_ws_id(current_user)}, {"_id": 0}).to_list(10000)
     current_month_start = month_start(datetime.now(timezone.utc))
     next_month_start = add_months(current_month_start, 1)
     monthly_budget_used = sum(
@@ -4516,9 +4675,9 @@ async def upgrade_business_settings_billing(data: BusinessBillingUpgrade, curren
     require_non_empty(data.dict(), ["plan_name"])
     now = datetime.now(timezone.utc).isoformat()
     await db.business_settings.update_one(
-        {"business_id": current_user["id"]},
+        {"business_id": _brand_ws_id(current_user)},
         {
-            "$set": {"business_id": current_user["id"], "billing.plan_name": data.plan_name, "updated_at": now},
+            "$set": {"business_id": _brand_ws_id(current_user), "billing.plan_name": data.plan_name, "updated_at": now},
             "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
         },
         upsert=True
@@ -4532,9 +4691,9 @@ async def create_business_settings_payment_method(data: BusinessPaymentMethodCre
     now = datetime.now(timezone.utc).isoformat()
     method = {"id": str(uuid.uuid4()), **payload, "created_at": now}
     await db.business_settings.update_one(
-        {"business_id": current_user["id"]},
+        {"business_id": _brand_ws_id(current_user)},
         {
-            "$set": {"business_id": current_user["id"], "updated_at": now},
+            "$set": {"business_id": _brand_ws_id(current_user), "updated_at": now},
             "$push": {"billing.payment_methods": method},
             "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
         },
@@ -4544,7 +4703,7 @@ async def create_business_settings_payment_method(data: BusinessPaymentMethodCre
 
 @api_router.get("/business/settings/notifications")
 async def get_business_settings_notifications(current_user: dict = Depends(get_current_business_user)):
-    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    settings = await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0})
     return business_notification_defaults((settings or {}).get("notifications"))
 
 @api_router.put("/business/settings/notifications")
@@ -4555,9 +4714,9 @@ async def update_business_settings_notifications(
     notification_data = data.dict()
     now = datetime.now(timezone.utc).isoformat()
     await db.business_settings.update_one(
-        {"business_id": current_user["id"]},
+        {"business_id": _brand_ws_id(current_user)},
         {
-            "$set": {"business_id": current_user["id"], "notifications": notification_data, "updated_at": now},
+            "$set": {"business_id": _brand_ws_id(current_user), "notifications": notification_data, "updated_at": now},
             "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}
         },
         upsert=True
@@ -4585,10 +4744,10 @@ async def delete_business_settings_session(session_id: str, current_user: dict =
 
 @api_router.get("/business/settings/summary")
 async def get_business_settings_summary(current_user: dict = Depends(get_current_business_user)):
-    settings = await db.business_settings.find_one({"business_id": current_user["id"]}, {"_id": 0})
+    settings = await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0})
     billing = (settings or {}).get("billing") or {}
     team_count = 1 + await db.business_team_members.count_documents({
-        "business_id": current_user["id"],
+        "business_id": _brand_ws_id(current_user),
         "status": {"$in": ["active", "invited"]}
     })
     return {
@@ -4764,7 +4923,7 @@ async def update_business_profile(data: BusinessProfileUpdate, current_user: dic
     brand_logo_url = profile_data.get('logo') or ''
     brand_cover_image_url = profile_data.get('banner') or ''
     await db.campaigns.update_many(
-        {"business_id": current_user['id']},
+        {"business_id": _brand_ws_id(current_user)},
         {"$set": {
             "brand_name": brand_name,
             "brand_logo_url": brand_logo_url,
@@ -5226,7 +5385,7 @@ async def create_draft(data: CampaignDraftCreate, current_user: dict = Depends(g
     # Add metadata
     campaign_doc.update({
         "id": campaign_id,
-        "business_id": current_user['id'],
+        "business_id": _brand_ws_id(current_user),
         "business_nickname": current_user.get('nickname', ''),
         "brand_name": brand_name,
         "brand_logo_url": brand_logo_url,
@@ -5257,7 +5416,7 @@ async def update_campaign_route(campaign_id: str, data: CampaignUpdate, current_
         raise HTTPException(status_code=404, detail="Campaign not found")
     
     # Check ownership
-    if campaign.get('business_id') != current_user['id']:
+    if campaign.get('business_id') != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="You can only edit your own campaigns")
     
     # Check if campaign can be edited
@@ -5298,7 +5457,7 @@ async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(g
         raise HTTPException(status_code=404, detail="Campaign not found")
     
     # Check ownership
-    if campaign.get('business_id') != current_user['id']:
+    if campaign.get('business_id') != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="You can only submit your own campaigns")
     
     # Check if campaign is in draft or rejected status
@@ -5383,7 +5542,7 @@ async def upload_campaign_image(
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if campaign.get('business_id') != current_user['id']:
+    if campaign.get('business_id') != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="You can only upload to your own campaigns")
 
     # Validate image_type
@@ -5482,7 +5641,7 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
     # Add metadata
     campaign_doc.update({
         "id": campaign_id,
-        "business_id": current_user['id'],
+        "business_id": _brand_ws_id(current_user),
         "business_nickname": current_user.get('nickname', ''),
         "brand_name": brand_name,
         "brand_logo_url": brand_logo_url,
@@ -5612,7 +5771,7 @@ async def get_campaign_shortlist(campaign_id: str, current_user: dict = Depends(
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if current_user["role"] not in OPS_ROLES and campaign.get("business_id") != current_user["id"]:
+    if current_user["role"] not in OPS_ROLES and campaign.get("business_id") != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="You can only view shortlists for your own briefs")
 
     candidates = []
@@ -5636,7 +5795,7 @@ async def invite_shortlist_candidate(campaign_id: str, creator_id: str, data: Sh
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if campaign.get("business_id") != current_user["id"]:
+    if campaign.get("business_id") != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="You can only invite from your own brief")
     shortlist = campaign.get("shortlist", [])
     if not any(c.get("creator_id") == creator_id for c in shortlist):
@@ -5693,7 +5852,7 @@ async def request_new_shortlist(campaign_id: str, current_user: dict = Depends(g
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if campaign.get("business_id") != current_user["id"]:
+    if campaign.get("business_id") != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="You can only request matches for your own brief")
     count = (campaign.get("shortlist_request_count") or 0) + 1
     await db.campaigns.update_one(
@@ -5799,7 +5958,7 @@ async def get_campaigns(
             ]
         }
     elif current_user['role'] == UserRole.BUSINESS:
-        query['business_id'] = current_user['id']
+        query['business_id'] = _brand_ws_id(current_user)  # team members see the owner's campaigns
         # Optionally filter by status
         if status:
             query['status'] = status
@@ -5887,7 +6046,7 @@ async def decline_bid(campaign_id: str, bid_id: str, current_user: dict = Depend
     campaign = await db.campaigns.find_one({"id": campaign_id})
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if campaign.get("business_id") != current_user["id"]:
+    if campaign.get("business_id") != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="This campaign belongs to another brand")
     # Match by bid id OR creator_id — the UI falls back to creator_id when a bid
     # has no id, so accept either as the identifier.
@@ -5955,7 +6114,7 @@ async def get_my_bids(current_user: dict = Depends(get_current_user)):
 @api_router.post("/campaigns/{campaign_id}/select-creator")
 async def select_creator(campaign_id: str, creator_id: str, current_user: dict = Depends(get_current_user)):
     campaign = await db.campaigns.find_one({"id": campaign_id})
-    if not campaign or campaign['business_id'] != current_user['id']:
+    if not campaign or campaign['business_id'] != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="Not authorized")
     
     # Get creator details
@@ -5996,7 +6155,7 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
         escrow_doc = {
             "id": escrow_id,
             "campaign_id": campaign_id,
-            "business_id": current_user['id'],
+            "business_id": _brand_ws_id(current_user),
             "creator_id": creator_id,
             "amount": deal_amount,
             "brand_commission_amount": brand_fee,
@@ -6018,7 +6177,7 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
         escrow_doc = {
             "id": escrow_id,
             "campaign_id": campaign_id,
-            "business_id": current_user['id'],
+            "business_id": _brand_ws_id(current_user),
             "creator_id": creator_id,
             "amount": deal_amount,
             "brand_commission_amount": brand_fee,
@@ -7330,7 +7489,7 @@ async def download_work(work_id: str, current_user: dict = Depends(get_current_u
         raise HTTPException(status_code=404, detail="Work not found")
     campaign = await db.campaigns.find_one({"id": work.get("campaign_id")}, {"_id": 0}) or {}
     uid, role = current_user["id"], current_user.get("role")
-    is_brand = uid == campaign.get("business_id")
+    is_brand = _brand_ws_id(current_user) == campaign.get("business_id")
     is_creator = uid == campaign.get("selected_creator") or uid == work.get("creator_id")
     if not (is_brand or is_creator or role == UserRole.ADMIN):
         raise HTTPException(status_code=403, detail="Not authorized to download this work")
@@ -7355,7 +7514,7 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
         raise HTTPException(status_code=404, detail="Work not found")
 
     campaign = await db.campaigns.find_one({"id": work['campaign_id']})
-    if campaign['business_id'] != current_user['id']:
+    if campaign['business_id'] != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     # PRD 9.3: no approval while a dispute is open.
@@ -7770,7 +7929,7 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
         raise HTTPException(status_code=404, detail="Work not found")
 
     campaign = await db.campaigns.find_one({"id": work['campaign_id']})
-    if campaign['business_id'] != current_user['id']:
+    if campaign['business_id'] != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     # PRD 9.3: no revision requests while a dispute is open.
@@ -7918,7 +8077,7 @@ async def get_business_deals(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Only brands can access this")
 
     campaigns = await db.campaigns.find({
-        "business_id": current_user['id'],
+        "business_id": _brand_ws_id(current_user),  # team members see the owner's deals
         "selected_creator": {"$nin": [None, ""]},
     }, {"_id": 0}).to_list(200)
 
@@ -8686,7 +8845,7 @@ async def appeal_dispute(dispute_id: str, data: DisputeAppeal, current_user: dic
 
 @api_router.get("/disputes/my")
 async def get_my_disputes(current_user: dict = Depends(get_current_user)):
-    disputes = await db.disputes.find({"$or": [{"business_id": current_user["id"]}, {"creator_id": current_user["id"]}]}, {"_id": 0}).sort("created_at", -1).to_list(200)
+    disputes = await db.disputes.find({"$or": [{"business_id": _brand_ws_id(current_user)}, {"creator_id": current_user["id"]}]}, {"_id": 0}).sort("created_at", -1).to_list(200)
     return disputes
 
 
@@ -8798,7 +8957,7 @@ async def get_brand_deal_campaign(deal_id: str, current_user: dict) -> dict:
     campaign = await get_campaign_by_deal_id(deal_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Deal not found")
-    if campaign.get('business_id') != current_user['id']:
+    if campaign.get('business_id') != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="Not authorized for this deal")
     return campaign
 
@@ -9021,7 +9180,7 @@ async def get_work_by_campaign(campaign_id: str, current_user: dict = Depends(ge
     brand has no other way to learn it (it used to send the campaign id, which 404'd).
     """
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0, "business_id": 1})
-    is_owner_brand = bool(campaign) and campaign.get("business_id") == current_user["id"]
+    is_owner_brand = bool(campaign) and campaign.get("business_id") == _brand_ws_id(current_user)
 
     query = {"campaign_id": campaign_id}
     if not is_owner_brand:
@@ -9038,7 +9197,7 @@ async def get_work_pending_review(current_user: dict = Depends(get_current_user)
 
     # Get all campaigns for this business
     campaigns = await db.campaigns.find(
-        {"business_id": current_user['id']},
+        {"business_id": _brand_ws_id(current_user)},
         {"_id": 0, "id": 1}
     ).to_list(1000)
     campaign_ids = [c['id'] for c in campaigns]
@@ -9066,7 +9225,7 @@ async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_
     # Verify authorization - user must be creator or the business reviewing it
     is_brand_viewer = False
     if current_user['id'] != work['creator_id']:
-        if not campaign or campaign.get('business_id') != current_user['id']:
+        if not campaign or campaign.get('business_id') != _brand_ws_id(current_user):
             raise HTTPException(status_code=403, detail="Not authorized to view this work")
         is_brand_viewer = True
 
@@ -9141,7 +9300,7 @@ async def get_creator_reviews(creator_id: str):
 @api_router.post("/shipment/update")
 async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get_current_user)):
     campaign = await db.campaigns.find_one({"id": data.campaign_id})
-    if not campaign or campaign['business_id'] != current_user['id']:
+    if not campaign or campaign['business_id'] != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="Not authorized")
     
     shipment_doc = {
@@ -9242,7 +9401,7 @@ async def get_shipment(campaign_id: str, current_user: dict = Depends(get_curren
         raise HTTPException(status_code=404, detail="Campaign not found")
     role = current_user.get('role')
     is_party = (
-        campaign.get('business_id') == current_user['id']
+        campaign.get('business_id') == _brand_ws_id(current_user)
         or campaign.get('selected_creator') == current_user['id']
         or role in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]
     )
@@ -9360,13 +9519,13 @@ async def get_shipping_address(campaign_id: Optional[str] = None, current_user: 
     campaign = await find_campaign_by_any_id(campaign_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Deal not found")
-    if current_user["id"] not in [campaign.get("business_id"), campaign.get("selected_creator")]:
+    if _brand_ws_id(current_user) not in [campaign.get("business_id"), campaign.get("selected_creator")]:
         raise HTTPException(status_code=403, detail="Not a party to this deal")
 
     creator = await db.users.find_one({"id": campaign.get("selected_creator")}, {"_id": 0, "profile": 1}) or {}
     sh = await db.shipments.find_one({"campaign_id": campaign["id"]}, {"_id": 0}) or {}
 
-    out["my_role"] = "brand" if current_user["id"] == campaign.get("business_id") else "creator"
+    out["my_role"] = "brand" if _brand_ws_id(current_user) == campaign.get("business_id") else "creator"
     # The brand submits their pickup address through the "Ship Product" form
     # (/deals/{id}/request-shipment), which stores it on the SHIPMENT — not on their
     # profile. So that's the source of truth for "the brand has given their details".
