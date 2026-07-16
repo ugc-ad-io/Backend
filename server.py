@@ -1260,20 +1260,34 @@ def _in_quiet_hours() -> bool:
     return ist_hour >= 22 or ist_hour < 8
 
 
+# Canonical notification categories → the per-role preference key. Creators and
+# brands name the same concept differently, so map both.
+_NOTIF_PREF_KEYS = {
+    "payments":     {"creator": "payout_alerts", "business": "payment_alerts"},
+    "deal_updates": {"creator": "bid_updates",   "business": "deal_updates"},
+    "applications": {"creator": "bid_updates",   "business": "new_applications"},
+    "messages":     {"creator": "messages",      "business": "messages"},
+    "weekly":       {"creator": "weekly_digest", "business": "weekly_reports"},
+}
+
+
 async def _email_category_allowed(user: dict, category: Optional[str]) -> bool:
-    """Whether the recipient still wants EMAIL for this notification category.
+    """Whether the recipient still wants EMAIL for this canonical category.
     Creator prefs live on user.notification_prefs; brand prefs in business_settings.
-    Unknown category / no pref set → allowed (don't silently drop)."""
+    Unknown category / no pref set → allowed (never silently drop)."""
     if not category or not user:
         return True
-    prefs = user.get("notification_prefs") or {}
-    if category in prefs:
-        return bool(prefs[category])
-    if user.get("role") == UserRole.BUSINESS:
+    role = user.get("role")
+    key = (_NOTIF_PREF_KEYS.get(category) or {}).get(role, category)
+    if role == UserRole.BUSINESS:
         s = await db.business_settings.find_one({"business_id": user["id"]}, {"_id": 0, "notifications": 1})
         n = (s or {}).get("notifications") or {}
-        if category in n:
-            return bool(n[category])
+        if key in n:
+            return bool(n[key])
+        return True
+    prefs = user.get("notification_prefs") or {}
+    if key in prefs:
+        return bool(prefs[key])
     return True
 
 
@@ -3856,7 +3870,7 @@ async def respond_to_booking(campaign_id: str, data: BookingRespond,
         await notify_user(brand_id, "Booking declined — you've been refunded",
                           f"{creator_name} declined '{title}'. ₹{refunded:,.0f} is back in your wallet."
                           + (f" Reason: {data.message}" if data.message else ""),
-                          link="/dashboard/business/wallet", ntype="warning")
+                          link="/dashboard/business/wallet", ntype="warning", email=True, category="payments")
         return {"booking_status": "declined", "refunded": refunded}
 
     if data.action == "revise":
@@ -5658,7 +5672,7 @@ async def invite_shortlist_candidate(campaign_id: str, creator_id: str, data: Sh
         {"id": campaign_id},
         {"$set": {"shortlist": shortlist, "match_status": "fulfilled", "updated_at": created_at}},
     )
-    await notify_user(creator_id, "You've received a brief invitation", f"{current_user.get('nickname', 'A brand')} invited you to '{campaign.get('title', '')}'.", link="/messages")
+    await notify_user(creator_id, "You've received a brief invitation", f"{current_user.get('nickname', 'A brand')} invited you to '{campaign.get('title', '')}'.", link="/messages", email=True, category="applications")
     return {"message": "Invitation sent", "campaign_id": campaign_id, "creator_id": creator_id, "action_card": {k: v for k, v in action_card.items() if k != "_id"}}
 
 
@@ -7412,7 +7426,7 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
         {"$set": {"status": CampaignStatus.COMPLETED, "payout_status": "approved", "approved_at": now, "updated_at": now}}
     )
     await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "content_approved", "Content approved.")
-    await notify_user(work['creator_id'], "Your content was approved", "Your content was approved.", link="/my-deals", ntype="success", email=True)
+    await notify_user(work['creator_id'], "Your content was approved", "Your content was approved.", link="/my-deals", ntype="success", email=True, category="deal_updates")
     return {"message": "Content approved.", **payout_info}
 
 
@@ -7533,7 +7547,7 @@ async def release_scheduled_payout(escrow: dict) -> bool:
     await db.campaigns.update_one({"id": campaign['id']}, {"$set": {"status": CampaignStatus.COMPLETED, "payout_status": "released", "updated_at": now}})
     await insert_deal_activity(campaign, "system", "UGCAD.IO", "payment_released", f"Payout of ₹{int(net)} released to the creator.")
     if creator_id:
-        await notify_user(creator_id, "Payment released", f"₹{int(net)} has been released to your wallet.", link="/withdrawal")
+        await notify_user(creator_id, "Payment released", f"₹{int(net)} has been released to your wallet.", link="/withdrawal", ntype="success", email=True, category="payments")
     return True
 
 
@@ -7846,7 +7860,7 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
     await insert_deal_system_message(campaign, f"Brand requested content revisions.{note}")
     await notify_user(work['creator_id'], "Revision requested on your content",
                       "The brand requested changes on your submission. Open your deal to review the feedback and resubmit.",
-                      link="/my-deals", ntype="info", email=True)
+                      link="/my-deals", ntype="info", email=True, category="deal_updates")
 
     new_balance = float(current_user.get('balance') or 0) - fee
     if paid:
@@ -12421,7 +12435,7 @@ async def admin_release_escrow(escrow_id: str, data: Dict[str, Any] = Body(...),
             await create_payout_receipt(creator_id=creator_id, receipt_type="earning", gross_amount=gross,
                                         campaign_id=escrow.get("campaign_id"), reference_id=escrow_id,
                                         note=f"Manual escrow release: {reason}", tds_amount=tds)
-            await notify_user(creator_id, "Payment released", f"₹{int(net)} has been released to your wallet.", link="/withdrawal")
+            await notify_user(creator_id, "Payment released", f"₹{int(net)} has been released to your wallet.", link="/withdrawal", ntype="success", email=True, category="payments")
     await log_admin_action(current_user, "escrow.release", target_type="escrow", target_id=escrow_id, reason=reason, request=request)
     return {"message": "Escrow released to creator", "escrow_id": escrow_id}
 
@@ -12451,7 +12465,7 @@ async def admin_refund_escrow(escrow_id: str, data: Dict[str, Any] = Body(...), 
             "type": "escrow_refund", "direction": "credit", "amount": round(amount, 2),
             "status": "success", "note": f"Escrow refund: {reason}", "created_at": now_iso(), "date": now_iso(),
         })
-        await notify_user(business_id, "Escrow refunded", f"₹{int(amount)} held in escrow was refunded to your wallet. Reason: {reason}", link="/dashboard/business/wallet")
+        await notify_user(business_id, "Escrow refunded", f"₹{int(amount)} held in escrow was refunded to your wallet. Reason: {reason}", link="/dashboard/business/wallet", ntype="success", email=True, category="payments")
     await log_admin_action(current_user, "escrow.refund", target_type="escrow", target_id=escrow_id,
                            after={"amount": amount}, reason=reason, request=request)
     return {"message": "Escrow refunded to brand", "escrow_id": escrow_id, "amount": amount}
@@ -12670,9 +12684,9 @@ async def admin_mark_shipped(campaign_id: str, data: Dict[str, Any] = Body(...),
     await log_admin_action(current_user, "shipping.marked_shipped", target_type="deal", target_id=campaign_id,
                            after={"courier": data.get("courier"), "tracking_number": data.get("tracking_number")}, request=request)
     if campaign.get("business_id"):
-        await notify_user(campaign["business_id"], "Product shipped", "Your product has been shipped to the creator.", link="/dashboard/business/shipments")
+        await notify_user(campaign["business_id"], "Product shipped", "Your product has been shipped to the creator.", link="/dashboard/business/shipments", category="deal_updates")
     if campaign.get("selected_creator"):
-        await notify_user(campaign["selected_creator"], "Product on the way", "The brand's product has been shipped to you.", link="/my-deals")
+        await notify_user(campaign["selected_creator"], "Product on the way", "The brand's product has been shipped to you.", link="/my-deals", email=True, category="deal_updates")
     await insert_deal_system_message(campaign, "Shipment dispatched by the platform team.")
     return {"message": "Marked as shipped"}
 
