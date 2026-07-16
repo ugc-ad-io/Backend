@@ -5012,6 +5012,12 @@ async def get_profile(user_id: str, current_user: dict = Depends(get_current_use
     if current_user.get('id') != user.get('id'):
         strip_private_fields(user, current_user.get('role'))
 
+    # Completed-works count: the single-profile route returned the raw doc,
+    # which never carries deliverables_completed, so the profile modal always
+    # showed 0. Compute it the same way the directory/shortlist do.
+    if user.get('role') == UserRole.CREATOR:
+        user['deliverables_completed'] = await creator_deliverables_completed(user)
+
     return user
 
 def enforce_brief_contact_policy(campaign_like: dict) -> None:
