@@ -2957,6 +2957,10 @@ async def google_auth(data: GoogleAuthRequest):
         "approval_reason": user.get("approval_reason", ""),
         "profile": user.get("profile", {}),
         "profile_photo": user.get("profile_photo"),
+        # Team context so the client can gate owner-only UI immediately after login.
+        "team_of": user.get("team_of"),
+        "team_role": user.get("team_role", "owner"),
+        "is_team_member": bool(user.get("team_of")),
     }
 
 
@@ -2983,6 +2987,10 @@ def _auth_response(user: dict) -> dict:
         "approval_reason": user.get("approval_reason", ""),
         "profile": user.get("profile", {}),
         "profile_photo": user.get("profile_photo"),
+        # Team context so the client can gate owner-only UI immediately after login.
+        "team_of": user.get("team_of"),
+        "team_role": user.get("team_role", "owner"),
+        "is_team_member": bool(user.get("team_of")),
     }
 
 
