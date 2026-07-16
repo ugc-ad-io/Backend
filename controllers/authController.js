@@ -2,6 +2,26 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
+const Deal = require('../models/Deal');
+const Campaign = require('../models/Campaign');
+const { DEAL_STATES } = require('../utils/dealStateMachine');
+const DEAL_PAID_STATE = DEAL_STATES[DEAL_STATES.length - 1]; // 'Paid - Complete'
+
+// Completed-works count for one creator — deduped across paid deals + completed
+// campaigns, identical to the directory listing so the profile modal agrees.
+async function creatorDeliverablesCompleted(userId) {
+  const [paidDeals, doneCampaigns] = await Promise.all([
+    Deal.find({
+      creator_id: userId,
+      $or: [{ current_state: DEAL_PAID_STATE }, { 'escrow.status': 'released' }],
+    }).select('campaign_id deal_id').lean(),
+    Campaign.find({ selected_creator: String(userId), status: 'completed' }).select('_id').lean(),
+  ]);
+  const jobs = new Set();
+  for (const d of paidDeals) jobs.add(String(d.campaign_id || `deal:${d.deal_id}`));
+  for (const c of doneCampaigns) jobs.add(String(c._id));
+  return jobs.size;
+}
 const { MIN_CHAT_BALANCE } = require('../utils/chatPolicy');
 const { sendEmail, baseTemplate } = require('../services/emailService');
 
@@ -291,7 +311,11 @@ exports.publicProfile = async (req, res, next) => {
     const viewer = req.user || {};
     const isSelf = String(viewer.id) === String(user._id);
     const isAdmin = viewer.role === 'admin';
-    res.json(isSelf || isAdmin ? user.toPublic() : user.toRedacted());
+    const payload = isSelf || isAdmin ? user.toPublic() : user.toRedacted();
+    if (user.role === 'creator') {
+      payload.deliverables_completed = await creatorDeliverablesCompleted(user._id);
+    }
+    res.json(payload);
   } catch (err) {
     next(err);
   }
