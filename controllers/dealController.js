@@ -34,9 +34,11 @@ async function loadDealForUser(req, res) {
   }
 
   const uid = String(req.user.id);
+  // A brand team member acts as the brand on the owner's deals.
+  const brandId = String(req.user.workspace_id || req.user.id);
   let viewerParty = null;
   if (String(deal.creator_id) === uid) viewerParty = 'creator';
-  else if (String(deal.brand_id) === uid) viewerParty = 'brand';
+  else if (String(deal.brand_id) === brandId) viewerParty = 'brand';
   else if (req.user.role === 'admin') viewerParty = 'admin';
 
   if (!viewerParty) {
@@ -92,20 +94,24 @@ async function syncCampaignWork(deal, { workStatus, campaignStatus, feedback, re
 exports.myDeals = async (req, res, next) => {
   try {
     const uid = req.user.id;
+    // A brand team member sees the OWNER's deals (workspace), not their own id.
+    const brandId = req.user.workspace_id || uid;
     let filter;
     let viewerParty;
     if (req.user.role === 'admin') {
       filter = {};
       viewerParty = 'admin';
     } else if (req.user.role === 'business') {
-      filter = { brand_id: uid };
+      filter = { brand_id: brandId };
       viewerParty = 'brand';
     } else {
       filter = { creator_id: uid };
       viewerParty = 'creator';
     }
 
-    const deals = await Deal.find({ ...filter, archived_by: { $ne: uid } }).sort({ updatedAt: -1 });
+    // Archive is per-brand for a team, so key it off the workspace, not the member.
+    const archiveKey = req.user.role === 'business' ? brandId : uid;
+    const deals = await Deal.find({ ...filter, archived_by: { $ne: archiveKey } }).sort({ updatedAt: -1 });
 
     // Fire time-based transitions on read so the 5-day timer always lands.
     await Promise.all(

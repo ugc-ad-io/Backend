@@ -15,6 +15,13 @@ const auth = async (req, res, next) => {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = decoded;
 
+    // Shared brand workspace: a team member acts on the OWNER's brand data, but
+    // keeps their own identity (id) for chat, notifications and audit. Every
+    // brand-scoped query should read req.user.workspace_id, not req.user.id.
+    // Falls back to the user's own id for owners and older tokens (no team_of).
+    req.user.workspace_id = decoded.team_of || decoded.id;
+    req.user.team_role = decoded.team_role || 'owner';
+
     // Reject banned / deactivated / suspended accounts even with a valid token,
     // so a ban takes effect immediately (kills existing sessions too).
     // Toggle: enforcement is OFF unless ENFORCE_BANS=true (temporarily disabled).
@@ -50,4 +57,17 @@ const admin = (req, res, next) => {
   next();
 };
 
-module.exports = { auth, admin };
+// Block a read-only team member (team_role === 'viewer') from mutating the
+// brand's workspace. Owners/admins/members pass through.
+const brandWrite = (req, res, next) => {
+  if (req.user && req.user.team_role === 'viewer') {
+    return res.status(403).json({ detail: 'Your team role is view-only. Ask a workspace admin for edit access.' });
+  }
+  next();
+};
+
+// The brand whose data this request operates on: the owner for a team member,
+// the user themselves otherwise.
+const workspaceId = (req) => (req.user && (req.user.workspace_id || req.user.id));
+
+module.exports = { auth, admin, brandWrite, workspaceId };

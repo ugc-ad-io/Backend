@@ -57,11 +57,21 @@ async function healFounder(user) {
 
 function signToken(user) {
   return jwt.sign(
-    { id: user._id, role: user.role, admin_role: user.admin_role || null },
+    {
+      id: user._id,
+      role: user.role,
+      admin_role: user.admin_role || null,
+      // Carried in the token so the auth middleware can resolve a team member's
+      // workspace (the owner brand) without a DB hit on every request.
+      team_of: user.team_of || null,
+      team_role: user.team_role || 'owner',
+    },
     process.env.JWT_SECRET,
     { expiresIn: '30d' }
   );
 }
+// Exported so the team-invite accept flow can mint the same token shape.
+exports.signToken = signToken;
 
 // POST /api/auth/signup { email, password, role }
 exports.signup = async (req, res, next) => {

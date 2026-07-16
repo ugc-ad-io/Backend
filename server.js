@@ -13,7 +13,7 @@ const chatRoutes = require('./routes/chatRoutes');
 const profileRoutes = require('./routes/profileRoutes');
 const checkoutRoutes = require('./routes/checkoutRoutes');
 const { ensureDealForCampaign } = require('./utils/ensureDeal');
-const { auth } = require('./middleware/auth');
+const { auth, brandWrite, workspaceId } = require('./middleware/auth');
 const authCtrl = require('./controllers/authController');
 const { sendEmail } = require('./services/emailService');
 const applicationEmails = require('./services/emailTemplates');
@@ -71,7 +71,7 @@ app.get('/api/campaigns', auth, async (req, res) => {
   try {
     const filter = {};
     if (req.query.status) filter.status = req.query.status;
-    if (req.user.role === 'business') filter.business_id = req.user.id;
+    if (req.user.role === 'business') filter.business_id = workspaceId(req);
     // A creator's own campaigns = those they were selected for. Without this the
     // creator_id query param was ignored, so e.g. "completed deals" counted every
     // completed campaign on the platform, not just this creator's.
@@ -88,7 +88,7 @@ app.get('/api/campaigns', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
-app.post('/api/campaigns', auth, async (req, res) => {
+app.post('/api/campaigns', auth, brandWrite, async (req, res) => {
   try {
     // Booking a specific creator costs money, so it can't happen here. This route
     // used to accept `selected_creator`, start the deal and mark escrow "held"
@@ -105,7 +105,7 @@ app.post('/api/campaigns', auth, async (req, res) => {
     // pending_approval (hidden from creators) until an admin approves it → active.
     // Drafts are still allowed through so the save-draft flow keeps working.
     const status = req.body.status === 'draft' ? 'draft' : 'pending_approval';
-    const campaign = await Campaign.create({ ...req.body, business_id: req.user.id, status });
+    const campaign = await Campaign.create({ ...req.body, business_id: workspaceId(req), status });
     res.status(201).json({ ...campaign.toObject(), id: campaign._id });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
@@ -120,7 +120,7 @@ app.get('/api/campaigns/:id', auth, async (req, res) => {
 
 app.get('/api/business/dashboard', auth, async (req, res) => {
   try {
-    const campaigns = await Campaign.find({ business_id: req.user.id }).lean();
+    const campaigns = await Campaign.find({ business_id: workspaceId(req) }).lean();
     const active = campaigns.filter(c => ['active', 'in_progress'].includes(c.status));
     res.json({
       metrics: {
@@ -803,7 +803,7 @@ app.post('/api/admin/user/convert-pro', adminAuth, requireCap('user_management')
 
 app.get('/api/work/pending-review', auth, async (req, res) => {
   try {
-    const camps = await Campaign.find({ business_id: req.user.id, status: 'work_submitted' }).lean();
+    const camps = await Campaign.find({ business_id: workspaceId(req), status: 'work_submitted' }).lean();
     const out = camps
       .filter((c) => c.work_submission)
       .map((c) => ({
@@ -1708,7 +1708,8 @@ app.post('/api/campaigns/:id/select-creator', auth, async (req, res) => {
     // may call it. Without this check any logged-in user could accept bids on
     // someone else's campaign.
     if (req.user.role !== 'business') return res.status(403).json({ detail: 'Only brands can select a creator.' });
-    if (String(c.business_id) !== String(req.user.id)) {
+    if (req.user.team_role === 'viewer') return res.status(403).json({ detail: 'Your team role is view-only.' });
+    if (String(c.business_id) !== String(workspaceId(req))) {
       return res.status(403).json({ detail: 'This campaign belongs to another brand.' });
     }
 
@@ -1811,17 +1812,22 @@ app.post('/api/campaigns/:id/select-creator', auth, async (req, res) => {
 });
 
 // ── Brand: save a draft campaign + edit a campaign ───────────────────────────
-app.post('/api/campaigns/draft', auth, async (req, res) => {
+app.post('/api/campaigns/draft', auth, brandWrite, async (req, res) => {
   try {
-    const c = await Campaign.create({ ...req.body, business_id: req.user.id, status: 'draft' });
+    const c = await Campaign.create({ ...req.body, business_id: workspaceId(req), status: 'draft' });
     res.status(201).json({ ...c.toObject(), id: c._id });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
-app.patch('/api/campaigns/:id', auth, async (req, res) => {
+app.patch('/api/campaigns/:id', auth, brandWrite, async (req, res) => {
   try {
     const body = { ...req.body }; delete body._id; delete body.id; delete body.business_id;
+    // Only the brand that owns the campaign (owner or a team member of it) may edit it.
+    const existing = await Campaign.findById(req.params.id).select('business_id').lean();
+    if (!existing) return res.status(404).json({ detail: 'Campaign not found' });
+    if (req.user.role === 'business' && String(existing.business_id) !== String(workspaceId(req))) {
+      return res.status(403).json({ detail: 'This campaign belongs to another brand.' });
+    }
     const c = await Campaign.findByIdAndUpdate(req.params.id, { $set: body }, { new: true });
-    if (!c) return res.status(404).json({ detail: 'Campaign not found' });
     res.json({ ...c.toObject(), id: c._id });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
@@ -1864,7 +1870,7 @@ app.get('/api/work/:id/download', auth, async (req, res) => {
   try {
     const c = await Campaign.findById(req.params.id).lean();
     if (!c || !c.work_submission) return res.status(404).json({ detail: 'Work not found' });
-    if (String(c.business_id) !== String(req.user.id) && req.user.role !== 'admin')
+    if (String(c.business_id) !== String(workspaceId(req)) && req.user.role !== 'admin')
       return res.status(403).json({ detail: 'Only the brand owner can download this deliverable' });
     if (!(c.work_submission.status === 'approved' || c.status === 'completed'))
       return res.status(403).json({ detail: 'Download unlocks after you approve the work' });
@@ -2518,24 +2524,203 @@ app.post('/api/notifications/mark-all-read', auth, async (req, res) => {
 });
 
 // ---- Business settings (back the brand Settings page from the user profile) ----
+// Brand settings read the OWNER's brand (a team member edits the shared brand,
+// not a personal profile), so they resolve through workspaceId(req).
 app.get('/api/business/settings/profile', auth, async (req, res) => {
-  const u = await User.findById(req.user.id).lean(); const p = (u && u.profile) || {};
+  const u = await User.findById(workspaceId(req)).lean(); const p = (u && u.profile) || {};
   res.json({ brand_name: p.business_name || (u && u.nickname) || '', contact_person: p.contact_person || (u && u.full_name) || '', work_email: p.business_email || (u && u.email) || '', phone: p.phone || '', website: p.website || '', logo: p.logo || (u && u.profile_photo) || '' });
 });
-app.put('/api/business/settings/profile', auth, async (req, res) => {
-  const u = await User.findById(req.user.id); if (!u) return res.status(404).json({ detail: 'Not found' });
+app.put('/api/business/settings/profile', auth, brandWrite, async (req, res) => {
+  const u = await User.findById(workspaceId(req)); if (!u) return res.status(404).json({ detail: 'Not found' });
   u.profile = { ...(u.profile || {}), ...req.body }; u.markModified('profile'); await u.save(); res.json({ success: true });
 });
 app.get('/api/business/settings/company', auth, async (req, res) => {
-  const u = await User.findById(req.user.id).lean(); const p = (u && u.profile) || {};
+  const u = await User.findById(workspaceId(req)).lean(); const p = (u && u.profile) || {};
   res.json({ business_type: p.business_type || '', gstin: p.gstin || '', business_category: p.industry_category || p.industry || '', country: p.country || '', billing_address: p.billing_address || '', city: p.city || '', state: p.state || '' });
 });
-app.put('/api/business/settings/company', auth, async (req, res) => {
-  const u = await User.findById(req.user.id); if (!u) return res.status(404).json({ detail: 'Not found' });
+app.put('/api/business/settings/company', auth, brandWrite, async (req, res) => {
+  const u = await User.findById(workspaceId(req)); if (!u) return res.status(404).json({ detail: 'Not found' });
   u.profile = { ...(u.profile || {}), ...req.body }; u.markModified('profile'); await u.save(); res.json({ success: true });
 });
-app.get('/api/business/settings/team', auth, (req, res) => res.json([]));
-app.post('/api/business/settings/team/invite', auth, (req, res) => res.json({ success: true }));
+
+// ── Brand team (shared workspace) ────────────────────────────────────────────
+const TeamInvite = require('./models/TeamInvite');
+const crypto = require('crypto');
+const { signToken } = require('./controllers/authController');
+const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
+
+// Only the owner or a team admin can manage the team.
+const canManageTeam = (req) => req.user.role === 'business' && ['owner', 'admin'].includes(req.user.team_role || 'owner');
+
+async function teamPayload(ownerId) {
+  const [owner, members, invites] = await Promise.all([
+    User.findById(ownerId).lean(),
+    User.find({ team_of: ownerId }).select('nickname full_name email profile_photo team_role active').lean(),
+    TeamInvite.find({ owner_id: ownerId }).lean(),
+  ]);
+  const memberRows = [
+    // The owner is always shown first.
+    owner && {
+      id: String(owner._id),
+      name: (owner.profile && owner.profile.business_name) || owner.nickname || owner.full_name || owner.email,
+      email: owner.email,
+      role: 'owner',
+      status: 'active',
+      avatar_url: owner.profile_photo || '',
+      is_owner: true,
+    },
+    ...members.map((m) => ({
+      id: String(m._id),
+      name: m.nickname || m.full_name || m.email,
+      email: m.email,
+      role: m.team_role || 'member',
+      status: m.active === false ? 'inactive' : 'active',
+      avatar_url: m.profile_photo || '',
+    })),
+    ...invites.map((i) => ({
+      id: String(i._id),
+      invite: true,
+      name: i.email,
+      email: i.email,
+      role: i.role,
+      status: 'invited',
+      avatar_url: '',
+    })),
+  ].filter(Boolean);
+  const seatLimit = (owner && owner.team_seat_limit) || 10;
+  return { members: memberRows, seat_limit: seatLimit, seats_used: members.length + invites.length + 1 /* owner */ };
+}
+
+app.get('/api/business/settings/team', auth, async (req, res) => {
+  try {
+    if (req.user.role !== 'business') return res.json({ members: [], seat_limit: 0, seats_used: 0 });
+    res.json(await teamPayload(workspaceId(req)));
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+app.post('/api/business/settings/team/invite', auth, async (req, res) => {
+  try {
+    if (!canManageTeam(req)) return res.status(403).json({ detail: 'Only the workspace owner or an admin can invite members.' });
+    const ownerId = workspaceId(req);
+    const email = String(req.body.email || '').toLowerCase().trim();
+    const role = ['admin', 'member', 'viewer'].includes(req.body.role) ? req.body.role : 'member';
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ detail: 'Enter a valid email address.' });
+
+    const owner = await User.findById(ownerId).lean();
+    // Seat check (owner + members + pending invites).
+    const { seats_used, seat_limit } = await teamPayload(ownerId);
+    if (seats_used >= seat_limit) return res.status(409).json({ detail: `Seat limit reached (${seat_limit}). Remove a member first.` });
+
+    // Already on the team, or is the owner?
+    if (email === String(owner.email).toLowerCase()) return res.status(409).json({ detail: 'That is the workspace owner.' });
+    const existingMember = await User.findOne({ team_of: ownerId, email }).select('_id').lean();
+    if (existingMember) return res.status(409).json({ detail: 'That person is already on your team.' });
+
+    // A person can't belong to two brand workspaces.
+    const asOtherMember = await User.findOne({ email, team_of: { $ne: null } }).select('_id').lean();
+    if (asOtherMember) return res.status(409).json({ detail: 'That email already belongs to another brand workspace.' });
+
+    const rawToken = crypto.randomBytes(24).toString('hex');
+    await TeamInvite.findOneAndUpdate(
+      { owner_id: ownerId, email },
+      { owner_id: ownerId, email, role, token_hash: hashToken(rawToken), invited_by: req.user.id, expires_at: new Date(Date.now() + 7 * 24 * 3600 * 1000) },
+      { upsert: true, new: true }
+    );
+
+    const brandName = (owner.profile && owner.profile.business_name) || owner.nickname || 'a brand';
+    const link = `${(process.env.FRONTEND_URL || '').replace(/\/$/, '')}/team/accept?token=${rawToken}`;
+    sendEmail({
+      to: email,
+      subject: `You've been invited to join ${brandName} on UGCad.io`,
+      html: baseTemplate({
+        title: 'Team invitation',
+        content: `
+          <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Join ${brandName} on UGCad.io</h1>
+          <p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#4a4f74;">You've been invited as a <strong>${role}</strong>. Click below to set a password and access the workspace. This link expires in 7 days.</p>
+          <p style="margin:0 0 8px;"><a href="${link}" style="display:inline-block;background:#5b6bff;color:#fff;text-decoration:none;font-weight:700;padding:12px 22px;border-radius:10px;">Accept invitation</a></p>
+          <p style="margin:20px 0 0;font-size:12.5px;color:#9296ba;word-break:break-all;">Or paste this link: ${link}</p>`,
+      }),
+    }).catch((err) => console.error('[team/invite] email failed:', err.message));
+
+    console.log(`[team/invite] ${email} invited to workspace ${ownerId}: ${link}`);
+    res.status(201).json(await teamPayload(ownerId));
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+// Public: look up an invite by its raw token (for the accept page).
+app.get('/api/team/invite/:token', async (req, res) => {
+  try {
+    const inv = await TeamInvite.findOne({ token_hash: hashToken(req.params.token) }).lean();
+    if (!inv || new Date(inv.expires_at) < new Date()) return res.status(404).json({ detail: 'This invitation is invalid or has expired.' });
+    const owner = await User.findById(inv.owner_id).lean();
+    res.json({
+      email: inv.email,
+      role: inv.role,
+      brand_name: (owner && owner.profile && owner.profile.business_name) || (owner && owner.nickname) || 'a brand',
+    });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+// Public: accept an invite — creates (or links) the member's login.
+app.post('/api/team/accept', async (req, res) => {
+  try {
+    const { token, password, name } = req.body || {};
+    if (!token || !password) return res.status(400).json({ detail: 'Token and password are required.' });
+    if (String(password).length < 6) return res.status(400).json({ detail: 'Password must be at least 6 characters.' });
+
+    const inv = await TeamInvite.findOne({ token_hash: hashToken(token) });
+    if (!inv || new Date(inv.expires_at) < new Date()) return res.status(404).json({ detail: 'This invitation is invalid or has expired.' });
+
+    const owner = await User.findById(inv.owner_id).lean();
+    if (!owner) { await inv.deleteOne(); return res.status(404).json({ detail: 'The inviting brand no longer exists.' }); }
+
+    let user = await User.findOne({ email: inv.email });
+    if (user && user.team_of && String(user.team_of) !== String(inv.owner_id)) {
+      return res.status(409).json({ detail: 'This email already belongs to another workspace.' });
+    }
+    if (!user) {
+      user = new User({
+        email: inv.email,
+        role: 'business',
+        nickname: (name && String(name).trim()) || inv.email.split('@')[0],
+        full_name: (name && String(name).trim()) || '',
+        profile_completed: true,
+      });
+    }
+    user.password = password;              // hashed by the pre-save hook
+    user.role = 'business';
+    user.team_of = inv.owner_id;
+    user.team_role = inv.role;
+    user.approval_status = 'approved';     // vouched for by an approved brand
+    user.active = true;
+    await user.save();
+    await inv.deleteOne();
+
+    res.status(201).json({ token: signToken(user), ...user.toSelf() });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+// Remove a pending invite or a team member (owner/admin only).
+app.delete('/api/business/settings/team/:id', auth, async (req, res) => {
+  try {
+    if (!canManageTeam(req)) return res.status(403).json({ detail: 'Only the workspace owner or an admin can remove members.' });
+    const ownerId = String(workspaceId(req));
+    const id = req.params.id;
+    if (id === ownerId) return res.status(400).json({ detail: 'You cannot remove the workspace owner.' });
+
+    // Pending invite?
+    const inv = await TeamInvite.findOne({ _id: id, owner_id: ownerId });
+    if (inv) { await inv.deleteOne(); return res.json(await teamPayload(ownerId)); }
+
+    // Active member — unlink from the workspace (their login survives, access is cut).
+    const member = await User.findOne({ _id: id, team_of: ownerId });
+    if (!member) return res.status(404).json({ detail: 'Member not found on your team.' });
+    member.team_of = null;
+    member.team_role = 'owner';
+    await member.save();
+    res.json(await teamPayload(ownerId));
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
 // The fee the brand is actually charged at checkout — read the admin's real
 // setting, not a hardcoded guess. This used to return 10 while the deal maths
 // assumed 20, so the brand was quoted one number and billed against another.

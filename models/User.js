@@ -102,6 +102,15 @@ const userSchema = new mongoose.Schema(
     // Brand wallet — gate for chat initiation (10.2)
     wallet_balance: { type: Number, default: 0 },
 
+    // Brand team / shared workspace. A brand owner can invite coworkers who log
+    // in with their OWN credentials but see the OWNER's campaigns, deals and
+    // wallet. `team_of` points at the owner (null = owner / not a team member);
+    // `team_role` gates what they can do. Every brand-scoped query resolves
+    // through workspaceId(req) = req.user.team_of || req.user.id.
+    team_of: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    team_role: { type: String, enum: ['owner', 'admin', 'member', 'viewer'], default: 'owner' },
+    team_seat_limit: { type: Number, default: 10 }, // only meaningful on the owner
+
     // Creator KYC (Aadhaar + PAN). A creator cannot withdraw earnings until an
     // admin has marked this `verified` — we are paying real money to a real
     // person, so the identity behind the payout account has to be checked.
@@ -238,6 +247,11 @@ userSchema.methods.toSelf = function () {
     wallet_balance: this.wallet_balance,
     chat_unlocked: this.role !== 'business' || this.wallet_balance >= MIN_CHAT_BALANCE,
     settings: this.settings,
+    // Team context: the client hides brand-owner-only actions (e.g. managing the
+    // team) from members, and read-only from viewers.
+    team_of: this.team_of || null,
+    team_role: this.team_role || 'owner',
+    is_team_member: !!this.team_of,
     kyc: {
       status: k.status || 'not_submitted',
       name_on_pan: k.name_on_pan || '',
