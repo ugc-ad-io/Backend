@@ -1214,19 +1214,29 @@ def check_contact_info_policy(message: str, allowed_domains: Optional[List[str]]
     return {"safe": len(deduped) == 0, "violations": deduped}
 
 async def notify_admins(title: str, message: str, link: Optional[str] = None):
-    notification = {
+    """Alert the ops team. Fans out to a per-admin in-app notification (keyed on
+    user_id) so it actually shows in each admin's bell — the notification list
+    queries by user_id, so a single target_roles doc was invisible."""
+    now = now_iso()
+    # Keep the audit copy.
+    await db.admin_notifications.insert_one({
+        "id": str(uuid.uuid4()), "title": title, "message": message, "type": "warning",
+        "link": link, "target_roles": [UserRole.ADMIN], "created_at": now, "created_by": "system",
+    })
+    admins = await db.users.find({"role": UserRole.ADMIN}, {"_id": 0, "id": 1}).to_list(500)
+    if not admins:
+        return
+    await db.in_app_notifications.insert_many([{
         "id": str(uuid.uuid4()),
+        "user_id": a["id"],
         "title": title,
         "message": message,
         "type": "warning",
         "link": link,
-        "target_roles": [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF],
-        "read_by": [],
-        "created_at": now_iso(),
-        "created_by": "system"
-    }
-    await db.in_app_notifications.insert_one(notification)
-    await db.admin_notifications.insert_one(notification.copy())
+        "read": False,
+        "created_at": now,
+        "created_by": "system",
+    } for a in admins if a.get("id")])
 
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://www.ugcad.io")
 
@@ -12977,15 +12987,27 @@ async def payout_overview(current_user: dict = Depends(get_current_user)):
     def this_month(e):
         r = parse_iso(e.get("released_at"))
         return bool(r and r.year == now.year and r.month == now.month)
+    def released_in(e, y, m):
+        r = parse_iso(e.get("released_at"))
+        return bool(r and r.year == y and r.month == m)
     paid_this_month = sum(payout(e) for e in released if this_month(e))
+    lm_year, lm_month = (now.year - 1, 12) if now.month == 1 else (now.year, now.month - 1)
+    last_month_paid = sum(payout(e) for e in released if released_in(e, lm_year, lm_month))
+    kyc = current_user.get("kyc") or {}
 
     return {
         "balance": balance,
         "pending_release": pending,
         "paid_this_month": paid_this_month,
         "all_time_earnings": all_time,
-        "last_month": 0,
+        "last_month": last_month_paid,
+        "last_month_paid": last_month_paid,
         "deals_paid": len(released),
+        # Display fields the Earnings/withdrawal page renders directly.
+        "pending_deals_count": len(held),
+        "deals_paid_this_month": sum(1 for e in released if this_month(e)),
+        "kyc_status": kyc.get("status") or "not_submitted",
+        "kyc_rejection_reason": kyc.get("rejection_reason"),
         # Saved payout account (prefilled into the withdrawal form).
         "bank_details": current_user.get("bank_details") or {},
         "upi_id": current_user.get("upi_id") or "",
