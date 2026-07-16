@@ -7605,9 +7605,20 @@ async def assess_late_delivery(creator_id: str, campaign: dict, work: dict) -> d
 async def download_work(work_id: str, current_user: dict = Depends(get_current_user)):
     """Download the delivered file. Allowed for the brand on the campaign, the
     creator, or an admin — and (for the brand) only once the work is approved."""
+    # The Work Review card passes a CAMPAIGN id, not a work_submission id (same shape as
+    # the approve fix). Resolve either: try the work id first, then fall back to the
+    # campaign's latest work submission — preferring the approved one.
     work = await db.work_submissions.find_one({"id": work_id}, {"_id": 0})
     if not work:
-        raise HTTPException(status_code=404, detail="Work not found")
+        campaign_match = await find_campaign_by_any_id(work_id)
+        cid = (campaign_match or {}).get("id", work_id)
+        work = await db.work_submissions.find_one(
+            {"campaign_id": cid, "status": WorkStatus.APPROVED}, {"_id": 0}, sort=[("submitted_at", -1)]
+        ) or await db.work_submissions.find_one(
+            {"campaign_id": cid}, {"_id": 0}, sort=[("submitted_at", -1)]
+        )
+    if not work:
+        raise HTTPException(status_code=404, detail="No submitted work found for this deal")
     campaign = await db.campaigns.find_one({"id": work.get("campaign_id")}, {"_id": 0}) or {}
     uid, role = current_user["id"], current_user.get("role")
     is_brand = _brand_ws_id(current_user) == campaign.get("business_id")
@@ -7618,7 +7629,18 @@ async def download_work(work_id: str, current_user: dict = Depends(get_current_u
         raise HTTPException(status_code=403, detail="Download unlocks after you approve the work")
     versions = work.get("versions") or []
     latest = versions[-1] if versions else {}
-    url = latest.get("original_url") or latest.get("video_url") or work.get("video_url") or work.get("original_url")
+    # work_submissions store the delivered files in `work_files` (first = the video);
+    # older/legacy docs may carry video_url/original_url. Also fall back to the newest
+    # approved content submission, which always has the raw video_url.
+    work_files = work.get("work_files") or []
+    url = (latest.get("original_url") or latest.get("video_url")
+           or work.get("original_url") or work.get("video_url")
+           or (work_files[0] if work_files else None))
+    if not url:
+        sub = await db.deal_content_submissions.find_one(
+            {"campaign_id": work.get("campaign_id")}, {"_id": 0}, sort=[("version", -1)]
+        ) or {}
+        url = sub.get("original_url") or sub.get("video_url")
     if not url:
         raise HTTPException(status_code=404, detail="No downloadable file for this work")
     # Files live on Cloudinary or /uploads — hand back the URL to stream from.
@@ -10588,6 +10610,19 @@ async def approve_withdrawal(withdrawal_id: str, current_user: dict = Depends(re
         }}
     )
 
+    # Let the creator know their payout is on the way.
+    amount = float(withdrawal.get('amount') or 0)
+    await notify_user(
+        withdrawal['user_id'],
+        "Withdrawal approved",
+        f"Your withdrawal of ₹{amount:,.0f} has been approved and is being paid out "
+        f"via {withdrawal.get('payment_method', 'bank/UPI')}. Receipt {receipt.get('receipt_number', '')}.",
+        link="/withdrawal",
+        ntype="success",
+        email=True,
+        category="payments",
+    )
+
     return {"message": "Withdrawal approved successfully", "receipt": receipt}
 
 @api_router.post("/admin/withdrawals/{withdrawal_id}/reject")
@@ -10617,7 +10652,21 @@ async def reject_withdrawal(withdrawal_id: str, reason: str, current_user: dict 
         {"id": withdrawal['user_id']},
         {"$inc": {"balance": withdrawal['amount']}}
     )
-    
+
+    # Tell the creator — they had no idea their payout was declined before this.
+    amount = float(withdrawal.get('amount') or 0)
+    reason_txt = (reason or '').strip()
+    await notify_user(
+        withdrawal['user_id'],
+        "Withdrawal request declined",
+        f"Your withdrawal of ₹{amount:,.0f} was not approved{(': ' + reason_txt) if reason_txt else '.'} "
+        f"The amount has been refunded to your UGCad balance.",
+        link="/withdrawal",
+        ntype="warning",
+        email=True,
+        category="payments",
+    )
+
     return {"message": "Withdrawal rejected and amount refunded"}
 
 @api_router.post("/upload/file")
