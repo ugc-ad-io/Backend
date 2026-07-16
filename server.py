@@ -5002,8 +5002,12 @@ async def get_profile(user_id: str, current_user: dict = Depends(get_current_use
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Hide sensitive info based on role
-    if user['role'] == UserRole.CREATOR and current_user['role'] != UserRole.ADMIN:
+    # Hide a creator's social links from OTHER users (anti-disintermediation) — but
+    # never from the creator viewing their own profile (that stripped their own links
+    # and made the profile show "add link" even after they'd saved them), and never
+    # from admins.
+    is_self = current_user.get('id') == user.get('id')
+    if user['role'] == UserRole.CREATOR and current_user['role'] != UserRole.ADMIN and not is_self:
         if 'profile' in user and 'social_links' in user['profile']:
             user['profile']['social_links'] = {}
 
@@ -5017,6 +5021,13 @@ async def get_profile(user_id: str, current_user: dict = Depends(get_current_use
     # showed 0. Compute it the same way the directory/shortlist do.
     if user.get('role') == UserRole.CREATOR:
         user['deliverables_completed'] = await creator_deliverables_completed(user)
+        # Same back-compat as /auth/me: a creator's signup portfolio can live only
+        # under profile.portfolio, but the profile modal reads the TOP-LEVEL
+        # `portfolio`. Without surfacing it here, saved work showed as "add work".
+        if not user.get('portfolio'):
+            nested = (user.get('profile') or {}).get('portfolio')
+            if nested:
+                user['portfolio'] = nested
 
     return user
 
