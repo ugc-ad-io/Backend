@@ -712,19 +712,19 @@ def _reset_code_valid(user: Optional[dict], code: str) -> bool:
         return False
     return user['reset_code'] == _reset_code_hash(code)
 
+# Realistic placeholder names so an account without a set name still reads as a
+# person, never a "BraveFalcon764" handle.
+PLACEHOLDER_FIRST_NAMES = [
+    'Aarav', 'Vivaan', 'Aditya', 'Arjun', 'Reyansh', 'Rohan', 'Kabir', 'Ishaan', 'Dev', 'Krishna',
+    'Ananya', 'Diya', 'Aadhya', 'Saanvi', 'Priya', 'Ira', 'Myra', 'Riya', 'Kiara', 'Meera',
+    'Neha', 'Kunal', 'Nikhil', 'Sara', 'Aisha', 'Tara', 'Karan', 'Sana', 'Yash', 'Zoya',
+]
+
 async def generate_nickname() -> str:
-    """Generate a unique nickname by checking database for existing nicknames"""
-    adjectives = ['Lucky', 'Happy', 'Bright', 'Swift', 'Bold', 'Cool', 'Smart', 'Quick', 'Brave', 'Wise', 
-                  'Noble', 'Fierce', 'Mighty', 'Grand', 'Royal', 'Elite', 'Prime', 'Alpha', 'Stellar', 'Epic']
-    nouns = ['Tiger', 'Eagle', 'Lion', 'Wolf', 'Bear', 'Fox', 'Hawk', 'Panther', 'Falcon', 'Dragon',
-             'Phoenix', 'Raven', 'Cobra', 'Shark', 'Viper', 'Leopard', 'Cheetah', 'Lynx', 'Puma', 'Jaguar']
-    
+    """A realistic placeholder NAME (not a handle) until the person sets their own."""
     max_attempts = 50
     for _ in range(max_attempts):
-        # No "@" — this is a placeholder display NAME until the creator sets a real
-        # one in their profile, not a username handle.
-        nickname = f"{random.choice(adjectives)}{random.choice(nouns)}{random.randint(100, 999)}"
-        # Check if nickname already exists
+        nickname = f"{random.choice(PLACEHOLDER_FIRST_NAMES)}{random.randint(10, 99)}"
         existing = await db.users.find_one({"nickname": {"$in": [nickname, f"@{nickname}"]}})
         if not existing:
             return nickname
