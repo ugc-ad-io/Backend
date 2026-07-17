@@ -3083,11 +3083,12 @@ async def forgot_password(data: ForgotPasswordRequest):
     )
     logger.info(f"[forgot-password] reset code for {email}: {code}")
     try:
+        from urllib.parse import quote
         html = _email_base_template("Password reset", f"""
             <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Reset your password</h1>
             <p style="margin:0 0 20px;font-size:15px;line-height:1.6;color:#4a4f74;">Use the code below to reset your password. It expires in 15 minutes.</p>
             <div style="font-size:32px;font-weight:800;letter-spacing:8px;color:#5b6bff;background:#f4f5fb;border-radius:12px;padding:18px 0;text-align:center;">{code}</div>
-            {_email_button("Go to sign in")}
+            {_email_button("Enter code & set new password", f"/auth?view=reset&email={quote(email)}")}
             <p style="margin:20px 0 0;font-size:13px;line-height:1.6;color:#9296ba;">If you didn't request this, you can safely ignore this email.</p>""")
         await send_email(email, "Your UGCad.io password reset code", html)
     except Exception as e:
@@ -13163,6 +13164,30 @@ async def admin_business_profile(business_id: str, current_user: dict = Depends(
     profile["role"] = user.get("role")
     profile["username"] = user.get("username")
     return profile
+
+
+@api_router.get("/admin/business/{business_id}/campaigns")
+async def admin_business_campaigns(business_id: str, current_user: dict = Depends(require_cap("manage_deals"))):
+    """Every campaign a brand has posted — live and completed — for the admin
+    user-detail drawer's Campaigns tab. Read straight from db.campaigns by
+    business_id so it includes campaigns with no selected creator yet, which
+    /admin/deals filters out (that route only lists matched deals)."""
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can view campaigns")
+    campaigns = await db.campaigns.find(
+        {"business_id": business_id, "status": {"$ne": CampaignStatus.DRAFT}},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(1000)
+    rows = [{
+        "id": c.get("id"),
+        "title": c.get("title") or "Untitled campaign",
+        "status": c.get("status"),
+        "budget_min": c.get("budget_min"),
+        "budget_max": c.get("budget_max"),
+        "selected_creator": c.get("selected_creator"),
+        "created_at": c.get("created_at"),
+    } for c in campaigns if c.get("id")]
+    return _json_safe(rows)
 
 
 @api_router.post("/admin/deals/{campaign_id}/force-transition")
