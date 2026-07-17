@@ -1357,6 +1357,7 @@ async def notify_user(user_id: str, title: str, message: str, link: Optional[str
         "message": message,
         "type": ntype,
         "link": link,
+        "category": category,
         "read": False,
         "created_at": now_iso(),
         "created_by": "system",
@@ -5219,11 +5220,9 @@ async def submit_kyc(data: Dict[str, Any] = Body(...), current_user: dict = Depe
 
     # --- Documents ---
     pan_doc = str(data.get("pan_doc_url") or "").strip()
-    selfie = str(data.get("selfie_url") or "").strip()
+    selfie = str(data.get("selfie_url") or "").strip()  # optional — no longer required
     if not pan_doc:
         raise HTTPException(status_code=400, detail="Upload a photo of your PAN card.")
-    if not selfie:
-        raise HTTPException(status_code=400, detail="Upload a selfie holding your ID.")
 
     kyc = {
         "status": "pending",
