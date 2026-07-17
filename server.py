@@ -6542,14 +6542,14 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
             unread_per_partner[other_id] = unread_per_partner.get(other_id, 0) + 1
 
         if other_id not in conversations or item_timestamp > conversations[other_id]['timestamp']:
-            other_user = await db.users.find_one({"id": other_id}, {"_id": 0, "nickname": 1, "role": 1, "profile_photo": 1})
+            other_user = await db.users.find_one({"id": other_id}, {"_id": 0, "nickname": 1, "full_name": 1, "username": 1, "role": 1, "profile_photo": 1})
             # Fall back to _id — a partner created through the Node backend may carry only
             # `_id`, and looking up by `id` alone silently DROPPED the whole conversation
             # (the "I got a message notification but Messages is empty" bug).
             if not other_user:
                 try:
                     from bson import ObjectId
-                    other_user = await db.users.find_one({"_id": ObjectId(other_id)}, {"_id": 0, "nickname": 1, "role": 1, "profile_photo": 1})
+                    other_user = await db.users.find_one({"_id": ObjectId(other_id)}, {"_id": 0, "nickname": 1, "full_name": 1, "username": 1, "role": 1, "profile_photo": 1})
                 except Exception:
                     other_user = None
             # Never drop a real message. Show the thread even if the account can't be
@@ -6568,6 +6568,10 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
                 conversations[other_id] = {
                     "user_id": other_id,
                     "nickname": other_user.get('nickname', 'Unknown'),
+                    # Real name + @handle exposed separately so the UI can show the
+                    # person's NAME (never the auto-generated "@handle") in the list.
+                    "full_name": other_user.get('full_name'),
+                    "username": other_user.get('username'),
                     "role": other_user.get('role', ''),
                     "profile_picture": other_user.get('profile_photo') or other_user.get('profile_picture'),
                     "last_message": item,
