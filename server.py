@@ -193,6 +193,7 @@ class SignupRequest(BaseModel):
     email: EmailStr
     password: str
     role: UserRole
+    name: Optional[str] = None
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -720,14 +721,16 @@ async def generate_nickname() -> str:
     
     max_attempts = 50
     for _ in range(max_attempts):
-        nickname = f"@{random.choice(adjectives)}{random.choice(nouns)}{random.randint(100, 999)}"
+        # No "@" — this is a placeholder display NAME until the creator sets a real
+        # one in their profile, not a username handle.
+        nickname = f"{random.choice(adjectives)}{random.choice(nouns)}{random.randint(100, 999)}"
         # Check if nickname already exists
-        existing = await db.users.find_one({"nickname": nickname})
+        existing = await db.users.find_one({"nickname": {"$in": [nickname, f"@{nickname}"]}})
         if not existing:
             return nickname
-    
+
     # Fallback: use UUID if all attempts fail
-    return f"@User{str(uuid.uuid4())[:8]}"
+    return f"User{str(uuid.uuid4())[:8]}"
 
 async def generate_creator_code() -> str:
     """Generate a permanent, unique public creator code (e.g. CR-7F3A2B).
@@ -2795,7 +2798,10 @@ async def signup(data: SignupRequest):
         raise HTTPException(status_code=400, detail="Email already registered")
     
     user_id = str(uuid.uuid4())
-    nickname = await generate_nickname()
+    # Use the name the person typed at signup as their display name; only fall
+    # back to a generated placeholder if they didn't give one.
+    typed_name = str(data.name or "").strip().lstrip("@")
+    nickname = typed_name or await generate_nickname()
 
     user_doc = {
         "id": user_id,
@@ -2803,6 +2809,7 @@ async def signup(data: SignupRequest):
         "password": hash_password(data.password),
         "role": data.role,
         "nickname": nickname,
+        "full_name": typed_name,
         "profile_completed": False,
         "curated_brand_visible": False,
         "creator_directory_visible": False,
@@ -4872,6 +4879,18 @@ async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict 
         "profile_completed": True,
         "updated_at": now_str,
     }
+
+    # The creator's real NAME becomes their display name — this is what replaces
+    # the auto-generated "@FierceDragon774" handle everywhere the UI shows them.
+    real_name = str(
+        profile_data.get("fullName")
+        or profile_data.get("full_name")
+        or profile_data.get("name")
+        or ""
+    ).strip().lstrip("@")
+    if real_name:
+        update_fields["nickname"] = real_name
+        update_fields["full_name"] = real_name
     if was_approved:
         # An already-approved creator editing their profile (details, new work) must NOT
         # be knocked back to PENDING — that silently de-lists them from the brand
@@ -4962,15 +4981,22 @@ async def update_business_profile(data: BusinessProfileUpdate, current_user: dic
         raise HTTPException(status_code=403, detail="Only businesses can update business profile")
 
     profile_data = data.dict()
-    await db.users.update_one(
-        {"id": current_user['id']},
-        {"$set": {
-            "profile": profile_data,
-            "profile_completed": True,
-            "approval_status": ApprovalStatus.PENDING,
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }}
-    )
+    set_fields = {
+        "profile": profile_data,
+        "profile_completed": True,
+        "approval_status": ApprovalStatus.PENDING,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # The brand's name becomes their display name (replaces any auto handle).
+    brand_display = str(
+        profile_data.get("business_name")
+        or profile_data.get("contact_person")
+        or profile_data.get("name")
+        or ""
+    ).strip().lstrip("@")
+    if brand_display:
+        set_fields["nickname"] = brand_display
+    await db.users.update_one({"id": current_user['id']}, {"$set": set_fields})
 
     # Cascade brand info updates to all existing campaigns for this business
     brand_name = profile_data.get('business_name') or current_user.get('nickname', '')

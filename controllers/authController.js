@@ -76,15 +76,18 @@ exports.signToken = signToken;
 // POST /api/auth/signup { email, password, role }
 exports.signup = async (req, res, next) => {
   try {
-    const { email, password, role } = req.body;
+    const { email, password, role, name } = req.body;
     if (!email || !password) return fail(res, 400, 'Email and password are required');
     if (await User.findOne({ email: email.toLowerCase() })) return fail(res, 409, 'An account with this email already exists');
 
+    // The typed name becomes the display name; fall back to the email local-part.
+    const displayName = String(name || '').trim().replace(/^@+/, '') || email.split('@')[0];
     const user = await User.create({
       email,
       password,
       role: ['creator', 'business', 'admin'].includes(role) ? role : 'creator',
-      nickname: email.split('@')[0]
+      nickname: displayName,
+      full_name: displayName,
     });
 
     res.status(201).json({ token: signToken(user), ...user.toSelf() });
@@ -351,8 +354,13 @@ async function saveOnboardingProfile(req, res, next, role) {
     // Mirror a few fields onto the top-level user so existing reads keep working.
     const photo = data.profile_picture || data.profile_photo || data.logo;
     if (photo) set.profile_photo = photo;
-    if (data.nickname || data.full_name || data.business_name) {
-      set.nickname = data.nickname || data.full_name || data.business_name;
+    // The person's real NAME becomes their display name (nickname), replacing the
+    // auto-generated handle. The creator form sends `fullName` (camelCase), the
+    // brand sends `business_name` — accept every spelling.
+    const realName = data.nickname || data.fullName || data.full_name || data.business_name || data.name;
+    if (realName) {
+      set.nickname = String(realName).trim().replace(/^@+/, '');
+      set.full_name = set.nickname;
     }
     if (Array.isArray(data.portfolio)) set.portfolio = data.portfolio;
     if (username) set.username = username;
