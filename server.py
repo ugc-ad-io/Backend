@@ -3231,11 +3231,12 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
         (creator.get("tags") or [None])[0] if isinstance(creator.get("tags"), list) else None,
         (profile.get("tags") or [None])[0] if isinstance(profile.get("tags"), list) else None,
     )
-    # Public display name = the admin-assigned handle/nickname (never the real full name).
+    # Public display NAME shown to brands — no "@username" handle anymore.
     display_name = first_non_empty(
         creator.get("nickname"),
-        ("@" + creator["username"]) if creator.get("username") else None,
         profile.get("nickname"),
+        creator.get("full_name"),
+        creator.get("username"),
         creator.get("public_creator_id"),
     ) or ""
     return {
@@ -12975,6 +12976,9 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
             "weight": (f"{prod.get('weight')} kg" if prod.get("weight") else None),
             "dimensions": dim_str,
             "requested_at": requested, "created_at": requested,
+            # When it actually shipped — lets the queue freeze the SLA at ship time
+            # instead of showing an ever-growing "breached" on a done shipment.
+            "shipped_at": sh.get("shipped_at") or sh.get("updated_at"),
             "status": ship_status, "courier": sh.get("courier_name"), "tracking_number": sh.get("tracking_number"),
             "has_label": bool(sh.get("label_url")), "label_url": sh.get("label_url"),
             # Prefer what was submitted for THIS shipment; fall back to the saved
