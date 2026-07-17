@@ -970,6 +970,11 @@ def gst_status_of(user: dict) -> str:
     return status if status in GST_STATUSES else "not_submitted"
 
 
+def kyc_status_of(user: dict) -> str:
+    """Current KYC state for a creator. Mirrors gst_status_of. Values: not_submitted / pending / verified / rejected."""
+    return ((user or {}).get("kyc") or {}).get("status") or "not_submitted"
+
+
 def gst_public(user: dict) -> dict:
     """What the brand itself sees about its own GST record."""
     gst = (user or {}).get("gst") or {}
@@ -6151,7 +6156,10 @@ async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Dep
     
     if current_user.get('approval_status') != ApprovalStatus.APPROVED:
         raise HTTPException(status_code=403, detail="Your profile must be approved first")
-    
+
+    if kyc_status_of(current_user) != "verified":
+        raise HTTPException(status_code=403, detail="Complete KYC verification before bidding on campaigns")
+
     campaign = await db.campaigns.find_one({"id": campaign_id})
     if not campaign or campaign['status'] != CampaignStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Campaign not available for bidding")
@@ -9849,6 +9857,10 @@ async def request_withdrawal(data: WithdrawalRequest, current_user: dict = Depen
     # Only approved creators can withdraw earnings.
     if current_user.get('approval_status') != ApprovalStatus.APPROVED:
         raise HTTPException(status_code=403, detail="Your creator profile must be approved before you can withdraw")
+
+    # KYC must be verified before any payout can leave the platform.
+    if kyc_status_of(current_user) != "verified":
+        raise HTTPException(status_code=403, detail="Complete KYC verification before withdrawing earnings")
 
     # Amount must be a positive number at or above the minimum.
     if data.amount is None or data.amount <= 0:
