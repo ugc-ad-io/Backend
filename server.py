@@ -7666,7 +7666,16 @@ async def download_work(work_id: str, current_user: dict = Depends(get_current_u
     is_creator = uid == campaign.get("selected_creator") or uid == work.get("creator_id")
     if not (is_brand or is_creator or role == UserRole.ADMIN):
         raise HTTPException(status_code=403, detail="Not authorized to download this work")
-    if is_brand and role != UserRole.ADMIN and work.get("status") != WorkStatus.APPROVED:
+    # Unlock on approval. Match the deal-room asset gate (see work_approved above):
+    # treat a COMPLETED campaign as approved too, so a finished deal whose resolved
+    # work_submissions row was never stamped "approved" (legacy deals, multi-version
+    # submissions, submitted_at sort ties) still downloads instead of falsely 403-ing
+    # "unlocks after you approve" on a card that already shows Approved.
+    work_approved = (
+        work.get("status") == WorkStatus.APPROVED
+        or campaign.get("status") == CampaignStatus.COMPLETED
+    )
+    if is_brand and role != UserRole.ADMIN and not work_approved:
         raise HTTPException(status_code=403, detail="Download unlocks after you approve the work")
     versions = work.get("versions") or []
     latest = versions[-1] if versions else {}
