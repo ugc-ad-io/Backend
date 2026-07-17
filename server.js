@@ -186,10 +186,12 @@ app.get('/api/business/creator-directory', auth, async (req, res) => {
       const p = u.profile || {};
       const portfolio = (u.portfolio && u.portfolio.length ? u.portfolio : null) || p.portfolio_items || p.portfolio || [];
       const preview = pickMedia(portfolio);
-      // Public website username/handle the admin assigns — never the creator's real name.
-      const resolvedName = (u.nickname || '').trim()
-        || (u.username ? `@${u.username}` : '')
-        || (u.public_creator_id || '') || 'Creator';
+      // Brand-facing display name = the creator's real FIRST name (no surname,
+      // no @handle). Prefer the profile name they typed; fall back to the handle.
+      const rawName = String(
+        p.fullName || p.full_name || u.full_name || u.nickname || u.username || u.public_creator_id || 'Creator'
+      ).trim().replace(/^@+/, '');
+      const resolvedName = rawName.split(/\s+/)[0] || 'Creator';
       return {
         id: u._id,
         name: resolvedName,

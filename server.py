@@ -3243,14 +3243,20 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
         (creator.get("tags") or [None])[0] if isinstance(creator.get("tags"), list) else None,
         (profile.get("tags") or [None])[0] if isinstance(profile.get("tags"), list) else None,
     )
-    # Public display NAME shown to brands — no "@username" handle anymore.
-    display_name = first_non_empty(
+    # Public display NAME shown to brands: the creator's real FIRST name (no
+    # surname, no "@username" handle). Prefer the name they typed on their
+    # profile; only fall back to the auto handle if they never set one.
+    raw_name = first_non_empty(
+        profile.get("fullName"),
+        profile.get("full_name"),
+        creator.get("full_name"),
         creator.get("nickname"),
         profile.get("nickname"),
-        creator.get("full_name"),
         creator.get("username"),
         creator.get("public_creator_id"),
     ) or ""
+    raw_name = raw_name.strip().lstrip("@")
+    display_name = raw_name.split()[0] if raw_name else ""
     return {
         "id": creator.get("id"),
         "public_creator_id": creator.get("public_creator_id") or "",
