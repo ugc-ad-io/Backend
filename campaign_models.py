@@ -253,6 +253,7 @@ class CampaignDraftCreate(BriefSectionsMixin):
     brand_cover_image_url: Optional[str] = None
     business_verified: Optional[bool] = None
     product_image_url: Optional[str] = None
+    image_url: Optional[str] = None  # optional campaign banner/cover image (was dropped on draft-save)
 
     # Industry classification
     industry_type: Optional[IndustryType] = None
@@ -306,6 +307,7 @@ class CampaignUpdate(BriefSectionsMixin):
     brand_cover_image_url: Optional[str] = None
     business_verified: Optional[bool] = None
     product_image_url: Optional[str] = None
+    image_url: Optional[str] = None  # optional campaign banner/cover image (was dropped on PATCH/publish)
 
     # Industry classification
     industry_type: Optional[IndustryType] = None

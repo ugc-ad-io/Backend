@@ -161,7 +161,7 @@ def normalize_campaign_response(campaign: Dict[str, Any]) -> Dict[str, Any]:
 
     # Add response-facing aliases for brand/image fields
     campaign['brand_logo'] = campaign.get('brand_logo_url') or ''
-    campaign['cover_image'] = campaign.get('brand_cover_image_url') or campaign.get('product_image_url') or ''
+    campaign['cover_image'] = campaign.get('image_url') or campaign.get('brand_cover_image_url') or campaign.get('product_image_url') or ''
     campaign['product_image'] = campaign.get('product_image_url') or ''
     campaign['brand_handle'] = f"@{campaign['business_nickname']}" if campaign.get('business_nickname') else ''
     campaign.setdefault('business_verified', False)
