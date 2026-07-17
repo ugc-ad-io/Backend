@@ -115,6 +115,15 @@ const defaultCompany = {
   kyb_status: 'pending'
 };
 
+const INDIAN_STATES = [
+  'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chhattisgarh', 'Goa', 'Gujarat',
+  'Haryana', 'Himachal Pradesh', 'Jharkhand', 'Karnataka', 'Kerala', 'Madhya Pradesh',
+  'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram', 'Nagaland', 'Odisha', 'Punjab', 'Rajasthan',
+  'Sikkim', 'Tamil Nadu', 'Telangana', 'Tripura', 'Uttar Pradesh', 'Uttarakhand', 'West Bengal',
+  'Andaman and Nicobar Islands', 'Chandigarh', 'Dadra and Nagar Haveli and Daman and Diu', 'Delhi',
+  'Jammu and Kashmir', 'Ladakh', 'Lakshadweep', 'Puducherry'
+];
+
 const defaultTeam = { members: [], seat_limit: 10, seats_used: 0 };
 const defaultBilling = {
   plan_name: 'Brand Pro',
@@ -524,15 +533,23 @@ export default function ProfileSettings() {
   const renderBrandField = (label, value, onChange, props = {}) => (
     <label className={props.full ? 'bs-field bs-full' : 'bs-field'}>
       <span>{label}</span>
-      {props.textarea ? (
+      {props.options ? (
+        <select value={value || ''} onChange={(event) => onChange(event.target.value)} disabled={props.disabled}>
+          <option value="">{props.placeholder || `Select ${label}`}</option>
+          {props.options.map((opt) => (
+            <option key={opt} value={opt}>{opt}</option>
+          ))}
+        </select>
+      ) : props.textarea ? (
         <textarea value={value || ''} onChange={(event) => onChange(event.target.value)} rows={props.rows || 3} />
       ) : (
         <input
           type={props.type || 'text'}
           value={value || ''}
-          onChange={(event) => onChange(event.target.value)}
+          onChange={(event) => onChange(props.numeric ? event.target.value.replace(/[^0-9]/g, '') : event.target.value)}
           disabled={props.disabled}
           placeholder={props.placeholder}
+          inputMode={props.numeric ? 'numeric' : undefined}
         />
       )}
     </label>
@@ -567,7 +584,7 @@ export default function ProfileSettings() {
               {renderBrandField('Brand Name', brandProfile.brand_name, value => setBrandProfile(current => ({ ...current, brand_name: value })))}
               {renderBrandField('Contact Person', brandProfile.contact_person, value => setBrandProfile(current => ({ ...current, contact_person: value })))}
               {renderBrandField('Work Email', brandProfile.work_email, value => setBrandProfile(current => ({ ...current, work_email: value })), { type: 'email' })}
-              {renderBrandField('Phone Number', brandProfile.phone_number, value => setBrandProfile(current => ({ ...current, phone_number: value })))}
+              {renderBrandField('Phone Number', brandProfile.phone_number, value => setBrandProfile(current => ({ ...current, phone_number: value })), { numeric: true, placeholder: '9876543210' })}
               {renderBrandField('Website URL', brandProfile.website_url, value => setBrandProfile(current => ({ ...current, website_url: value })), { full: true, placeholder: 'https://yourbrand.com' })}
             </div>
           </div>
@@ -597,7 +614,7 @@ export default function ProfileSettings() {
             {renderBrandField('Country', company.country, value => setCompany(current => ({ ...current, country: value })))}
             {renderBrandField('Billing Address', company.billing_address, value => setCompany(current => ({ ...current, billing_address: value })), { full: true, textarea: true })}
             {renderBrandField('City', company.city, value => setCompany(current => ({ ...current, city: value })))}
-            {renderBrandField('State', company.state, value => setCompany(current => ({ ...current, state: value })))}
+            {renderBrandField('State', company.state, value => setCompany(current => ({ ...current, state: value })), { options: INDIAN_STATES, placeholder: 'Select state' })}
           </div>
           <div className="bs-card-actions">
             <button type="button" className="bs-primary dark" onClick={saveCompany} disabled={loading}>{loading ? 'Saving...' : 'Save Company Details'}</button>
