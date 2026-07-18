@@ -1528,8 +1528,22 @@ async def creator_has_chat_relationship(creator_id: str, brand_id: str) -> bool:
     }, {"_id": 0})
     return bool(invite)
 
-async def validate_chat_access(current_user: dict, recipient_id: str, allow_action_cards_only: bool = False):
+async def validate_chat_access(current_user: dict, recipient_id: str, allow_action_cards_only: bool = False, read_only: bool = False):
     recipient = await db.users.find_one({"id": recipient_id}, {"_id": 0, "password": 0})
+    # Reading a thread you're already part of must NEVER be blocked. The wallet,
+    # approval, relationship and pause gates below govern SENDING; enforcing them on
+    # reads made the whole Messages tab look broken ("No messages yet", nothing
+    # actionable") for under-funded or not-yet-approved brands. We also tolerate a
+    # partner that can only be resolved by _id (created via the Node backend) instead
+    # of 404-ing the read — the same fix the conversations list already carries.
+    if read_only:
+        if not recipient:
+            try:
+                from bson import ObjectId
+                recipient = await db.users.find_one({"_id": ObjectId(recipient_id)}, {"_id": 0, "password": 0})
+            except Exception:
+                recipient = None
+        return recipient or {"id": recipient_id, "role": ""}
     if not recipient:
         raise HTTPException(status_code=404, detail="Recipient not found")
     if current_user["id"] == recipient_id:
@@ -7148,7 +7162,7 @@ async def get_chat_typing(other_user_id: str, current_user: dict = Depends(get_c
 
 @api_router.get("/chat/{other_user_id}")
 async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_current_user)):
-    await validate_chat_access(current_user, other_user_id, allow_action_cards_only=True)
+    await validate_chat_access(current_user, other_user_id, allow_action_cards_only=True, read_only=True)
     messages = await db.messages.find({
         "$or": [
             {"sender_id": current_user['id'], "recipient_id": other_user_id},
