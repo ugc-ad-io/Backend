@@ -536,6 +536,9 @@ class DealContentSubmit(BaseModel):
 class DealRevisionResponseSubmit(BaseModel):
     response: str
     note: Optional[str] = None
+    # The specific requested changes the creator ticked they'll do (checklist on the
+    # creator's Revision Tracker). Lets the brand see exactly what was committed to.
+    accepted_changes: Optional[List[str]] = None
 
 class DealChatSubmit(BaseModel):
     message: str
@@ -2552,7 +2555,8 @@ def normalize_revision_tracker(work: Optional[dict], response: Optional[dict],
         "items": latest.get('items') or [],
         "notes": latest.get('notes') or '',
         "new_deadline_at": latest.get('new_deadline_at'),
-        "creator_response": (response or {}).get('response')
+        "creator_response": (response or {}).get('response'),
+        "accepted_changes": (response or {}).get('accepted_changes') or []
     }
 
 def compute_deal_state(campaign: dict, shipment: Optional[dict], receipt: dict, work: Optional[dict], escrow: Optional[dict], action_cards: List[dict]) -> dict:
@@ -7255,6 +7259,25 @@ async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_
         "participants": {"$all": [current_user['id'], other_user_id]}
     }, {"_id": 0}).sort("created_at", 1).to_list(1000)
 
+    # Deal-room SYSTEM messages ("Content submitted…", "Brand requested revisions…",
+    # "Creator partially accepted…") live in db.deal_messages, scoped by campaign — so
+    # the creator saw them in their Deal Room but the brand (who chats via the 1:1
+    # ChatPopup / Messages page) never did. Surface those system notices in this 1:1
+    # thread for BOTH parties. We pull only sender_type="system"; the deal room's own
+    # human chat stays in the deal room.
+    shared_campaigns = await db.campaigns.find({
+        "$or": [
+            {"business_id": current_user['id'], "selected_creator": other_user_id},
+            {"business_id": other_user_id, "selected_creator": current_user['id']},
+        ]
+    }, {"_id": 0, "id": 1}).to_list(100)
+    deal_system_messages = []
+    if shared_campaigns:
+        deal_system_messages = await db.deal_messages.find({
+            "campaign_id": {"$in": [c["id"] for c in shared_campaigns]},
+            "sender_type": "system",
+        }, {"_id": 0}).sort("created_at", 1).to_list(1000)
+
     if not current_user.get("disable_read_receipts"):
         read_at = now_iso()
         await db.messages.update_many(
@@ -7266,7 +7289,11 @@ async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_
             {"$addToSet": {"read_by": current_user['id']}, "$set": {"read_at": read_at}}
         )
 
-    items = [message_to_chat_item(msg) for msg in messages] + [action_card_to_chat_item(card) for card in action_cards]
+    items = (
+        [message_to_chat_item(msg) for msg in messages]
+        + [message_to_chat_item(msg) for msg in deal_system_messages]
+        + [action_card_to_chat_item(card) for card in action_cards]
+    )
     items.sort(key=lambda item: item.get("created_at") or item.get("timestamp") or "")
     return items
 
@@ -8362,6 +8389,18 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
         if not feedback:
             raise HTTPException(status_code=400, detail="Add at least one revision item.")
 
+    # Keep the deal on-platform — reject any phone/email in the revision text. Mirrors the
+    # guard in request_deal_revision and findContactInfo() in RevisionRequestModal.js, so
+    # brands can't pass contact details to creators via this entry point either.
+    contact_texts = [feedback, data.notes or ""] + [
+        f"{it.get('description', '')} {it.get('brief_reference', '')}" for it in items
+    ]
+    if any(contains_contact_info(t) for t in contact_texts):
+        raise HTTPException(
+            status_code=400,
+            detail="Revision requests can't include phone numbers or email addresses. Please keep all communication on-platform.",
+        )
+
     # PRD 8.5: hard maximum of 5 revisions per deliverable, then admin must step in.
     # Counted across the whole deal — every resubmission creates a new work doc, so
     # reading work['revisions'] alone restarted the count at 0 each round.
@@ -8796,6 +8835,7 @@ async def submit_revision_response(deal_id: str, data: DealRevisionResponseSubmi
         "creator_id": current_user['id'],
         "response": data.response,
         "note": data.note,
+        "accepted_changes": data.accepted_changes or [],
         "created_at": now_iso()
     }
     # Upsert so a creator changing their mind replaces the previous response
@@ -9660,8 +9700,31 @@ async def approve_deal_content(deal_id: str, current_user: dict = Depends(get_cu
         raise HTTPException(status_code=404, detail="No submitted work to approve")
     return await approve_work(work['id'], current_user)
 
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_PHONE_RE = re.compile(r"\+?\d[\d\s().-]{5,}\d")
+
+def contains_contact_info(text: Any) -> bool:
+    """True if the text looks like it contains a phone number or email address.
+    Mirrors findContactInfo() in RevisionRequestModal.js. Used to keep brands from
+    passing contact details to creators through a revision request (off-platform bait).
+    """
+    s = str(text or "")
+    if _EMAIL_RE.search(s):
+        return True
+    for m in _PHONE_RE.findall(s):
+        if len(re.sub(r"\D", "", m)) >= 7:
+            return True
+    return False
+
 @api_router.post("/deals/{deal_id}/request-revision")
 async def request_deal_revision(deal_id: str, data: DealRevisionRequest, current_user: dict = Depends(get_current_user)):
+    # Keep the deal on-platform — reject any phone/email in the revision text.
+    revision_texts = [data.feedback or ""] + list(data.requested_changes or [])
+    if any(contains_contact_info(t) for t in revision_texts):
+        raise HTTPException(
+            status_code=400,
+            detail="Revision requests can't include phone numbers or email addresses. Please keep all communication on-platform.",
+        )
     campaign = await get_brand_deal_campaign(deal_id, current_user)
     work = await db.work_submissions.find_one(
         {"campaign_id": campaign['id']}, {"_id": 0}, sort=[("submitted_at", -1)]
