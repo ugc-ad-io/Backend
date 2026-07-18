@@ -464,6 +464,19 @@ class BusinessNotificationPreferences(BaseModel):
 class BusinessBillingUpgrade(BaseModel):
     plan_name: str
 
+# Admin-managed "Top Earner" showcase cards on the creator home hero.
+class TopEarnerItem(BaseModel):
+    name: str
+    category: Optional[str] = ""
+    earned: float = 0
+    deals: int = 0
+    rating: float = 0
+    level: Optional[str] = ""
+    video_url: Optional[str] = ""
+
+class TopEarnersUpdate(BaseModel):
+    items: List[TopEarnerItem] = []
+
 class BusinessPaymentMethodCreate(BaseModel):
     type: str
     label: str
@@ -4272,7 +4285,7 @@ async def get_business_dashboard(current_user: dict = Depends(get_current_user))
     top_campaigns.sort(key=lambda item: (item["applications"], item["spend"]), reverse=True)
 
     creator_ids = [campaign.get("selected_creator") for campaign in selected_active_campaigns if campaign.get("selected_creator")]
-    creators = await db.users.find({"id": {"$in": creator_ids}}, {"_id": 0, "id": 1, "nickname": 1}).to_list(10000) if creator_ids else []
+    creators = await db.users.find({"id": {"$in": creator_ids}}, {"_id": 0, "id": 1, "nickname": 1, "full_name": 1, "business_name": 1, "profile.business_name": 1, "profile.full_name": 1, "profile.fullName": 1}).to_list(10000) if creator_ids else []
     creator_by_id = {creator.get("id"): creator for creator in creators}
 
     active_deals = []
@@ -4288,6 +4301,7 @@ async def get_business_dashboard(current_user: dict = Depends(get_current_user))
             "campaign_title": campaign.get("title", "Untitled Campaign"),
             "creator_id": campaign.get("selected_creator"),
             "creator_nickname": creator.get("nickname"),
+            "creator_name": person_display_name(creator, creator.get("nickname") or "Creator"),
             **stage,
             "due_date": campaign.get("deadline") or campaign.get("due_date"),
             "escrow_amount": to_float(escrow.get("amount") or escrow.get("held_amount")) or selected_bid_amount(campaign)
@@ -6152,6 +6166,30 @@ async def get_match_metrics(current_user: dict = Depends(require_cap("review_app
     }
 
 
+async def enrich_bids_with_creator_names(campaigns: list) -> None:
+    """Fill each bid's `creator_name` (the creator's real name) in place so brands
+    see real names, not the auto-generated @handle. New bids already store it; this
+    backfills older bids by batch-looking-up the creators. Mutates the campaigns."""
+    missing_ids = {
+        bid.get("creator_id")
+        for c in campaigns
+        for bid in (c.get("bids") or [])
+        if bid.get("creator_id") and not bid.get("creator_name")
+    }
+    if not missing_ids:
+        return
+    users = await db.users.find(
+        {"id": {"$in": list(missing_ids)}},
+        {"_id": 0, "id": 1, "nickname": 1, "full_name": 1, "business_name": 1,
+         "profile.business_name": 1, "profile.full_name": 1, "profile.fullName": 1},
+    ).to_list(10000)
+    name_by_id = {u.get("id"): person_display_name(u, u.get("nickname") or "Creator") for u in users}
+    for c in campaigns:
+        for bid in (c.get("bids") or []):
+            if not bid.get("creator_name") and bid.get("creator_id") in name_by_id:
+                bid["creator_name"] = name_by_id[bid["creator_id"]]
+
+
 @api_router.get("/campaigns")
 async def get_campaigns(
     status: Optional[str] = None,
@@ -6192,7 +6230,11 @@ async def get_campaigns(
         if normalized.get('status') == CampaignStatus.DRAFT:
             normalized['completion_percentage'] = get_campaign_completion_percentage(normalized)
         normalized_campaigns.append(normalized)
-    
+
+    # Brands should see each bidder's real name, not the @handle.
+    if current_user.get('role') == UserRole.BUSINESS:
+        await enrich_bids_with_creator_names(normalized_campaigns)
+
     return _json_safe(normalized_campaigns)
 
 @api_router.get("/campaigns/{campaign_id}")
@@ -6208,7 +6250,11 @@ async def get_campaign(campaign_id: str, current_user: dict = Depends(get_curren
     # Add completion percentage if draft
     if campaign.get('status') == CampaignStatus.DRAFT:
         campaign['completion_percentage'] = get_campaign_completion_percentage(campaign)
-    
+
+    # Brands should see each bidder's real name, not the @handle.
+    if current_user.get('role') == UserRole.BUSINESS:
+        await enrich_bids_with_creator_names([campaign])
+
     return campaign
 
 @api_router.post("/campaigns/{campaign_id}/bid")
@@ -6235,6 +6281,8 @@ async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Dep
         "id": str(uuid.uuid4()),
         "creator_id": current_user['id'],
         "creator_nickname": current_user['nickname'],
+        # Real name so brands see the creator's actual name, not the @handle.
+        "creator_name": person_display_name(current_user, current_user['nickname']),
         **data.dict(),
         "submitted_at": datetime.now(timezone.utc).isoformat()
     }
@@ -6510,6 +6558,7 @@ You can now communicate directly with {creator_display} to coordinate the work. 
         "message": "Creator selected and payment held in escrow",
         "creator_id": creator_id,
         "creator_nickname": creator['nickname'],
+        "creator_name": creator_display,
         "escrow_id": escrow_id,
         "amount": selected_bid['amount']
     }
@@ -9478,6 +9527,19 @@ async def get_work_pending_review(current_user: dict = Depends(get_current_user)
         {"_id": 0}
     ).to_list(1000)
 
+    # Attach each creator's real name so the brand sees it (not the @handle).
+    creator_ids = {w.get('creator_id') for w in work_submissions if w.get('creator_id')}
+    if creator_ids:
+        creators = await db.users.find(
+            {"id": {"$in": list(creator_ids)}},
+            {"_id": 0, "id": 1, "nickname": 1, "full_name": 1, "business_name": 1,
+             "profile.business_name": 1, "profile.full_name": 1, "profile.fullName": 1},
+        ).to_list(10000)
+        name_by_id = {u.get('id'): person_display_name(u, u.get('nickname') or 'Creator') for u in creators}
+        for w in work_submissions:
+            if w.get('creator_id') in name_by_id:
+                w['creator_name'] = name_by_id[w['creator_id']]
+
     # Brand review happens on watermark-protected previews only; raw files are
     # withheld until approval (PRD Section 8).
     return [cf.to_brand_facing_asset(work, approved=False) for work in work_submissions]
@@ -9502,9 +9564,10 @@ async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_
     # Denormalize fields the review UI expects.
     if campaign:
         work['campaign_title'] = campaign.get('title') or campaign.get('campaign_name')
-    creator = await db.users.find_one({"id": work['creator_id']}, {"_id": 0, "nickname": 1, "full_name": 1})
+    creator = await db.users.find_one({"id": work['creator_id']}, {"_id": 0, "nickname": 1, "full_name": 1, "business_name": 1, "profile.business_name": 1, "profile.full_name": 1, "profile.fullName": 1})
     if creator:
         work['creator_nickname'] = creator.get('nickname') or creator.get('full_name')
+        work['creator_name'] = person_display_name(creator, creator.get('nickname') or 'Creator')
 
     if is_brand_viewer:
         # Brand viewer gets the watermark-protected preview until approval.
@@ -11471,6 +11534,29 @@ async def create_notification_gateway(data: NotificationGatewayConfig, current_u
         )
     
     return {"message": f"Notification gateway {data.provider} configured successfully"}
+
+# ── Top Earner showcase (creator home hero) ──────────────────────────────────
+# Manually curated by admins. The hero shows these rotating cards; if none are
+# set the frontend falls back to its built-in defaults.
+@api_router.get("/home/top-earners")
+async def get_top_earners():
+    doc = await db.site_settings.find_one({"key": "top_earners"}, {"_id": 0})
+    return {"items": (doc or {}).get("items", [])}
+
+@api_router.get("/admin/top-earners")
+async def admin_get_top_earners(current_user: dict = Depends(require_cap("edit_settings"))):
+    doc = await db.site_settings.find_one({"key": "top_earners"}, {"_id": 0})
+    return {"items": (doc or {}).get("items", [])}
+
+@api_router.put("/admin/top-earners")
+async def admin_set_top_earners(data: TopEarnersUpdate, current_user: dict = Depends(require_cap("edit_settings"))):
+    items = [i.dict() for i in data.items if str(i.name or "").strip()]
+    await db.site_settings.update_one(
+        {"key": "top_earners"},
+        {"$set": {"key": "top_earners", "items": items, "updated_at": datetime.now(timezone.utc).isoformat(), "updated_by": current_user["id"]}},
+        upsert=True,
+    )
+    return {"items": items}
 
 @api_router.get("/admin/notification-gateways")
 async def get_notification_gateways(current_user: dict = Depends(require_cap("edit_settings"))):
