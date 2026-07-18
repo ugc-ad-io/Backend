@@ -1657,6 +1657,35 @@ async def log_chat_violation(current_user: dict, recipient_id: Optional[str], or
     await db.users.update_one({"id": current_user["id"]}, {"$set": user_updates})
     return {"violation": violation_doc, "strike": strike_doc}
 
+
+def contact_info_block_message(strike: dict) -> str:
+    """Human, escalation-aware block message for a contact-info violation.
+
+    Tells the user which strike this is and exactly what happens next / if they
+    do it again, so the warning isn't a bare 'blocked' with no context. Mirrors
+    the severity ladder in log_chat_violation (warning → paused → action-cards-only
+    → suspended).
+    """
+    n = strike.get("strike_number", 1)
+    severity = strike.get("severity")
+    pause_txt = "1 hour" if CHAT_PAUSE_SECONDS == 3600 else f"{CHAT_PAUSE_SECONDS // 60} minutes"
+    if severity == "suspended" or n >= 4:
+        tail = (f"This is strike {n}. Your account has been suspended for repeated "
+                "policy violations and is pending admin review. Email support@ugcad.io to appeal.")
+    elif severity == "action_cards_only" or n == 3:
+        tail = (f"This is strike 3 of 3. You can now only send structured action cards "
+                f"(offers, counters) for {ACTION_CARDS_ONLY_DAYS} days. One more violation will "
+                "suspend your account.")
+    elif severity == "paused" or n == 2:
+        tail = (f"This is strike 2 of 3. Your chat is now paused for {pause_txt}. A 3rd strike "
+                f"limits you to action cards only for {ACTION_CARDS_ONLY_DAYS} days, and a 4th "
+                "suspends your account.")
+    else:
+        tail = (f"This is strike 1 of 3. If it happens again your chat is paused for {pause_txt}; "
+                f"a 3rd strike limits you to action cards only for {ACTION_CARDS_ONLY_DAYS} days, "
+                "and a 4th suspends your account.")
+    return f"{CONTACT_INFO_BLOCK_DETAIL} {tail}"
+
 async def validate_message_attachments(attachment_urls: List[str]):
     if len(attachment_urls) > MAX_IMAGES_PER_CHAT_MESSAGE:
         # A message can include up to five image attachments; this also caps mixed simple file-only payloads.
@@ -6631,8 +6660,8 @@ async def send_message(data: ChatMessage, current_user: dict = Depends(get_curre
     await refresh_filter_rules()
     safety_check = check_contact_info_policy(data.message, brand_allowed_domains(current_user, recipient))
     if not safety_check["safe"]:
-        await log_chat_violation(current_user, data.recipient_id, data.message, safety_check["violations"], "message")
-        raise HTTPException(status_code=400, detail=CONTACT_INFO_BLOCK_DETAIL)
+        result = await log_chat_violation(current_user, data.recipient_id, data.message, safety_check["violations"], "message")
+        raise HTTPException(status_code=400, detail=contact_info_block_message(result["strike"]))
 
     created_at = now_iso()
     message_doc = {
