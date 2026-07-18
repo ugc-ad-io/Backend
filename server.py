@@ -11558,6 +11558,47 @@ async def admin_set_top_earners(data: TopEarnersUpdate, current_user: dict = Dep
     )
     return {"items": items}
 
+@api_router.get("/admin/top-earners/suggest")
+async def admin_suggest_top_earners(limit: int = 3, current_user: dict = Depends(require_cap("edit_settings"))):
+    """Compute the REAL top-earning creators from released payouts, so the admin can
+    seed the showcase from live data instead of typing it. Returns the same item
+    shape as the showcase; the admin can then edit and Save."""
+    n = max(1, min(int(limit or 3), 10))
+    released = await db.escrow.find({"status": "released"}, {"_id": 0, "campaign_id": 1, "net_payable": 1, "creator_payout": 1, "amount": 1}).to_list(20000)
+    camp_ids = list({e.get("campaign_id") for e in released if e.get("campaign_id")})
+    camps = await db.campaigns.find({"id": {"$in": camp_ids}}, {"_id": 0, "id": 1, "selected_creator": 1}).to_list(20000) if camp_ids else []
+    camp_to_creator = {c["id"]: c.get("selected_creator") for c in camps if c.get("id")}
+
+    totals = {}
+    for e in released:
+        cid = camp_to_creator.get(e.get("campaign_id"))
+        if not cid:
+            continue
+        pay = to_float(e.get("net_payable") if e.get("net_payable") is not None
+                       else (e.get("creator_payout") if e.get("creator_payout") is not None else e.get("amount")))
+        t = totals.setdefault(cid, {"earned": 0.0, "deals": 0})
+        t["earned"] += pay
+        t["deals"] += 1
+
+    top = sorted(totals.items(), key=lambda kv: kv[1]["earned"], reverse=True)[:n]
+    out = []
+    for cid, agg in top:
+        u = await db.users.find_one({"id": cid}, {"_id": 0}) or {}
+        p = u.get("profile") or {}
+        name = (p.get("fullName") or p.get("full_name") or u.get("full_name") or u.get("nickname") or "Creator")
+        portfolio = u.get("portfolio") or p.get("portfolio_items") or p.get("portfolio") or []
+        preview = portfolio[0] if isinstance(portfolio, list) and portfolio else portfolio
+        out.append({
+            "name": str(name).strip().lstrip("@"),
+            "category": p.get("primary_category") or p.get("category") or u.get("category") or "",
+            "earned": round(agg["earned"]),
+            "deals": agg["deals"],
+            "rating": to_float(u.get("average_rating")) or 0,
+            "level": str(u.get("level") or ""),
+            "video_url": _portfolio_preview_url(preview) if preview else "",
+        })
+    return {"items": out}
+
 @api_router.get("/admin/notification-gateways")
 async def get_notification_gateways(current_user: dict = Depends(require_cap("edit_settings"))):
     """Get all notification gateway configurations"""
