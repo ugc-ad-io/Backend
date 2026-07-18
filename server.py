@@ -976,15 +976,24 @@ def kyc_status_of(user: dict) -> str:
 
 
 def first_name_of(user: dict, fallback: str = "there") -> str:
-    """First name for greetings. Prefers explicit first_name, else the first word
-    of the real name / nickname, with any leading '@' stripped. Mirrors the
-    frontend firstName() util so greetings read 'Hi Meet!' not 'Hi Meet Jain!'."""
+    """First name for greetings. Prefers an explicit first_name, else the first
+    word of the real name (full_name). Only if no real name is set does it fall
+    back to the display nickname — with any auto-generated numeric suffix stripped
+    so a placeholder handle like 'Aarav42' (legacy 'BraveFalcon277') greets as a
+    name, never the raw username. Mirrors the frontend firstName() util so
+    greetings read 'Hi Meet!' not 'Hi Meet Jain!'."""
     u = user or {}
     explicit = str(u.get("first_name") or "").strip().lstrip("@")
     if explicit:
-        return explicit
-    name = str(u.get("full_name") or u.get("nickname") or "").strip().lstrip("@")
-    parts = name.split()
+        return explicit.split()[0]
+    real = str(u.get("full_name") or "").strip().lstrip("@")
+    if real:
+        return real.split()[0]
+    # No real name — this is the auto-generated placeholder handle. Drop the
+    # trailing digits so emails read as a first name, not a "@Name42" username.
+    # (Brands keep their typed business nickname as-is — it has no digit suffix.)
+    handle = re.sub(r"\d+$", "", str(u.get("nickname") or "").strip().lstrip("@")).strip()
+    parts = handle.split()
     return parts[0] if parts else fallback
 
 
@@ -1392,7 +1401,7 @@ async def notify_user(user_id: str, title: str, message: str, link: Optional[str
                 return
             addr = (u or {}).get("email")
             if addr:
-                html = _notification_email_html(title, message, link, (u.get("full_name") or u.get("nickname")))
+                html = _notification_email_html(title, message, link, first_name_of(u, fallback=""))
                 res = await send_email(addr, title, html, message)
                 # Never let a dropped email be invisible. A bare `except: pass` here is how
                 # "emails aren't coming" stayed unnoticed while prod had no RESEND_API_KEY.
@@ -9516,6 +9525,15 @@ async def get_creator_reviews(creator_id: str):
     reviews = await db.reviews.find({"creator_id": creator_id}, {"_id": 0}).to_list(1000)
     return reviews
 
+@api_router.get("/reviews/business/{business_id}")
+async def get_business_reviews(business_id: str):
+    """Reviews creators left for a brand (reviewee_role == 'business'). Powers the
+    brand profile card a creator opens from Messages — mirror of the creator route."""
+    reviews = await db.reviews.find(
+        {"business_id": business_id, "reviewee_role": "business"}, {"_id": 0}
+    ).to_list(1000)
+    return reviews
+
 # Shipment Routes
 @api_router.post("/shipment/update")
 async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get_current_user)):
@@ -10087,7 +10105,7 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(req
     # Branded decision email to the applicant (fire-and-forget — never blocks the decision).
     try:
         to_email = user.get("email")
-        name = user.get("nickname") or user.get("full_name") or "there"
+        name = first_name_of(user)
         if to_email:
             if data.action == "approve":
                 subject = "Your UGCad.io application is approved 🎉"
@@ -11637,7 +11655,11 @@ async def broadcast_notification(data: BroadcastNotification, current_user: dict
             "link": data.link,
             "read": False,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "created_by": current_user['id']
+            "created_by": current_user['id'],
+            # Tag broadcasts so the recipient's bell can show they came from the
+            # admin/ops team (e.g. an "Admin" chip) instead of a system event.
+            "source": "admin",
+            "sender_label": "Admin",
         }
         notifications.append(notification_doc)
     
