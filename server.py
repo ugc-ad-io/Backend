@@ -975,6 +975,19 @@ def kyc_status_of(user: dict) -> str:
     return ((user or {}).get("kyc") or {}).get("status") or "not_submitted"
 
 
+def first_name_of(user: dict, fallback: str = "there") -> str:
+    """First name for greetings. Prefers explicit first_name, else the first word
+    of the real name / nickname, with any leading '@' stripped. Mirrors the
+    frontend firstName() util so greetings read 'Hi Meet!' not 'Hi Meet Jain!'."""
+    u = user or {}
+    explicit = str(u.get("first_name") or "").strip().lstrip("@")
+    if explicit:
+        return explicit
+    name = str(u.get("full_name") or u.get("nickname") or "").strip().lstrip("@")
+    parts = name.split()
+    return parts[0] if parts else fallback
+
+
 def gst_public(user: dict) -> dict:
     """What the brand itself sees about its own GST record."""
     gst = (user or {}).get("gst") or {}
@@ -6418,7 +6431,7 @@ You can now communicate directly with {creator['nickname']} to coordinate the wo
             "sender_id": current_user['id'],
             "sender_nickname": current_user['nickname'],
             "recipient_id": creator_id,
-            "message": f"Hi {creator['nickname']}! Looking forward to working with you on this campaign. Let me know if you have any questions!",
+            "message": f"Hi {first_name_of(creator)}! Looking forward to working with you on this campaign. Let me know if you have any questions!",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "read": False
         }
