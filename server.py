@@ -2467,7 +2467,15 @@ def compute_deal_state(campaign: dict, shipment: Optional[dict], receipt: dict, 
     work_status = (work or {}).get('status')
     escrow_status = (escrow or {}).get('status')
 
-    if damaged:
+    # A cancelled deal is terminal — the brand ended it (or a dispute was refunded
+    # in full). This must be checked FIRST: without it a cancelled campaign fell
+    # through to a content-stage state with active_party "creator" and action
+    # "Submit content", so a deal sitting in the creator's Cancelled tab still
+    # offered a "Submit Content" button when opened.
+    if campaign.get('status') == 'cancelled':
+        state, party, action = "Cancelled", "system", "Deal cancelled"
+        started = campaign.get('cancelled_at') or campaign.get('updated_at')
+    elif damaged:
         state, party, action = "Damaged/Wrong Product Reported", "brand", "Resolve damage report"
         started = receipt.get('received_at') or now_iso()
     elif disputed:
