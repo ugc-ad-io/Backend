@@ -6875,6 +6875,10 @@ async def review_chat_false_positive(violation_id: str, data: ChatFalsePositiveR
 @api_router.post("/chat/action-cards")
 async def create_chat_action_card(data: ChatActionCardCreate, current_user: dict = Depends(get_current_user)):
     await validate_chat_access(current_user, data.recipient_id, allow_action_cards_only=True)
+    # Creators can't open a dispute directly — they resolve with the brand first and
+    # escalate to admin only if that fails (mirrors the deal-room /dispute guard).
+    if data.type == "raise_dispute" and current_user.get("role") == UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Creators can't open a dispute directly. Try to resolve it with the brand, then use 'Escalate to admin' if you need help.")
     fields = await validate_action_card_payload(data, current_user)
     created_at = now_iso()
     card = {
@@ -8852,77 +8856,28 @@ async def submit_revision_response(deal_id: str, data: DealRevisionResponseSubmi
         "partial_dispute": "partially accepted and disputed the remaining items",
     }
     label = LABELS.get(data.response, data.response)
-    event_type = "revision_requested" if data.response == "accepted" else "dispute_raised"
+    # A creator pushing back on a revision is NO LONGER an instant admin dispute.
+    # It's a disagreement the brand and creator are expected to resolve between
+    # themselves first; only an explicit "Escalate to admin" (see
+    # /deals/{deal_id}/escalate) turns it into a real dispute. So here we just record
+    # the pushback and nudge both sides to talk it out in the deal chat.
+    event_type = "revision_requested" if data.response == "accepted" else "revision_pushback"
     await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), event_type, f"Creator {label}.")
     await insert_deal_system_message(campaign, f"Creator {label}.")
 
     # Tell the brand — previously this was recorded silently and nothing happened.
     if campaign.get('business_id'):
+        pushed_back = data.response != "accepted"
         await notify_user(
             campaign['business_id'],
             "Creator responded to your revision request",
-            f"The creator {label}.",
+            (f"The creator {label}. Work it out together in the deal chat — if you "
+             "can't agree, it can be escalated to admin.") if pushed_back else f"The creator {label}.",
             link="/dashboard/business/all-campaigns",
-            ntype="warning" if data.response != "accepted" else "info",
+            ntype="warning" if pushed_back else "info",
         )
 
-    # Pushing back on a revision must raise a REAL dispute (db.disputes) — not just a
-    # deal action card. create_issue_action() only wrote an action card + held escrow,
-    # so the creator was told "a dispute was raised" while the admin Disputes queue
-    # stayed empty. Write the same dispute document the structured flow does.
-    dispute_id = None
-    if data.response in ("scope_creep", "partial_dispute"):
-        reason = (data.note or "").strip() or f"Creator {label} on the latest revision request."
-        existing = await get_open_dispute(campaign['id'])
-        if existing:
-            dispute_id = existing.get("id")   # don't stack duplicates on the same deal
-        else:
-            dtype = "scope_creep" if data.response == "scope_creep" else "revision_abuse"
-            severity = dispute_severity(dtype)
-            first_hrs, res_days = DISPUTE_SLA[severity]
-            now = datetime.now(timezone.utc)
-            dispute = {
-                "id": str(uuid.uuid4()),
-                "deal_id": make_deal_id(campaign),
-                "campaign_id": campaign['id'],
-                "business_id": campaign.get('business_id'),
-                "creator_id": campaign.get('selected_creator'),
-                "raised_by": current_user['id'],
-                "raised_by_role": current_user.get('role'),
-                "dispute_type": dtype,
-                "severity": severity,
-                "description": reason,
-                "desired_outcome": "other",
-                "evidence_urls": [],
-                "status": "open",
-                "first_response_due_at": (now + timedelta(hours=first_hrs)).isoformat(),
-                "resolution_due_at": (now + timedelta(days=res_days)).isoformat(),
-                "created_at": now_iso(),
-            }
-            await db.disputes.insert_one(dispute)
-            dispute_id = dispute["id"]
-
-            # Pause the deal: hold escrow + drop a dispute card in the room.
-            await db.escrow.update_one({"campaign_id": campaign['id']},
-                                       {"$set": {"status": "on_hold", "updated_at": now_iso()}}, upsert=True)
-            await db.deal_action_cards.insert_one({
-                "id": str(uuid.uuid4()), "deal_id": make_deal_id(campaign), "campaign_id": campaign['id'],
-                "type": "raise_dispute", "title": "Dispute raised", "status": "open", "created_at": now_iso(),
-                "created_by": current_user['id'], "message": reason, "dispute_id": dispute_id,
-            })
-            # PRD 9.9 — admin must be notified, and it must show in the Disputes queue.
-            await notify_admins(
-                f"New {severity} dispute",
-                f"{dtype.replace('_', ' ')} on deal {make_deal_id(campaign)} — first response due in {first_hrs}h.",
-                link="/dashboard/admin/disputes",
-            )
-            if campaign.get('business_id'):
-                await notify_user(
-                    campaign['business_id'], "A dispute was raised on your deal",
-                    "Deal activity is paused while our team reviews it.", link="/dashboard/business/all-campaigns",
-                )
-
-    return {"message": "Revision response submitted", "response": data.response, "dispute_id": dispute_id}
+    return {"message": "Revision response submitted", "response": data.response, "dispute_id": None}
 
 @api_router.get("/deals/{deal_id}/chat")
 async def get_deal_chat(deal_id: str, current_user: dict = Depends(get_current_user)):
@@ -8960,6 +8915,10 @@ async def create_deal_action_card(deal_id: str, data: DealActionCardSubmit, curr
         raise HTTPException(status_code=400, detail="Invalid action card type")
     context = await get_deal_context(deal_id, current_user)
     campaign = context['campaign']
+    # A creator can't open a dispute directly — their "raise dispute" becomes an admin
+    # escalation, which our team reviews and turns into a formal dispute if warranted.
+    if data.type == "raise_dispute" and current_user.get('role') == UserRole.CREATOR:
+        data.type = "escalate_to_admin"
     title_map = {
         "milestone_update": "Milestone update",
         "damage_report": "Damage report",
@@ -9000,13 +8959,16 @@ async def create_issue_action(deal_id: str, current_user: dict, issue_type: str,
         "attachment_urls": payload.attachment_urls
     }
     await db.deal_action_cards.insert_one(card)
-    if issue_type in ["raise_dispute", "escalate_to_admin"]:
+    # A creator's escalation must not auto-freeze escrow — the admin decides that on
+    # review. Escrow only holds on a raise_dispute, or a brand/admin escalation.
+    is_creator = current_user.get('role') == UserRole.CREATOR
+    if issue_type == "raise_dispute" or (issue_type == "escalate_to_admin" and not is_creator):
         await db.escrow.update_one({"campaign_id": campaign['id']}, {"$set": {"status": "on_hold", "updated_at": now_iso()}}, upsert=True)
     await insert_deal_activity(
         campaign,
         map_sender_type(current_user['id'], campaign, context['creator']['id'], current_user.get('role')),
         current_user.get('nickname', 'User'),
-        "dispute_raised",
+        "escalated_to_admin" if issue_type == "escalate_to_admin" else "dispute_raised",
         activity_message
     )
     await insert_deal_system_message(campaign, activity_message)
@@ -9014,11 +8976,38 @@ async def create_issue_action(deal_id: str, current_user: dict, issue_type: str,
 
 @api_router.post("/deals/{deal_id}/dispute")
 async def raise_deal_dispute(deal_id: str, data: DealIssueSubmit, current_user: dict = Depends(get_current_user)):
+    # Creators can no longer open a dispute directly — they must raise the issue with
+    # the brand first and then escalate if it can't be resolved (see /escalate).
+    if current_user['role'] == UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Creators can't open a dispute directly. Raise the issue with the brand first, then use 'Escalate to admin' if you can't resolve it together.")
     return await create_issue_action(deal_id, current_user, "raise_dispute", "Dispute raised", data.message or "A dispute was raised on this deal.", data)
 
 @api_router.post("/deals/{deal_id}/escalate")
 async def escalate_deal(deal_id: str, data: DealIssueSubmit, current_user: dict = Depends(get_current_user)):
-    return await create_issue_action(deal_id, current_user, "escalate_to_admin", "Escalated to admin", data.message or "This deal was escalated to admin support.", data)
+    context = await get_deal_context(deal_id, current_user)
+    campaign = context['campaign']
+    is_creator = current_user['role'] == UserRole.CREATOR
+    flagged = None
+    if is_creator:
+        # Talk first, escalate only if it couldn't be resolved: the creator must have
+        # already flagged a revision disagreement or reported a damaged/wrong product.
+        flagged = await db.deal_revision_responses.find_one({
+            "campaign_id": campaign['id'], "creator_id": current_user['id'],
+            "response": {"$in": ["scope_creep", "partial_dispute"]},
+        })
+        damaged = bool(await db.deal_action_cards.find_one({
+            "campaign_id": campaign['id'], "type": "damage_report", "status": "open"}))
+        if not flagged and not damaged:
+            raise HTTPException(status_code=400, detail="Raise your concern with the brand first (flag the revision or report the issue). You can escalate to admin only if you can't resolve it together.")
+    result = await create_issue_action(deal_id, current_user, "escalate_to_admin", "Escalated to admin", data.message or "This deal was escalated to admin support.", data)
+    # Escalation is the single path that actually reaches admin now, so file the real
+    # dispute record/queue entry (idempotent — reuses any dispute already open).
+    dtype = "communication_issue"
+    if flagged:
+        dtype = "revision_abuse" if flagged.get('response') == 'partial_dispute' else "scope_creep"
+    dispute_id = await open_admin_dispute(campaign, current_user, dtype, data.message or "Escalated to admin — could not resolve with the other party.")
+    result["dispute_id"] = dispute_id
+    return result
 
 @api_router.post("/deals/{deal_id}/damage-report")
 async def report_deal_damage(deal_id: str, data: DealIssueSubmit, current_user: dict = Depends(get_current_user)):
@@ -9060,6 +9049,57 @@ async def ensure_not_disputed(campaign_id: str):
     """PRD 9.3: while a dispute is open, all non-dispute deal actions are paused."""
     if await get_open_dispute(campaign_id):
         raise HTTPException(status_code=409, detail="This deal is under dispute. Actions are paused until an admin resolves it.")
+
+
+async def open_admin_dispute(campaign: dict, raised_by: dict, dtype: str, reason: str) -> str:
+    """Create the single real admin dispute for a deal (idempotent per campaign),
+    pause the deal (hold escrow + drop a dispute card) and notify admin + the other
+    party. This is the ONE place a deal reaches the admin Disputes queue now that
+    creators can no longer file disputes directly — only escalation gets here.
+    Returns the dispute id (the existing open one if a dispute is already open)."""
+    existing = await get_open_dispute(campaign['id'])
+    if existing:
+        return existing.get("id")
+    severity = dispute_severity(dtype)
+    first_hrs, res_days = DISPUTE_SLA[severity]
+    now = datetime.now(timezone.utc)
+    dispute = {
+        "id": str(uuid.uuid4()),
+        "deal_id": make_deal_id(campaign),
+        "campaign_id": campaign['id'],
+        "business_id": campaign.get('business_id'),
+        "creator_id": campaign.get('selected_creator'),
+        "raised_by": raised_by['id'],
+        "raised_by_role": raised_by.get('role'),
+        "dispute_type": dtype,
+        "severity": severity,
+        "description": reason,
+        "desired_outcome": "other",
+        "evidence_urls": [],
+        "status": "open",
+        "first_response_due_at": (now + timedelta(hours=first_hrs)).isoformat(),
+        "resolution_due_at": (now + timedelta(days=res_days)).isoformat(),
+        "created_at": now_iso(),
+    }
+    await db.disputes.insert_one(dispute)
+    await db.escrow.update_one({"campaign_id": campaign['id']},
+                               {"$set": {"status": "on_hold", "updated_at": now_iso()}}, upsert=True)
+    await db.deal_action_cards.insert_one({
+        "id": str(uuid.uuid4()), "deal_id": make_deal_id(campaign), "campaign_id": campaign['id'],
+        "type": "raise_dispute", "title": "Escalated to admin", "status": "open", "created_at": now_iso(),
+        "created_by": raised_by['id'], "message": reason, "dispute_id": dispute["id"],
+    })
+    await notify_admins(
+        f"New {severity} dispute",
+        f"{dtype.replace('_', ' ')} on deal {make_deal_id(campaign)} — first response due in {first_hrs}h.",
+        link="/dashboard/admin/disputes",
+    )
+    other_id = campaign.get('business_id') if raised_by.get('role') == UserRole.CREATOR else campaign.get('selected_creator')
+    if other_id and other_id != raised_by['id']:
+        await notify_user(other_id, "This deal was escalated to admin",
+                          "Deal activity is paused while our team reviews it.",
+                          link="/dashboard/business/all-campaigns")
+    return dispute["id"]
 
 
 @api_router.post("/deals/{deal_id}/raise-dispute")
