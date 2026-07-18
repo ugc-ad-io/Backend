@@ -5694,6 +5694,33 @@ async def update_campaign_route(campaign_id: str, data: CampaignUpdate, current_
         "message": "Campaign updated successfully"
     }
 
+@api_router.delete("/campaigns/{campaign_id}")
+async def delete_campaign_route(campaign_id: str, current_user: dict = Depends(get_current_user)):
+    """Delete a draft (or rejected) campaign the brand owns.
+
+    Only un-published briefs can be removed — a draft/rejected campaign never held
+    escrow and was never shown to creators, so deletion is safe. Anything that has
+    gone live (or beyond) must be cancelled through the normal flow instead.
+    """
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Check ownership
+    if campaign.get('business_id') != _brand_ws_id(current_user):
+        raise HTTPException(status_code=403, detail="You can only delete your own campaigns")
+
+    # Guard: only drafts / rejected briefs (never live, no money held) can be deleted.
+    if campaign.get('status') not in ['draft', 'rejected']:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot delete campaign with status: {campaign.get('status')}"
+        )
+
+    await db.campaigns.delete_one({"id": campaign_id})
+
+    return {"deleted": True, "campaign_id": campaign_id, "message": "Draft deleted"}
+
 @api_router.post("/campaigns/{campaign_id}/submit")
 async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(get_current_user)):
     """Submit a draft campaign for approval"""
