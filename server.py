@@ -1021,10 +1021,13 @@ def first_name_of(user: dict, fallback: str = "there") -> str:
     name, never the raw username. Mirrors the frontend firstName() util so
     greetings read 'Hi Meet!' not 'Hi Meet Jain!'."""
     u = user or {}
-    explicit = str(u.get("first_name") or "").strip().lstrip("@")
+    p = u.get("profile") or {}
+    # Names may live at the root OR nested under profile (creator signup stores them
+    # there via extra="allow"), so check both.
+    explicit = str(u.get("first_name") or p.get("first_name") or p.get("firstName") or "").strip().lstrip("@")
     if explicit:
         return explicit.split()[0]
-    real = str(u.get("full_name") or "").strip().lstrip("@")
+    real = str(u.get("full_name") or p.get("fullName") or p.get("full_name") or "").strip().lstrip("@")
     if real:
         return real.split()[0]
     # No real name — this is the auto-generated placeholder handle. Drop the
@@ -6600,7 +6603,11 @@ async def send_message(data: ChatMessage, current_user: dict = Depends(get_curre
     # Tell the recipient they have a new message. Works both ways (brand → creator and
     # creator → brand) — sending a chat used to create no notification at all, so the
     # other side only found out if they happened to open Messages.
-    sender_label = person_display_name(current_user)
+    # A creator's message only ever goes to a brand, who sees creators by first name.
+    # A brand's message keeps the full business name for the creator.
+    sender_label = (first_name_of(current_user, person_display_name(current_user))
+                    if current_user.get("role") == UserRole.CREATOR
+                    else person_display_name(current_user))
     body = (data.message or "").strip()
     preview = (body[:80] + "…") if len(body) > 80 else (body or "Sent an attachment")
     await notify_user(
@@ -11588,11 +11595,17 @@ async def admin_suggest_top_earners(limit: int = 3, current_user: dict = Depends
     return {"items": out}
 
 def _creator_showcase_item(u: dict, agg: dict) -> dict:
-    """Map a creator user + earnings aggregate into a showcase card."""
+    """Map a creator user + earnings aggregate into a showcase card, including the
+    full list of their portfolio videos (for the per-card video dropdown)."""
     p = u.get("profile") or {}
     name = (p.get("fullName") or p.get("full_name") or u.get("full_name") or u.get("nickname") or "Creator")
     portfolio = u.get("portfolio") or p.get("portfolio_items") or p.get("portfolio") or []
-    preview = portfolio[0] if isinstance(portfolio, list) and portfolio else portfolio
+    portfolio = portfolio if isinstance(portfolio, list) else [portfolio]
+    videos = []
+    for it in portfolio:
+        url = _portfolio_preview_url(it)
+        if url and url not in videos:
+            videos.append(url)
     return {
         "id": u.get("id"),
         "name": str(name).strip().lstrip("@"),
@@ -11601,7 +11614,8 @@ def _creator_showcase_item(u: dict, agg: dict) -> dict:
         "deals": (agg or {}).get("deals", 0),
         "rating": to_float(u.get("average_rating")) or 0,
         "level": str(u.get("level") or ""),
-        "video_url": _portfolio_preview_url(preview) if preview else "",
+        "video_url": videos[0] if videos else "",
+        "videos": videos,
     }
 
 @api_router.get("/admin/top-earners/creators")
