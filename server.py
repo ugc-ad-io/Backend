@@ -8915,10 +8915,10 @@ async def create_deal_action_card(deal_id: str, data: DealActionCardSubmit, curr
         raise HTTPException(status_code=400, detail="Invalid action card type")
     context = await get_deal_context(deal_id, current_user)
     campaign = context['campaign']
-    # A creator can't open a dispute directly — their "raise dispute" becomes an admin
-    # escalation, which our team reviews and turns into a formal dispute if warranted.
+    # Creators can't open a dispute directly (mirrors the /dispute and chat-action-card
+    # guards) — they resolve with the brand first, then escalate to admin if needed.
     if data.type == "raise_dispute" and current_user.get('role') == UserRole.CREATOR:
-        data.type = "escalate_to_admin"
+        raise HTTPException(status_code=403, detail="Creators can't open a dispute directly. Try to resolve it with the brand, then use 'Escalate to admin' if you need help.")
     title_map = {
         "milestone_update": "Milestone update",
         "damage_report": "Damage report",
