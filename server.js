@@ -2843,6 +2843,34 @@ app.delete('/api/admin/filter-rules/:ruleId', adminAuth, requireCap('content_mod
 });
 app.post('/api/admin/message/moderate', adminAuth, requireCap('content_moderation'), (req, res) => res.json({ success: true }));
 
+// ── Top Earner showcase (creator home hero) — admin-curated ──────────────────
+const siteSettings = () => require('mongoose').connection.db.collection('site_settings');
+app.get('/api/home/top-earners', async (req, res) => {
+  try { const doc = await siteSettings().findOne({ key: 'top_earners' }); res.json({ items: (doc && doc.items) || [] }); }
+  catch (e) { res.json({ items: [] }); }
+});
+app.get('/api/admin/top-earners', adminAuth, requireCap('edit_settings'), async (req, res) => {
+  try { const doc = await siteSettings().findOne({ key: 'top_earners' }); res.json({ items: (doc && doc.items) || [] }); }
+  catch (e) { res.status(500).json({ detail: e.message }); }
+});
+app.put('/api/admin/top-earners', adminAuth, requireCap('edit_settings'), async (req, res) => {
+  try {
+    const items = (Array.isArray(req.body.items) ? req.body.items : [])
+      .filter((i) => i && String(i.name || '').trim())
+      .map((i) => ({
+        name: String(i.name).trim(),
+        category: String(i.category || ''),
+        earned: Number(i.earned) || 0,
+        deals: Number(i.deals) || 0,
+        rating: Number(i.rating) || 0,
+        level: String(i.level || ''),
+        video_url: String(i.video_url || ''),
+      }));
+    await siteSettings().updateOne({ key: 'top_earners' }, { $set: { key: 'top_earners', items, updated_at: new Date() } }, { upsert: true });
+    res.json({ items });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({

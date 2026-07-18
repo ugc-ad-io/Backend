@@ -3917,7 +3917,7 @@ async def checkout_brief(data: CheckoutBriefCreate,
         "📩 New booking request",
         f"{brand_name} booked you for '{title}' — ₹{q['subtotal']:,.0f} is already held in escrow. "
         f"Accept it, decline it, or propose a different price.",
-        link="/my-deals",
+        link="/my-deals?tab=requested",
         ntype="info",
     )
     await notify_user(
