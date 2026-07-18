@@ -1840,7 +1840,11 @@ async def validate_action_card_payload(data: ChatActionCardCreate, current_user:
         await enforce_custom_offer_abuse_rules(current_user, data.recipient_id, fields)
         fields.setdefault("expires_at", (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat())
     elif data.type == "private_invitation":
-        require_fields(fields, ["campaign_name", "deliverable_summary", "budget", "timeline", "usage_rights", "full_brief_link"], "private_invitation")
+        require_fields(fields, ["campaign_name", "deliverable_summary", "budget", "timeline", "usage_rights"], "private_invitation")
+        # The brand now writes the brief inline ("Send a brief") via brief_details.
+        # A legacy/ops-shortlist invite may instead carry a full_brief_link — accept either.
+        if not str(fields.get("brief_details") or fields.get("full_brief_link") or "").strip():
+            raise HTTPException(status_code=400, detail="private_invitation requires: brief_details")
         # require_fields() treats 0 as "present", and an empty budget box arrives as 0
         # (JS Number('') === 0) — so a zero-budget invitation would otherwise go through.
         if to_float(fields.get("budget")) <= 0:
@@ -6532,6 +6536,10 @@ You can now communicate directly with {creator_display} to coordinate the work. 
             "sender_id": "system",
             "sender_nickname": "Platform",
             "recipient_id": creator_id,
+            # Scope this system message to the exact brand<->creator thread so it
+            # surfaces in that 1:1 conversation (GET /chat/{other}) and never leaks
+            # into the brand's other creator threads.
+            "thread_key": thread_key_for(creator_id, current_user['id']),
             "message": system_message_to_creator,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "read": False,
@@ -6549,6 +6557,10 @@ You can now communicate directly with {creator_display} to coordinate the work. 
             "sender_id": "system",
             "sender_nickname": "Platform",
             "recipient_id": current_user['id'],
+            # Same thread scope as the creator's copy (thread_key is symmetric) — this
+            # is what makes the "You've successfully selected …" system message appear
+            # in the BRAND's message section, which was the reported gap.
+            "thread_key": thread_key_for(creator_id, current_user['id']),
             "message": system_message_to_business,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "read": False,
@@ -7193,7 +7205,13 @@ async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_
     messages = await db.messages.find({
         "$or": [
             {"sender_id": current_user['id'], "recipient_id": other_user_id},
-            {"sender_id": other_user_id, "recipient_id": current_user['id']}
+            {"sender_id": other_user_id, "recipient_id": current_user['id']},
+            # System messages (sender_id="system") are addressed to one user but belong
+            # to a specific 1:1 thread. Match this viewer's own system messages scoped
+            # to THIS thread by thread_key, so e.g. the brand sees "You've successfully
+            # selected …" in the creator's thread — without it leaking into other threads.
+            {"sender_id": "system", "recipient_id": current_user['id'],
+             "thread_key": thread_key_for(current_user['id'], other_user_id)}
         ]
     }, {"_id": 0}).sort("timestamp", 1).to_list(1000)
 
