@@ -975,6 +975,31 @@ def kyc_status_of(user: dict) -> str:
     return ((user or {}).get("kyc") or {}).get("status") or "not_submitted"
 
 
+def person_display_name(user: Optional[dict], fallback: str = "Someone") -> str:
+    """Single source of truth for a person's shown NAME — never the "@handle".
+    Mirrors the frontend displayName() util: prefer the real name / business name,
+    strip any leading "@", and only fall back to the nickname handle when no real
+    name exists. Used anywhere the backend bakes a name into text (notifications,
+    receipts, emails) so the website never surfaces a raw username."""
+    u = user or {}
+    p = u.get("profile") or {}
+    def clean(v):
+        s = str(v or "").strip()
+        return s.lstrip("@").strip() if s else ""
+    return (
+        clean(u.get("full_name"))
+        or clean(p.get("fullName"))
+        or clean(p.get("full_name"))
+        or clean(u.get("business_name"))
+        or clean(p.get("business_name"))
+        or clean(u.get("name"))
+        or clean(u.get("nickname"))
+        or clean(u.get("username"))
+        or (clean(u.get("email")).split("@")[0] if u.get("email") else "")
+        or fallback
+    )
+
+
 def first_name_of(user: dict, fallback: str = "there") -> str:
     """First name for greetings. Prefers an explicit first_name, else the first
     word of the real name (full_name). Only if no real name is set does it fall
@@ -2736,7 +2761,7 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
                 "id": f"{campaign['id']}-shipment",
                 "timestamp": context['shipment'].get('updated_at') or campaign.get('work_started_at'),
                 "actor_type": "brand",
-                "actor_name": brand.get('nickname') or brand.get('email') or 'Brand',
+                "actor_name": person_display_name(brand, 'Brand'),
                 "event_type": "tracking_uploaded",
                 "message": "Shipment tracking was uploaded."
             })
@@ -2745,7 +2770,7 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
                 "id": f"{campaign['id']}-receipt",
                 "timestamp": normalized_receipt['received_at'],
                 "actor_type": "creator",
-                "actor_name": creator.get('nickname') or creator.get('email') or 'Creator',
+                "actor_name": person_display_name(creator, 'Creator'),
                 "event_type": "receipt_confirmed",
                 "message": "Product receipt was confirmed."
             })
@@ -2754,7 +2779,7 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
                 "id": f"{campaign['id']}-work",
                 "timestamp": context['work'].get('submitted_at'),
                 "actor_type": "creator",
-                "actor_name": creator.get('nickname') or creator.get('email') or 'Creator',
+                "actor_name": person_display_name(creator, 'Creator'),
                 "event_type": "content_submitted",
                 "message": "Content was submitted for brand review."
             })
@@ -3866,7 +3891,7 @@ async def checkout_brief(data: CheckoutBriefCreate,
         raise HTTPException(status_code=500, detail="Checkout failed. You have not been charged.")
 
     title = campaign_doc.get("title") or "your brief"
-    creator_name = creator.get("nickname") or "the creator"
+    creator_name = person_display_name(creator, "the creator")
     brand_name = campaign_doc.get("brand_name") or "A brand"
 
     await insert_deal_system_message(
@@ -3953,7 +3978,7 @@ async def respond_to_booking(campaign_id: str, data: BookingRespond,
     if campaign.get("booking_status") != "pending_creator":
         raise HTTPException(status_code=400, detail="This booking has already been answered")
 
-    creator_name = current_user.get("nickname") or "The creator"
+    creator_name = person_display_name(current_user, "The creator")
     title = campaign.get("title") or "your booking"
     brand_id = campaign["business_id"]
     now = now_iso()
@@ -4019,8 +4044,8 @@ async def decide_booking_price(campaign_id: str, data: BookingPriceDecision,
     if campaign.get("booking_status") != "price_revision":
         raise HTTPException(status_code=400, detail="There's no price proposal on this booking")
 
-    creator = await db.users.find_one({"id": campaign["selected_creator"]}, {"_id": 0, "nickname": 1})
-    creator_name = (creator or {}).get("nickname") or "The creator"
+    creator = await db.users.find_one({"id": campaign["selected_creator"]}, {"_id": 0, "nickname": 1, "full_name": 1, "business_name": 1, "profile.business_name": 1, "profile.full_name": 1, "profile.fullName": 1, "email": 1})
+    creator_name = person_display_name(creator, "The creator")
     title = campaign.get("title") or "your booking"
     now = now_iso()
 
@@ -6031,7 +6056,7 @@ async def invite_shortlist_candidate(campaign_id: str, creator_id: str, data: Sh
         {"id": campaign_id},
         {"$set": {"shortlist": shortlist, "match_status": "fulfilled", "updated_at": created_at}},
     )
-    await notify_user(creator_id, "You've received a brief invitation", f"{current_user.get('nickname', 'A brand')} invited you to '{campaign.get('title', '')}'.", link="/messages", email=True, category="applications")
+    await notify_user(creator_id, "You've received a brief invitation", f"{person_display_name(current_user, 'A brand')} invited you to '{campaign.get('title', '')}'.", link="/messages", email=True, category="applications")
     return {"message": "Invitation sent", "campaign_id": campaign_id, "creator_id": creator_id, "action_card": {k: v for k, v in action_card.items() if k != "_id"}}
 
 
@@ -6224,7 +6249,7 @@ async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Dep
         await notify_user(
             campaign["business_id"],
             "New bid on your campaign",
-            f"{current_user.get('nickname', 'A creator')} placed a bid of ₹{int(data.amount or 0):,} on '{campaign.get('title', 'your campaign')}'.",
+            f"{person_display_name(current_user, 'A creator')} placed a bid of ₹{int(data.amount or 0):,} on '{campaign.get('title', 'your campaign')}'.",
             link="/dashboard/business/pending-bids",
             ntype="info",
         )
@@ -6310,9 +6335,10 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
         raise HTTPException(status_code=403, detail="Not authorized")
     
     # Get creator details
-    creator = await db.users.find_one({"id": creator_id}, {"_id": 0, "nickname": 1})
+    creator = await db.users.find_one({"id": creator_id}, {"_id": 0, "nickname": 1, "full_name": 1, "business_name": 1, "profile.business_name": 1, "profile.full_name": 1, "profile.fullName": 1, "email": 1})
     if not creator:
         raise HTTPException(status_code=404, detail="Creator not found")
+    creator_display = person_display_name(creator, "the creator")
     
     # Create escrow transaction
     selected_bid = next((bid for bid in campaign.get('bids', []) if bid['creator_id'] == creator_id), None)
@@ -6400,12 +6426,12 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
 
 Let's discuss the next steps and get started! Feel free to ask any questions."""
     
-    system_message_to_business = f"""✅ You've successfully selected {creator['nickname']} for "{campaign['title']}"!
+    system_message_to_business = f"""✅ You've successfully selected {creator_display} for "{campaign['title']}"!
 
 💰 Payment: ₹{int(selected_bid['amount']):,} has been held in escrow
 📅 Expected Delivery: {selected_bid['estimated_delivery_days']} days
 
-You can now communicate directly with {creator['nickname']} to coordinate the work. Good luck with your campaign!"""
+You can now communicate directly with {creator_display} to coordinate the work. Good luck with your campaign!"""
     
     # Send message to creator
     try:
@@ -6475,7 +6501,7 @@ You can now communicate directly with {creator['nickname']} to coordinate the wo
     await notify_user(
         current_user['id'],
         "Payment held in escrow",
-        f"₹{int(deal_amount):,} for '{campaign['title']}' is now held in escrow. It's released to {creator['nickname']} once you approve their work.",
+        f"₹{int(deal_amount):,} for '{campaign['title']}' is now held in escrow. It's released to {creator_display} once you approve their work.",
         link="/dashboard/business/wallet",
         ntype="success",
     )
@@ -6525,7 +6551,7 @@ async def send_message(data: ChatMessage, current_user: dict = Depends(get_curre
     # Tell the recipient they have a new message. Works both ways (brand → creator and
     # creator → brand) — sending a chat used to create no notification at all, so the
     # other side only found out if they happened to open Messages.
-    sender_label = current_user.get("nickname") or current_user.get("full_name") or "Someone"
+    sender_label = person_display_name(current_user)
     body = (data.message or "").strip()
     preview = (body[:80] + "…") if len(body) > 80 else (body or "Sent an attachment")
     await notify_user(
@@ -6613,6 +6639,9 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
                     "timestamp": item_timestamp,
                     "unread_count": unread_per_partner.get(other_id, 0),
                     "associated_deal_status": deal_status,
+                    # Campaign id of the deal on this thread — lets the creator leave a
+                    # brand review once the deal is completed (POST /reviews needs it).
+                    "associated_campaign_id": (deal or {}).get("id"),
                     "thread_classification": thread_classification
                 }
 
@@ -7026,7 +7055,7 @@ async def revoke_chat_action_card(card_id: str, current_user: dict = Depends(get
     await notify_user(
         card.get("recipient_id"),
         "An invitation was withdrawn",
-        f"{current_user.get('nickname', 'The brand')} withdrew their {card.get('type', 'offer').replace('_', ' ')}.",
+        f"{person_display_name(current_user, 'The brand')} withdrew their {card.get('type', 'offer').replace('_', ' ')}.",
         link="/messages",
     )
     await record_match_event(f"{card.get('type')}_revoked", None, None, card_id=card_id, campaign_id=card.get("deal_id"))
@@ -7639,7 +7668,7 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         await notify_user(
             campaign["business_id"],
             "Content submitted for review",
-            f"{current_user.get('nickname', 'The creator')} submitted content for '{campaign.get('title', 'your campaign')}'. Review it to release payment.",
+            f"{first_name_of(current_user, fallback='The creator')} submitted content for '{campaign.get('title', 'your campaign')}'. Review it to release payment.",
             link="/dashboard/business/work-review",
             ntype="info",
         )
@@ -8490,7 +8519,7 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         await notify_user(
             campaign["business_id"],
             "Content submitted for review",
-            f"{current_user.get('nickname', 'The creator')} submitted content for '{campaign.get('title', 'your campaign')}'. Review it to release payment.",
+            f"{first_name_of(current_user, fallback='The creator')} submitted content for '{campaign.get('title', 'your campaign')}'. Review it to release payment.",
             link="/dashboard/business/work-review",
             ntype="info",
             email=True,
@@ -9488,6 +9517,16 @@ async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_
 @api_router.post("/reviews")
 async def submit_review(data: ReviewSubmit, current_user: dict = Depends(get_current_user)):
     rates_brand = bool(data.business_id) and current_user.get('role') == UserRole.CREATOR
+    # A creator can review a brand ONLY after that deal is completed, and only for a
+    # brand they actually worked with (they were the selected creator on the campaign).
+    if rates_brand:
+        campaign = await db.campaigns.find_one({"id": data.campaign_id})
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Deal not found")
+        if campaign.get("selected_creator") != current_user['id'] or campaign.get("business_id") != data.business_id:
+            raise HTTPException(status_code=403, detail="You can only review a brand you've completed a deal with")
+        if campaign.get("status") != CampaignStatus.COMPLETED:
+            raise HTTPException(status_code=400, detail="You can review a brand only after the deal is completed")
     # A review is one-time and immutable: once you've reviewed the other party for
     # a campaign you can't add another (and there's no edit/undo). Block a repeat
     # so a double-submit / re-open can't stack or silently change the rating.
