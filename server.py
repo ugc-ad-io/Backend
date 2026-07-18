@@ -777,6 +777,13 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             user = None
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    # A suspended/banned account must be locked out IMMEDIATELY, not only at the next
+    # login. Tokens live 7 days, and /auth/login already blocks banned users — but
+    # without this check an already-logged-in banned user could keep using the app on
+    # their existing token for up to a week. Enforce the ban on every authenticated
+    # request so a 4th chat strike (or an admin ban) takes effect right away.
+    if user.get("banned"):
+        raise HTTPException(status_code=403, detail=f"Account banned: {user.get('banned_reason') or user.get('ban_reason') or 'Account suspended'}")
     return user
 
 async def get_current_business_user(current_user: dict = Depends(get_current_user)):
@@ -8493,6 +8500,106 @@ async def get_business_deals(current_user: dict = Depends(get_current_user)):
         result.append(await build_deal_response(context, current_user))
 
     return result
+
+
+# Human-readable label + normalized bucket for each offer-card lifecycle state,
+# so the brand's "Sent Briefs" section can group by a stable set of statuses
+# regardless of the raw value stored on the card.
+BRIEF_TYPE_LABELS = {
+    "private_invitation": "Private Invitation",
+    "custom_offer": "Custom Offer",
+    "counter_offer": "Counter Offer",
+}
+# raw card.status -> the bucket the UI filters on.
+BRIEF_STATUS_BUCKETS = {
+    "open": "sent",
+    "pending": "sent",
+    "accept": "accepted",
+    "reject": "declined",
+    "counter": "countered",
+    "expired": "expired",
+    "revoked": "revoked",
+}
+
+
+def _brief_amount(fields: dict):
+    """The headline money on an offer, whichever field the card type uses."""
+    fields = fields or {}
+    return fields.get("price") or fields.get("modified_price") or fields.get("budget")
+
+
+@api_router.get("/business/briefs")
+async def get_business_briefs(current_user: dict = Depends(get_current_user)):
+    """Every brief/offer that involves this brand's workspace — private
+    invitations, custom offers and counter offers — with its lifecycle status
+    (sent / accepted / declined / countered / expired / revoked) so the brand can
+    see in one place everything it sent, accepted or rejected. Sourced from
+    db.chat_action_cards, which every send path writes to."""
+    if current_user['role'] != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only brands can access this")
+
+    ws_id = _brand_ws_id(current_user)
+    # A brand workspace = the owner plus any team members. Cards store real user
+    # ids in participants/sender, so gather all of them to catch team activity.
+    members = await db.users.find(
+        {"$or": [{"id": ws_id}, {"team_of": ws_id}]}, {"_id": 0, "id": 1}
+    ).to_list(200)
+    brand_ids = {ws_id, *[m["id"] for m in members]}
+
+    cards = await db.chat_action_cards.find(
+        {"participants": {"$in": list(brand_ids)}, "type": {"$in": OFFER_CARD_TYPES}},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(500)
+
+    # Batch-resolve the counterpart (creator) names to avoid an N+1 lookup.
+    counterpart_ids = set()
+    for card in cards:
+        for pid in card.get("participants", []):
+            if pid not in brand_ids:
+                counterpart_ids.add(pid)
+    users = await db.users.find({"id": {"$in": list(counterpart_ids)}}, {"_id": 0}).to_list(500)
+    users_by_id = {u["id"]: u for u in users}
+
+    result = []
+    for card in cards:
+        expired = is_action_card_expired(card)
+        raw_status = "expired" if expired else card.get("status", "open")
+        sender_is_brand = card.get("sender_id") in brand_ids
+        counterpart_id = card.get("recipient_id") if sender_is_brand else card.get("sender_id")
+        counterpart = users_by_id.get(counterpart_id) or {}
+        response = card.get("response") or {}
+        fields = card.get("fields") or {}
+        result.append({
+            "id": card.get("id"),
+            "type": card.get("type"),
+            "type_label": BRIEF_TYPE_LABELS.get(card.get("type"), card.get("type")),
+            "direction": "sent" if sender_is_brand else "received",
+            "status": raw_status,
+            "status_bucket": BRIEF_STATUS_BUCKETS.get(raw_status, "sent"),
+            "creator_id": counterpart_id,
+            "creator_name": person_display_name(counterpart, "Creator"),
+            "creator_nickname": counterpart.get("nickname"),
+            "creator_photo": (counterpart.get("profile") or {}).get("profile_photo")
+                or counterpart.get("profile_photo"),
+            "campaign_name": fields.get("campaign_name") or fields.get("deliverable_type"),
+            "campaign_id": fields.get("campaign_id") or card.get("deal_id"),
+            "deliverable_summary": fields.get("deliverable_summary"),
+            "amount": _brief_amount(fields),
+            "timeline": fields.get("timeline"),
+            "usage_rights": fields.get("usage_rights"),
+            "message": fields.get("message"),
+            "decline_reason": response.get("decline_reason"),
+            "response_note": response.get("note"),
+            "deal_campaign_id": card.get("deal_campaign_id"),
+            "deal_id": card.get("deal_id"),
+            "created_at": card.get("created_at"),
+            "responded_at": response.get("responded_at"),
+            "expired_at": card.get("expired_at"),
+            "revoked_at": card.get("revoked_at"),
+        })
+
+    return result
+
 
 @api_router.post("/deals/{deal_id}/receipt")
 async def submit_deal_receipt(deal_id: str, data: DealReceiptSubmit, current_user: dict = Depends(get_current_user)):
