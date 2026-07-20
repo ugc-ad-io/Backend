@@ -8456,10 +8456,24 @@ async def apply_brand_penalty(data: BrandPenaltyApply, current_user: dict = Depe
     return {"message": "Penalty applied", "business_id": data.business_id, "penalty_type": data.penalty_type, "amount": amount}
 
 
+def _fmt_video_ts(value) -> str:
+    """Seconds -> m:ss for revision notes pinned to a moment in the video."""
+    try:
+        total = int(float(value))
+    except (TypeError, ValueError):
+        return ""
+    if total < 0:
+        return ""
+    return f"{total // 60}:{total % 60:02d}"
+
+
 class RevisionItemIn(BaseModel):
     description: str
     severity: Optional[str] = "must-fix"     # must-fix | preference
     brief_reference: Optional[str] = ""
+    # Moment in the submitted video this note refers to (Frame.io-style review).
+    # None = a general note that isn't tied to one frame.
+    timestamp_seconds: Optional[float] = None
 
 class RevisionRequestIn(BaseModel):
     items: List[RevisionItemIn] = []
@@ -8486,8 +8500,13 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
     if items:
         if not 1 <= len(items) <= 5:
             raise HTTPException(status_code=400, detail="Provide 1 to 5 revision items.")
+        # "[must-fix @ 0:04] Re-shoot the intro" — the timestamp rides inside the
+        # existing tag so every text-based consumer (creator checklist, emails,
+        # chat system messages) shows the moment without needing to change.
         feedback = "\n".join(
-            f"[{(it.get('severity') or 'must-fix')}] {it.get('description', '')}"
+            f"[{(it.get('severity') or 'must-fix')}"
+            + (f" @ {_fmt_video_ts(it.get('timestamp_seconds'))}" if _fmt_video_ts(it.get('timestamp_seconds')) else "")
+            + f"] {it.get('description', '')}"
             + (f" (ref: {it['brief_reference']})" if it.get('brief_reference') else "")
             for it in items
         )
@@ -13814,31 +13833,64 @@ async def admin_list_deals(state: Optional[str] = None, current_user: dict = Dep
     query = {"selected_creator": {"$nin": [None, ""]}}
     if state:
         query["status"] = state
-    campaigns = await db.campaigns.find(query, {"_id": 0}).sort("updated_at", -1).to_list(2000)
+    campaigns = [c for c in await db.campaigns.find(query, {"_id": 0}).sort("updated_at", -1).to_list(2000)
+                 if c.get("id")]   # legacy campaigns without a UUID id are skipped, not 500s
+    cids = [c["id"] for c in campaigns]
+
+    # Batch-load everything compute_deal_state() needs. The previous version ran four
+    # per-row lookups (brand, creator, escrow, disputes); this is a fixed handful of
+    # queries for the WHOLE page, so pulling in shipment/receipt/work/action-cards as
+    # well actually costs fewer round-trips than before.
+    def first_by_campaign(rows):
+        out = {}
+        for r in rows:
+            out.setdefault(r.get("campaign_id"), r)
+        return out
+
+    uids = [u for u in {c.get("business_id") for c in campaigns} | {c.get("selected_creator") for c in campaigns} if u]
+    users = {u["id"]: u for u in await db.users.find({"id": {"$in": uids}}, {"_id": 0, "id": 1, "nickname": 1}).to_list(None)}
+    escrows = first_by_campaign(await db.escrow.find({"campaign_id": {"$in": cids}}, {"_id": 0}).to_list(None))
+    shipments = first_by_campaign(await db.shipments.find({"campaign_id": {"$in": cids}}, {"_id": 0}).to_list(None))
+    receipts = first_by_campaign(await db.deal_receipts.find({"campaign_id": {"$in": cids}}, {"_id": 0}).to_list(None))
+    # Ascending sort + overwrite leaves the LATEST submission per campaign, matching
+    # get_deal_context()'s sort=[("submitted_at", -1)] single-doc fetch.
+    works = {}
+    for w in await db.work_submissions.find({"campaign_id": {"$in": cids}}, {"_id": 0}).sort("submitted_at", 1).to_list(None):
+        works[w.get("campaign_id")] = w
+    cards = {}
+    for card in await db.deal_action_cards.find({"campaign_id": {"$in": cids}}, {"_id": 0}).to_list(None):
+        cards.setdefault(card.get("campaign_id"), []).append(card)
+    disputed_ids = {d.get("campaign_id") for d in await db.disputes.find(
+        {"campaign_id": {"$in": cids}, "status": {"$in": ["open", "info_requested", "appealed"]}},
+        {"_id": 0, "campaign_id": 1}).to_list(None)}
+
     rows = []
     for c in campaigns:
-        cid = c.get("id")
-        if not cid:
-            continue  # legacy campaign without a UUID id — skip rather than 500
-        brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "nickname": 1}) or {}
-        creator = await db.users.find_one({"id": c.get("selected_creator")}, {"_id": 0, "nickname": 1}) or {}
-        escrow = await db.escrow.find_one({"campaign_id": cid}, {"_id": 0, "amount": 1, "status": 1}) or {}
-        disputed = await db.disputes.count_documents({"campaign_id": cid, "status": {"$in": ["open", "info_requested", "appealed"]}})
-        deadline = c.get("final_delivery_by") or c.get("due_date")
-        countdown = hours_until(deadline)
-        terminal = c.get("status") in (CampaignStatus.COMPLETED, "completed", "cancelled", "paid")
-        overdue = bool(countdown is not None and countdown < 0 and not terminal)
-        urgency = "overdue" if overdue else ("due_soon" if (countdown is not None and 0 <= countdown <= 24 and not terminal) else "normal")
+        cid = c["id"]
+        escrow = escrows.get(cid) or {}
+        shipment = shipments.get(cid)
+        # THE FIX: report the real, human-readable deal state — the same one the deal
+        # room and the admin State dropdown are built from. This used to echo the raw
+        # campaign status enum ("work_submitted"), which no dropdown option could ever
+        # equal, so every State filter selection matched zero rows (and the State
+        # column showed the enum instead of "Content Submitted — Awaiting Review").
+        st = compute_deal_state(
+            c, shipment, normalize_receipt(shipment, receipts.get(cid)),
+            works.get(cid), escrow, cards.get(cid) or [],
+        )
+        brand = users.get(c.get("business_id")) or {}
+        creator = users.get(c.get("selected_creator")) or {}
         rows.append({
             "id": cid, "deal_id": cid, "campaign_title": c.get("title"), "campaign": c.get("title"),
             "brand": brand.get("nickname"), "creator": creator.get("nickname"),
-            "current_state": c.get("status"), "state": c.get("status"),
-            "deadline": deadline,
-            "deadline_countdown_hours": countdown,
-            "is_overdue": overdue,
-            "urgency": urgency,
+            "current_state": st["current_state"], "state": st["current_state"],
+            "active_party": st["active_party"], "primary_next_action": st["primary_next_action"],
+            "deadline": c.get("final_delivery_by") or c.get("due_date"),
+            "deadline_countdown_hours": st["deadline_countdown_hours"],
+            "is_overdue": st["is_overdue"],
+            "urgency": st["urgency"],
             "escrow": to_float(escrow.get("amount")), "escrow_status": escrow.get("status"),
-            "flagged": bool(disputed), "requires_shipment": bool(c.get("requires_shipment")),
+            "flagged": bool(cid in disputed_ids), "requires_shipment": bool(c.get("requires_shipment")),
         })
     # Surface overdue / due-soon deals at the top of the ops queue.
     rows.sort(key=lambda r: (0 if r["is_overdue"] else 1 if r["urgency"] == "due_soon" else 2))
@@ -13858,11 +13910,20 @@ async def admin_deal_detail(campaign_id: str, current_user: dict = Depends(requi
     shipment = await db.shipments.find_one({"campaign_id": campaign_id}, {"_id": 0}) or {}
     timeline = await db.deal_activity.find({"campaign_id": campaign_id}, {"_id": 0}).sort("timestamp", 1).to_list(500)
     content = await db.deal_content_submissions.find({"campaign_id": campaign_id}, {"_id": 0}).sort("version", 1).to_list(50)
+    # Same fix as the list endpoint: the drawer showed the raw campaign status enum
+    # instead of the deal's real state, so it disagreed with the deal room.
+    receipt = await db.deal_receipts.find_one({"campaign_id": campaign_id}, {"_id": 0})
+    work = await db.work_submissions.find_one({"campaign_id": campaign_id}, {"_id": 0}, sort=[("submitted_at", -1)])
+    action_cards = await db.deal_action_cards.find({"campaign_id": campaign_id}, {"_id": 0}).to_list(200)
+    st = compute_deal_state(c, shipment or None, normalize_receipt(shipment, receipt), work, escrow, action_cards)
     return {
         "deal_id": campaign_id, "id": campaign_id, "campaign_title": c.get("title"),
         "brand": brand.get("nickname"), "creator": creator.get("nickname"),
         "brand_id": c.get("business_id"), "creator_id": c.get("selected_creator"),
-        "current_state": c.get("status"), "deadline": c.get("final_delivery_by") or c.get("due_date"),
+        "current_state": st["current_state"],
+        "active_party": st["active_party"],
+        "primary_next_action": st["primary_next_action"],
+        "deadline": c.get("final_delivery_by") or c.get("due_date"),
         "brief_text": c.get("brief_text"), "escrow": escrow, "shipment": shipment,
         "timeline": timeline, "content_versions": content, "admin_notes": c.get("admin_notes") or [],
     }
