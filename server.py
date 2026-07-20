@@ -6456,7 +6456,7 @@ async def decline_bid(campaign_id: str, bid_id: str, current_user: dict = Depend
             "Your bid was declined",
             f"The brand declined your bid on '{campaign.get('title', 'a campaign')}'. Keep an eye out — plenty of other briefs are open.",
             link="/browse-briefs",
-            ntype="info",
+            ntype="warning",
         )
     return {"message": "Bid declined"}
 
@@ -8585,9 +8585,10 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
     note = f" (paid revision, ₹{fee} charged)" if paid else f" ({cf.FREE_REVISION_LIMIT - used - 1} free revision(s) remaining)"
     await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "revision_requested", f"Brand requested content revisions.{note}")
     await insert_deal_system_message(campaign, f"Brand requested content revisions.{note}")
+    # Action-required for the creator → warning (amber ⚠), not a neutral info note.
     await notify_user(work['creator_id'], "Revision requested on your content",
                       "The brand requested changes on your submission. Open your deal to review the feedback and resubmit.",
-                      link="/my-deals", ntype="info", email=True, category="deal_updates")
+                      link="/my-deals", ntype="warning", email=True, category="deal_updates")
 
     new_balance = float(current_user.get('balance') or 0) - fee
     if paid:
