@@ -1728,12 +1728,20 @@ def strip_private_fields(user_doc: dict, requester_role: Optional[str]) -> dict:
 
     Username is a creator's private internal handle — only visible to the creator
     themselves and admin/staff. Brands continue to see the auto-generated nickname.
+
+    KYC identity + payout details (PAN, Aadhaar, address, document URLs, bank
+    account, UPI) are NEVER exposed to another user — only the `kyc_verified`
+    boolean survives, so a viewer can see the "Verified" badge without the PII.
     """
     if not isinstance(user_doc, dict):
         return user_doc
     if requester_role == UserRole.BUSINESS:
         user_doc.pop("username", None)
         user_doc.pop("email", None)
+    if requester_role != UserRole.ADMIN:
+        user_doc["kyc_verified"] = bool(user_doc.get("kyc_verified"))
+        for private in ("kyc", "bank_details", "upi_id", "pan_number", "aadhaar_number"):
+            user_doc.pop(private, None)
     return user_doc
 
 def message_to_chat_item(msg: dict) -> dict:
@@ -3416,6 +3424,9 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
         # Brand-facing display handle. The real username stays private (strip_private_fields);
         # brands see the auto-generated nickname, so cards/briefs don't read "Creator".
         "nickname": creator.get("nickname") or "",
+        # Identity-verified (admin-approved KYC) — drives the "Verified" badge. Only the
+        # boolean is exposed; the KYC documents themselves never leave the backend.
+        "kyc_verified": bool(creator.get("kyc_verified")),
         "name": display_name,
         "nickname": creator.get("nickname") or "",
         "profile_photo": first_non_empty(creator.get("profile_photo"), creator.get("profile_picture"), profile.get("profile_photo"), profile.get("profile_picture")),
@@ -10680,7 +10691,10 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    campaign = await db.campaigns.find_one({"id": data.item_id}, {"_id": 0, "status": 1})
+    campaign = await db.campaigns.find_one(
+        {"id": data.item_id},
+        {"_id": 0, "status": 1, "business_id": 1, "title": 1}
+    )
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
@@ -10689,7 +10703,7 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
             status_code=400,
             detail="Only pending approval campaigns can be approved or rejected"
         )
-    
+
     status = CampaignStatus.ACTIVE if data.action == "approve" else CampaignStatus.REJECTED
 
     await db.campaigns.update_one(
@@ -10707,6 +10721,30 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
     else:
         # Rejected → refund the reserved budget back to the brand wallet.
         await refund_campaign_reservation(data.item_id, reason="campaign_rejected")
+
+    # Tell the brand either way — in-app AND email. Without this the brand had no
+    # signal their brief went live (or was rejected + refunded) and had to keep
+    # re-checking the dashboard. Best-effort: a mail failure never fails the action.
+    brand_id = campaign.get("business_id")
+    if brand_id:
+        title = campaign.get("title") or "Your campaign"
+        link = f"/dashboard/business/campaign/{data.item_id}"
+        if data.action == "approve":
+            await notify_user(
+                brand_id,
+                "✅ Your brief is approved and live",
+                f"'{title}' has been approved and is now live — creators can start applying.",
+                link=link, ntype="success", email=True, category="deal_updates",
+            )
+        else:
+            reason = (data.reason_details or data.reason or "").strip()
+            await notify_user(
+                brand_id,
+                "Your brief was not approved",
+                f"'{title}' was not approved{f' — {reason}' if reason else ''}. "
+                "Your reserved budget has been refunded to your wallet.",
+                link=link, ntype="warning", email=True, category="deal_updates",
+            )
 
     return {"message": f"Campaign {data.action}d"}
 
