@@ -41,7 +41,8 @@ from campaign_helpers import (
     prepare_campaign_for_storage,
     can_edit_campaign,
     get_campaign_completion_percentage,
-    map_legacy_to_new_fields
+    map_legacy_to_new_fields,
+    total_deliverable_quantity,
 )
 import admin_caps
 
@@ -532,6 +533,11 @@ class DealContentSubmit(BaseModel):
     raw_footage_url: Optional[str] = None
     creator_note: Optional[str] = None
     self_assessment: Optional[List[str]] = None  # PRD 8.3: confirmed must-include items
+    # WHICH required asset this submission is for, 0-based, on a brief that asks for
+    # more than one (quantity > 1 or several deliverable rows). Omitted by older
+    # clients and by single-asset briefs, where it defaults to 0 — that keeps the
+    # existing one-video flow behaving exactly as before.
+    deliverable_index: Optional[int] = None
 
 class DealRevisionResponseSubmit(BaseModel):
     response: str
@@ -1997,7 +2003,9 @@ def is_between_iso(value: Optional[str], start: datetime, end: datetime) -> bool
         parsed = parsed.replace(tzinfo=timezone.utc)
     return start <= parsed < end
 
-def campaign_budget_total(campaign: dict) -> float:
+def campaign_per_asset_budget(campaign: dict) -> float:
+    """The budget for ONE deliverable asset. This is what the brief wizard sends as
+    per_video_budget / budget_max (it sends the same figure for both)."""
     if campaign.get("budget"):
         return to_float(campaign.get("budget"))
     budget_min = to_float(campaign.get("budget_min"))
@@ -2005,6 +2013,21 @@ def campaign_budget_total(campaign: dict) -> float:
     if budget_min and budget_max:
         return budget_max
     return budget_min or budget_max
+
+
+def campaign_budget_total(campaign: dict) -> float:
+    """TOTAL budget a brief commits = per-asset budget x total deliverable quantity.
+
+    Previously this returned the per-asset figure, so a brief asking for 3 Reels only
+    ever held ONE video's budget while the creator owed three — the brand was
+    under-charged and the payout maths was wrong.
+
+    LEGACY SAFETY: total_deliverable_quantity() returns 1 when a brief has no
+    deliverable_items, so every pre-existing campaign yields exactly the old value.
+    Refunds are unaffected either way — refund_campaign_reservation() pays back the
+    escrow row's STORED reserved_amount rather than recomputing it here.
+    """
+    return campaign_per_asset_budget(campaign) * total_deliverable_quantity(campaign)
 
 async def reserve_campaign_budget(user: dict, campaign_doc: dict) -> Optional[dict]:
     """Hold a campaign's full budget from the brand wallet at post time so it shows as
@@ -8005,23 +8028,64 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
     # Keep the creator's deal content view in sync — but stamp ONLY the version the brand
     # actually approved. The old update_many() swept every row still marked "submitted",
     # so v1..v3 (already sent back for revision) all flipped to Approved next to v4.
+    # Scope to the ASSET this work item was for, so approving deliverable #2 can't stamp
+    # deliverable #1's latest version (they share a campaign_id but are separate assets).
+    work_idx = work.get('deliverable_index') or 0
     approved_version = await db.deal_content_submissions.find_one(
-        {"campaign_id": work['campaign_id']}, sort=[("version", -1)]
+        {"campaign_id": work['campaign_id'],
+         "$or": [{"deliverable_index": work_idx},
+                 # legacy rows predate the field; only index 0 may claim them
+                 *([{"deliverable_index": {"$exists": False}}] if work_idx == 0 else [])]},
+        sort=[("version", -1)]
     )
     if approved_version:
         await db.deal_content_submissions.update_one(
             {"id": approved_version['id']},
             {"$set": {"status": "approved", "approved_at": now}}
         )
-        # Anything older that never got a verdict is superseded, not approved.
+        # Anything older for THIS asset that never got a verdict is superseded.
         await db.deal_content_submissions.update_many(
             {"campaign_id": work['campaign_id'],
+             "deliverable_index": approved_version.get('deliverable_index') or 0,
              "version": {"$lt": approved_version.get('version', 1)},
              "status": {"$nin": ["approved", "revision_requested"]}},
             {"$set": {"status": "superseded"}}
         )
 
-    # Content approved — fund the creator instantly (no hold period).
+    # PAYOUT GATE: only fund once EVERY required asset has an approved submission.
+    # Previously one approval released the whole payout, so a brief asking for 3 Reels
+    # paid out in full after the first video. For a single-asset brief (required == 1,
+    # which is every legacy campaign) this is satisfied immediately and the behaviour
+    # is identical to before.
+    progress = await deliverables_progress(campaign)
+    if not progress["complete"]:
+        await db.campaigns.update_one(
+            {"id": work['campaign_id']},
+            {"$set": {"status": "in_progress", "updated_at": now}}
+        )
+        await insert_deal_activity(
+            campaign, "brand", current_user.get('nickname', 'Brand'), "content_approved",
+            f"Deliverable {progress['approved']} of {progress['required']} approved. "
+            f"{progress['remaining']} still to be delivered before payout.",
+        )
+        await insert_deal_system_message(
+            campaign,
+            f"Deliverable approved ({progress['approved']}/{progress['required']}). "
+            f"The creator has {progress['remaining']} more to submit before the deal completes.",
+        )
+        await notify_user(
+            work['creator_id'], "Deliverable approved",
+            f"{progress['approved']} of {progress['required']} deliverables approved. "
+            f"Submit the remaining {progress['remaining']} to complete this deal.",
+            link="/my-deals", ntype="success", email=True, category="deal_updates",
+        )
+        return {
+            "message": f"Deliverable approved ({progress['approved']}/{progress['required']}).",
+            "payout_status": "awaiting_remaining_deliverables",
+            "deliverables": progress,
+        }
+
+    # Every deliverable is in — fund the creator instantly (no hold period).
     payout_info = await release_payout_now(campaign, work, source="approval")
 
     if payout_info.get("released"):
@@ -8097,6 +8161,34 @@ async def schedule_payout_for_deal(campaign: dict, work: dict, source: str = "ap
         "source": source,
     })
     return {"payout_scheduled_at": scheduled_at, "net_payable": net, "tds_amount": tds, "penalty_amount": penalty, "late": late}
+
+
+async def deliverables_progress(campaign: dict) -> dict:
+    """How many of a brief's required assets currently have an APPROVED submission.
+
+    Counts DISTINCT deliverable_index values, not rows — v1/v2/v3 of the same asset
+    are revisions and must only ever count once. Submissions written before this field
+    existed have no deliverable_index and collapse to index 0, so a legacy single-asset
+    deal reads as 1-of-1 complete exactly as it did before.
+    """
+    required = total_deliverable_quantity(campaign)
+    rows = await db.deal_content_submissions.find(
+        {"campaign_id": campaign['id'], "status": "approved"},
+        {"_id": 0, "deliverable_index": 1},
+    ).to_list(length=None)
+    approved_idx = set()
+    for row in rows:
+        try:
+            approved_idx.add(int(row.get('deliverable_index') or 0))
+        except (TypeError, ValueError):
+            approved_idx.add(0)
+    approved = len(approved_idx)
+    return {
+        "required": required,
+        "approved": approved,
+        "remaining": max(0, required - approved),
+        "complete": approved >= required,
+    }
 
 
 async def release_payout_now(campaign: dict, work: dict, source: str = "approval") -> dict:
@@ -8742,9 +8834,22 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing required assets: {', '.join(missing)}")
 
+    # Which of the brief's required assets this upload is for. Single-asset briefs (and
+    # older clients that don't send the field) fall through to 0 and behave as before.
+    required_total = total_deliverable_quantity(campaign)
+    deliverable_index = data.deliverable_index if data.deliverable_index is not None else 0
+    if not 0 <= deliverable_index < required_total:
+        raise HTTPException(
+            status_code=400,
+            detail=f"deliverable_index {deliverable_index} is out of range — this brief requires {required_total} deliverable(s).",
+        )
+
     existing_versions = await db.deal_content_submissions.count_documents({
         "campaign_id": campaign['id'],
-        "creator_id": current_user['id']
+        "creator_id": current_user['id'],
+        # Versions are revisions OF ONE ASSET, so they're counted per deliverable —
+        # otherwise asset #2 would arrive as "v2" and look like a revision of asset #1.
+        "deliverable_index": deliverable_index,
     })
     version = existing_versions + 1
     uploads_dir = str(Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))))
@@ -8753,6 +8858,7 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         "deal_id": make_deal_id(campaign),
         "campaign_id": campaign['id'],
         "creator_id": current_user['id'],
+        "deliverable_index": deliverable_index,
         "version": version,
         "video_url": data.video_url,
         "caption_url": data.caption_url,
@@ -8777,6 +8883,9 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         "id": str(uuid.uuid4()),
         "campaign_id": campaign['id'],
         "creator_id": current_user['id'],
+        # Carried through so approve_work() marks the right asset approved rather than
+        # whichever submission happens to have the highest version number.
+        "deliverable_index": deliverable_index,
         "work_files": [url for url in [data.video_url, data.caption_url, data.thumbnail_url, data.raw_footage_url] if url],
         "description": data.creator_note or f"Deal content submission v{version}",
         "status": WorkStatus.SUBMITTED,

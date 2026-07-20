@@ -26,6 +26,54 @@ def _has_value(value: Any) -> bool:
     return True
 
 
+def total_deliverable_quantity(campaign: Dict[str, Any]) -> int:
+    """
+    Total number of assets a brief requires = the sum of every deliverable row's
+    `quantity`. This is the single source of truth for both the escrow hold and
+    delivery completion, so escrow and payout can never disagree about the count.
+
+    LEGACY SAFETY: briefs posted before structured deliverables existed have no
+    `deliverable_items`, and this returns 1 for them. A quantity of 1 reproduces
+    the old behaviour exactly (hold one asset's budget, one approval completes the
+    deal), so nothing about existing campaigns changes.
+    """
+    items = campaign.get('deliverable_items') or []
+    total = 0
+    for item in items:
+        # Rows may be dicts (from Mongo) or pydantic models (fresh off a request).
+        raw = item.get('quantity') if isinstance(item, dict) else getattr(item, 'quantity', None)
+        try:
+            total += max(1, int(raw))
+        except (TypeError, ValueError):
+            total += 1          # unparseable quantity counts as a single asset
+    return total if total > 0 else 1
+
+
+def backfill_deliverable_items(campaign_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Older drafts (and briefs created before Section 2 was structured) carry only the
+    flat video_format/aspect_ratio/duration_seconds fields. Synthesise a single
+    equivalent deliverable row for them so they still satisfy the publish check and
+    get a sane quantity of 1 — instead of being blocked with "Deliverables are
+    required" on a brief the brand already filled in.
+    """
+    if campaign_data.get('deliverable_items'):
+        return campaign_data
+    fmt = campaign_data.get('video_format') or campaign_data.get('brief_type')
+    if not fmt:
+        return campaign_data
+    duration = campaign_data.get('duration_seconds')
+    aspect = campaign_data.get('aspect_ratio')
+    campaign_data['deliverable_items'] = [{
+        'type': fmt,
+        'quantity': 1,
+        'duration': f"{duration} seconds" if duration else '',
+        'aspect_ratios': [aspect] if aspect else [],
+        'raw_required': bool(campaign_data.get('raw_footage_required')),
+    }]
+    return campaign_data
+
+
 def validate_campaign_for_submission(campaign_data: Dict[str, Any]) -> None:
     """
     Validate that a campaign has all required fields for submission.
@@ -56,6 +104,14 @@ def validate_campaign_for_submission(campaign_data: Dict[str, Any]) -> None:
         or _has_value(campaign_data.get('budget_max'))
     ):
         field_errors['per_video_budget'] = 'Per video budget or budget max is required'
+
+    # A brief must say WHAT is being delivered — the quantity drives the escrow hold
+    # and the completion gate, so publishing with an empty list would hold the wrong
+    # amount. backfill_deliverable_items() already rescues legacy drafts that only
+    # have the flat video_format fields, so this only fires on a genuinely empty
+    # Section 2.
+    if not _has_value(campaign_data.get('deliverable_items')):
+        field_errors['deliverable_items'] = 'At least one deliverable is required'
 
     if field_errors:
         raise HTTPException(
@@ -195,7 +251,9 @@ def prepare_campaign_for_storage(campaign_data: Dict[str, Any], status: str = 'd
     campaign_data.setdefault('objectives', [])
     campaign_data.setdefault('brief_attachments', [])
     campaign_data.setdefault('bids', [])
-    # Structured brief section lists
+    # Structured brief section lists. Rebuild a deliverable row from the legacy flat
+    # fields first, so pre-structured drafts aren't blocked at publish.
+    backfill_deliverable_items(campaign_data)
     campaign_data.setdefault('deliverable_items', [])
     campaign_data.setdefault('required_phrases', [])
     campaign_data.setdefault('required_shots', [])

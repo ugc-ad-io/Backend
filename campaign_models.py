@@ -24,6 +24,26 @@ class IndustryType(str, Enum):
     FOOD_BEVERAGE = "foodBeverage"
 
 
+class DeliverableItem(BaseModel):
+    """
+    One row of Section 2 "Deliverables" in the Post-a-Brief wizard.
+
+    `quantity` is how many of THIS asset the creator must actually deliver. It is
+    load-bearing in two places, so it is validated here rather than trusted:
+      * escrow — the brand's wallet hold is per_asset_budget x total quantity
+        (see campaign_budget_total in server.py), and
+      * completion — the payout is only released once every required asset has an
+        approved submission (see deliverables_progress in server.py).
+
+    Bounds match the wizard, which caps a brief at 5 deliverable rows of 1-5 each.
+    """
+    type: str = ""
+    quantity: int = Field(default=1, ge=1, le=5)
+    duration: Optional[str] = None
+    aspect_ratios: List[str] = []
+    raw_required: bool = False
+
+
 class BriefSectionsMixin(BaseModel):
     """
     Structured fields for the 8-section "Post a Brief" template.
@@ -35,8 +55,10 @@ class BriefSectionsMixin(BaseModel):
     target_audience: Optional[str] = None
     budget_visible: Optional[bool] = None
 
-    # Section 2: Deliverables (structured list of {type, quantity, duration, aspect_ratios, raw_required})
-    deliverable_items: Optional[List[Dict[str, Any]]] = None
+    # Section 2: Deliverables. Typed (was List[Dict[str, Any]]) so `quantity` is
+    # coerced to a bounded int instead of persisting whatever the client sent —
+    # it now drives escrow and payout gating, so it can't be free-form.
+    deliverable_items: Optional[List[DeliverableItem]] = None
 
     # Section 3: Must-Include
     product_visible: Optional[bool] = None
