@@ -9054,6 +9054,17 @@ async def post_deal_chat(deal_id: str, data: DealChatSubmit, current_user: dict 
     context = await get_deal_context(deal_id, current_user)
     campaign = context['campaign']
     sender_type = map_sender_type(current_user['id'], campaign, context['creator']['id'], current_user.get('role'))
+
+    # Keep the deal room on-platform too. This endpoint previously inserted the message
+    # with NO contact-info check (unlike /chat/send), so phone numbers / emails posted in
+    # the deal chat went straight through. Mirror the /chat/send guard exactly.
+    await refresh_filter_rules()
+    other_party = context['brand'] if current_user['id'] == context['creator']['id'] else context['creator']
+    safety_check = check_contact_info_policy(data.message, brand_allowed_domains(context['brand'], context['creator']))
+    if not safety_check["safe"]:
+        result = await log_chat_violation(current_user, other_party['id'], data.message, safety_check["violations"], "message", deal_id=deal_id)
+        raise HTTPException(status_code=400, detail=contact_info_block_message(result["strike"]))
+
     message_doc = {
         "id": str(uuid.uuid4()),
         "deal_id": make_deal_id(campaign),
@@ -12285,11 +12296,34 @@ async def get_notification_logs(current_user: dict = Depends(require_cap("edit_s
 # In-App Notification System
 @api_router.get("/notifications/my-notifications")
 async def get_my_notifications(current_user: dict = Depends(get_current_user)):
-    """Get current user's in-app notifications"""
+    """Get current user's in-app notifications.
+
+    The "Admin" chip is driven by `source == 'admin'`, which the broadcast endpoint
+    stamps. But notifications created BEFORE that tagging existed (or by any other
+    admin-authored path) have no `source`, so they showed as plain system events for
+    both brands and creators. Derive the tag here from `created_by`: if an admin
+    authored it, surface it as an admin message — retroactively, with no migration.
+    """
     notifications = await db.in_app_notifications.find(
         {"user_id": current_user['id']},
         {"_id": 0}
     ).sort("created_at", -1).limit(50).to_list(50)
+
+    # Resolve the distinct human authors once (usually 0-2 ids), then tag any
+    # untagged notification an admin wrote. 'system' is skipped — those are genuine
+    # system events and must stay chip-less.
+    author_ids = {n.get("created_by") for n in notifications
+                  if n.get("created_by") and n.get("created_by") != "system" and not n.get("source")}
+    admin_ids = set()
+    if author_ids:
+        admin_ids = {u["id"] for u in await db.users.find(
+            {"id": {"$in": list(author_ids)}, "role": {"$in": list(OPS_ROLES)}},
+            {"_id": 0, "id": 1},
+        ).to_list(None)}
+    for n in notifications:
+        if not n.get("source") and n.get("created_by") in admin_ids:
+            n["source"] = "admin"
+            n.setdefault("sender_label", "Admin")
     return notifications
 
 @api_router.get("/notifications/unread-count")
