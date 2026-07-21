@@ -1671,6 +1671,26 @@ async def log_chat_violation(current_user: dict, recipient_id: Optional[str], or
         await notify_admins("Account suspended for review", f"{current_user.get('nickname', current_user['id'])} reached repeated or flagrant chat contact-info violations.")
 
     await db.users.update_one({"id": current_user["id"]}, {"$set": user_updates})
+
+    # Persist the strike to the user's own bell. Until now the struck user only
+    # saw it as the transient 400 chat popup (contact_info_block_message), which
+    # vanishes and leaves no record — so warnings never appeared in-app for
+    # either brand or creator. Save it as a warning notification too.
+    strike_titles = {
+        "warning": "Policy warning issued",
+        "paused": "Chat paused — policy strike",
+        "action_cards_only": "Action Cards only — policy strike",
+        "suspended": "Account suspended — policy strike",
+    }
+    await notify_user(
+        current_user["id"],
+        strike_titles.get(severity, "Policy warning issued"),
+        contact_info_block_message(strike_doc),
+        link="/chat",
+        ntype="warning",
+        category="policy",
+    )
+
     return {"violation": violation_doc, "strike": strike_doc}
 
 
