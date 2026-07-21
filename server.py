@@ -2164,9 +2164,34 @@ def percent_change(current: int, previous: int) -> float:
         return 100.0 if current > 0 else 0.0
     return round(((current - previous) / previous) * 100, 2)
 
+def _fmt_amount_short(a: float) -> str:
+    a = float(a or 0)
+    if a >= 100000:
+        return f"₹{a / 100000:.0f}L"
+    if a >= 1000:
+        return f"₹{a / 1000:.0f}K"
+    return f"₹{a:.0f}"
+
+def wallet_bonus_tiers() -> list:
+    """Recharge-bonus tiers, driven by Admin → Settings → Recharge bonus tiers.
+    Falls back to the shipped defaults. Normalised + sorted ascending by amount."""
+    raw = platform_setting("wallet_bonus_tiers", WALLET_BONUS_TIERS) or WALLET_BONUS_TIERS
+    tiers = []
+    for t in raw:
+        try:
+            amount = float(t.get("amount") or 0)
+            percent = float(t.get("bonus_percent") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if amount <= 0:
+            continue
+        tiers.append({"amount": amount, "bonus_percent": percent, "label": (t.get("label") or _fmt_amount_short(amount))})
+    tiers.sort(key=lambda t: t["amount"])
+    return tiers or WALLET_BONUS_TIERS
+
 def wallet_bonus_percent(amount: float) -> int:
     percent = 0
-    for tier in WALLET_BONUS_TIERS:
+    for tier in wallet_bonus_tiers():
         if amount >= tier["amount"]:
             percent = tier["bonus_percent"]
     return percent
@@ -2177,7 +2202,7 @@ def wallet_bonus_amount(amount: float) -> float:
 def wallet_bonus_progress(amount: float) -> dict:
     current_tier = None
     next_tier = None
-    for tier in WALLET_BONUS_TIERS:
+    for tier in wallet_bonus_tiers():
         if amount >= tier["amount"]:
             current_tier = tier
         elif next_tier is None:
@@ -3778,7 +3803,7 @@ async def get_business_wallet(current_user: dict = Depends(get_approved_business
         "chat_unlocked": balance >= MIN_BRAND_CHAT_BALANCE,
         "plan_name": plan_name,
         "recharge_bonus": wallet_bonus_progress(balance),
-        "bonus_tiers": WALLET_BONUS_TIERS,
+        "bonus_tiers": wallet_bonus_tiers(),
         "transactions": transactions,
     }
 
@@ -8765,8 +8790,12 @@ async def get_business_briefs(current_user: dict = Depends(get_current_user)):
             "creator_id": counterpart_id,
             "creator_name": person_display_name(counterpart, "Creator"),
             "creator_nickname": counterpart.get("nickname"),
-            "creator_photo": (counterpart.get("profile") or {}).get("profile_photo")
-                or counterpart.get("profile_photo"),
+            "creator_photo": first_non_empty(
+                counterpart.get("profile_photo"),
+                counterpart.get("profile_picture"),
+                (counterpart.get("profile") or {}).get("profile_photo"),
+                (counterpart.get("profile") or {}).get("profile_picture"),
+            ),
             "campaign_name": fields.get("campaign_name") or fields.get("deliverable_type"),
             "campaign_id": fields.get("campaign_id") or card.get("deal_id"),
             "deliverable_summary": fields.get("deliverable_summary"),
@@ -13099,6 +13128,8 @@ DEFAULT_PLATFORM_SETTINGS = {
     "payout_delay_days": {"new": 12, "verified": 7, "l1": 5, "l2": 3, "elite": 2},
     "restricted_categories": ["tobacco", "weapons", "adult", "gambling"],
     "feature_flags": {"matching_v05": True, "instant_payout": True},
+    # Brand wallet recharge-bonus tiers (amount -> instant % bonus). Editable in admin.
+    "wallet_bonus_tiers": WALLET_BONUS_TIERS,
 }
 
 # In-process cache so sync helpers (commission, fees) can read live settings without
