@@ -1529,6 +1529,11 @@ async def find_chat_deal(user_id: str, other_user_id: str) -> Optional[dict]:
 async def creator_has_chat_relationship(creator_id: str, brand_id: str) -> bool:
     if await find_chat_deal(creator_id, brand_id):
         return True
+    # A brand can open the conversation with a plain message before sending any
+    # formal invite. Once they've messaged this creator, let the creator reply —
+    # so a brand can talk first and invite to a private deal afterwards.
+    if await db.messages.find_one({"sender_id": brand_id, "recipient_id": creator_id}, {"_id": 0}):
+        return True
     invite_query = {
         "creator_id": creator_id,
         "business_id": brand_id,
