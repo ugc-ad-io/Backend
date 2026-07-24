@@ -127,7 +127,7 @@ async def test_business_can_list_only_curated_approved_creators():
 
 
 @pytest.mark.asyncio
-async def test_non_business_and_unapproved_business_cannot_access_directory():
+async def test_non_business_is_rejected_but_pending_business_can_access_directory():
     test_ids, brand_user, creator_a, _creator_b, _hidden = await seed_directory()
     try:
         with pytest.raises(HTTPException) as non_business:
@@ -135,9 +135,11 @@ async def test_non_business_and_unapproved_business_cannot_access_directory():
         assert non_business.value.status_code == 403
 
         brand_user["approval_status"] = "pending"
-        with pytest.raises(HTTPException) as unapproved:
-            await server.get_creator_directory(current_user=brand_user)
-        assert unapproved.value.status_code == 403
+        response = await server.get_creator_directory(current_user=brand_user)
+        assert {item["id"] for item in response["creators"]} == {
+            test_ids["creator_a"],
+            test_ids["creator_b"],
+        }
     finally:
         await cleanup(test_ids)
 

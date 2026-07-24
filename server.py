@@ -3559,12 +3559,12 @@ async def get_creator_directory(
     style: Optional[str] = None,
     budget: Optional[str] = None,
     sort: Optional[str] = "best_match",
-    current_user: dict = Depends(get_approved_business_user),
+    # A brand may discover and message creators while its profile is under review.
+    # Paid/publishing actions continue to use get_approved_business_user.
+    current_user: dict = Depends(get_current_business_user),
 ):
     if current_user.get("role") != UserRole.BUSINESS:
         raise HTTPException(status_code=403, detail="Only business users can access this resource")
-    if current_user.get("approval_status") != ApprovalStatus.APPROVED:
-        raise HTTPException(status_code=403, detail="Business profile must be approved")
     if sort not in ["recent", "active", "best_match", None]:
         raise HTTPException(status_code=400, detail="Invalid sort option")
 
