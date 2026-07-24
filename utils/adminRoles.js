@@ -18,7 +18,7 @@ const ADMIN_ROLES = ['founder', 'ops_senior', 'ops_regular', 'finance', 'custom'
 const ROLE_LABELS = {
   founder: 'Founder / Admin',
   ops_senior: 'Ops (Senior)',
-  ops_regular: 'Ops (Regular)',
+  ops_regular: 'Operations Team',
   finance: 'Finance',
   custom: 'Custom Admin'
 };

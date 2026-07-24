@@ -658,6 +658,18 @@ def create_token(user_id: str, email: str, role: str) -> str:
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
+def create_delegated_brand_token(brand: dict, admin: dict) -> str:
+    payload = {
+        "user_id": brand["id"],
+        "email": brand.get("email"),
+        "role": UserRole.BUSINESS,
+        "delegated_admin_id": admin["id"],
+        "delegated_admin_email": admin.get("email"),
+        "delegated_admin_name": person_display_name(admin, "Operations Team"),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=2),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
 # ---- Email (Resend) --------------------------------------------------------
 # Generic transactional email sender. Safe no-op if RESEND_API_KEY is unset.
 def _send_email_sync(to, subject: str, html: str, text: Optional[str] = None) -> dict:
@@ -764,7 +776,7 @@ async def generate_creator_code() -> str:
             return code
     return cf.generate_creator_code()
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+async def get_current_user(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
@@ -793,6 +805,26 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     # request so a 4th chat strike (or an admin ban) takes effect right away.
     if user.get("banned"):
         raise HTTPException(status_code=403, detail=f"Account banned: {user.get('banned_reason') or user.get('ban_reason') or 'Account suspended'}")
+    delegated_admin_id = payload.get("delegated_admin_id")
+    if delegated_admin_id:
+        admin = await db.users.find_one({"id": delegated_admin_id}, {"_id": 0})
+        if not admin or admin.get("role") != UserRole.ADMIN or not admin_caps.can(admin, "manage_deals", "edit"):
+            raise HTTPException(status_code=403, detail="Delegated brand access is no longer authorized")
+        if request.method not in ("GET", "HEAD", "OPTIONS"):
+            if request.url.path.startswith("/api/auth"):
+                raise HTTPException(status_code=403, detail="Operations cannot change brand authentication details")
+            await log_admin_action(
+                admin,
+                f"delegated_brand.{request.method.lower()}",
+                target_type="business",
+                target_id=user.get("id"),
+                after={"path": request.url.path},
+                reason="Operations acted through the brand workspace",
+                request=request,
+            )
+        user["_delegated_admin_id"] = admin.get("id")
+        user["_delegated_admin_name"] = person_display_name(admin, "Operations Team")
+        user["_delegated_admin_email"] = admin.get("email")
     return user
 
 async def get_current_business_user(current_user: dict = Depends(get_current_user)):
@@ -905,20 +937,21 @@ def require_cap(capability: str):
     `capability` (per admin_caps.can). Mirrors the Express requireCap middleware
     so both backends enforce the same RBAC matrix. Returns current_user so routes
     can keep `current_user: dict = Depends(require_cap("..."))`."""
-    async def _dep(current_user: dict = Depends(get_current_user)) -> dict:
+    async def _dep(request: Request, current_user: dict = Depends(get_current_user)) -> dict:
         if current_user.get("role") != UserRole.ADMIN:
             raise HTTPException(status_code=403, detail="Admin access required")
-        if not admin_caps.can(current_user, capability):
+        access = "view" if request.method in ("GET", "HEAD", "OPTIONS") else "edit"
+        if not admin_caps.can(current_user, capability, access):
             role = admin_caps.normalize_role(current_user.get("admin_role"))
             label = admin_caps.ROLE_LABELS.get(role, role)
-            raise HTTPException(status_code=403, detail=f"Your role ({label}) cannot perform this action")
+            raise HTTPException(status_code=403, detail=f"Your role ({label}) does not have {access} access for this feature")
         return current_user
     return _dep
 
-async def get_approved_business_user(current_user: dict = Depends(get_current_user)):
+async def get_approved_business_user(request: Request, current_user: dict = Depends(get_current_user)):
     if current_user.get("role") != UserRole.BUSINESS:
         raise HTTPException(status_code=403, detail="Only business users can access this resource")
-    if current_user.get("approval_status") != ApprovalStatus.APPROVED:
+    if request.method not in ("GET", "HEAD", "OPTIONS") and current_user.get("approval_status") != ApprovalStatus.APPROVED:
         raise HTTPException(status_code=403, detail="Business profile must be approved")
     return current_user
 
@@ -3095,6 +3128,7 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
         "role": user.get('role'),
         "admin_role": user.get('admin_role'),
         "admin_caps": user.get('admin_caps', []),
+        "admin_cap_modes": user.get('admin_cap_modes', {}),
         "admin_scope": user.get('admin_scope', 'all'),
         "assigned_categories": user.get('assigned_categories', []),
         "profile_completed": user.get('profile_completed', False),
@@ -3214,6 +3248,7 @@ async def google_auth(data: GoogleAuthRequest):
         "role": user.get("role"),
         "admin_role": user.get("admin_role"),
         "admin_caps": user.get("admin_caps", []),
+        "admin_cap_modes": user.get("admin_cap_modes", {}),
         "admin_scope": user.get("admin_scope", "all"),
         "assigned_categories": user.get("assigned_categories", []),
         "profile_completed": user.get("profile_completed", False),
@@ -3243,6 +3278,7 @@ def _auth_response(user: dict) -> dict:
         "role": user.get("role"),
         "admin_role": user.get("admin_role"),
         "admin_caps": user.get("admin_caps", []),
+        "admin_cap_modes": user.get("admin_cap_modes", {}),
         "admin_scope": user.get("admin_scope", "all"),
         "assigned_categories": user.get("assigned_categories", []),
         "profile_completed": user.get("profile_completed", False),
@@ -3559,8 +3595,8 @@ async def get_creator_directory(
     style: Optional[str] = None,
     budget: Optional[str] = None,
     sort: Optional[str] = "best_match",
-    # A brand may discover and message creators while its profile is under review.
-    # Paid/publishing actions continue to use get_approved_business_user.
+    # Discovery is available while a brand profile is under review. Invitations,
+    # campaign publishing and payments continue to use the approved-brand guard.
     current_user: dict = Depends(get_current_business_user),
 ):
     if current_user.get("role") != UserRole.BUSINESS:
@@ -3577,15 +3613,30 @@ async def get_creator_directory(
         "creator_directory_visible": {"$ne": False},
     }, {"_id": 0}).to_list(10000)
 
+    # Batch the review aggregates (avg rating + count) for ALL creators in one query,
+    # so the directory/quick-preview cards can show a real rating instead of "New".
+    creator_ids = [c.get("id") for c in creators if c.get("id")]
+    rating_map = {}
+    if creator_ids:
+        agg = await db.reviews.aggregate([
+            {"$match": {"creator_id": {"$in": creator_ids}}},
+            {"$group": {"_id": "$creator_id", "avg": {"$avg": "$rating"}, "count": {"$sum": 1}}},
+        ]).to_list(None)
+        rating_map = {a["_id"]: a for a in agg}
+
     rows = []
     for creator in creators:
         if not creator_matches_directory_filters(creator, category, language, region, style, budget):
             continue
         await ensure_public_creator_id(creator)
         deliverables = await creator_deliverables_completed(creator)
+        pub = creator_directory_public_view(creator, deliverables)
+        _r = rating_map.get(creator.get("id"))
+        pub["avg_rating"] = round(_r["avg"], 1) if (_r and _r.get("count")) else None
+        pub["review_count"] = int(_r["count"]) if _r else 0
         rows.append({
             "creator": creator,
-            "public": creator_directory_public_view(creator, deliverables),
+            "public": pub,
             "deliverables": deliverables,
             "activity": first_non_empty(creator.get("recent_activity_score"), creator.get("activity_score"), (creator.get("profile") or {}).get("recent_activity_score")),
             "best_match": creator_best_match_score(creator, current_user),
@@ -3739,9 +3790,6 @@ async def submit_business_gst(data: BusinessGSTSubmit, current_user: dict = Depe
 async def get_business_wallet(current_user: dict = Depends(get_approved_business_user)):
     if current_user.get("role") != UserRole.BUSINESS:
         raise HTTPException(status_code=403, detail="Only business users can access this resource")
-    if current_user.get("approval_status") != ApprovalStatus.APPROVED:
-        raise HTTPException(status_code=403, detail="Business profile must be approved")
-
     balance = to_float(current_user.get("balance"))
     settings = await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0})
     plan_name = (
@@ -6831,14 +6879,14 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
             unread_per_partner[other_id] = unread_per_partner.get(other_id, 0) + 1
 
         if other_id not in conversations or item_timestamp > conversations[other_id]['timestamp']:
-            other_user = await db.users.find_one({"id": other_id}, {"_id": 0, "nickname": 1, "full_name": 1, "username": 1, "role": 1, "profile_photo": 1, "business_name": 1, "profile.business_name": 1, "profile.full_name": 1, "profile.fullName": 1, "profile.logo": 1})
+            other_user = await db.users.find_one({"id": other_id}, {"_id": 0, "nickname": 1, "full_name": 1, "username": 1, "role": 1, "profile_photo": 1, "profile_picture": 1, "business_name": 1, "profile.business_name": 1, "profile.full_name": 1, "profile.fullName": 1, "profile.logo": 1, "profile.profile_photo": 1, "profile.profile_picture": 1})
             # Fall back to _id — a partner created through the Node backend may carry only
             # `_id`, and looking up by `id` alone silently DROPPED the whole conversation
             # (the "I got a message notification but Messages is empty" bug).
             if not other_user:
                 try:
                     from bson import ObjectId
-                    other_user = await db.users.find_one({"_id": ObjectId(other_id)}, {"_id": 0, "nickname": 1, "full_name": 1, "username": 1, "role": 1, "profile_photo": 1, "business_name": 1, "profile.business_name": 1, "profile.full_name": 1, "profile.fullName": 1, "profile.logo": 1})
+                    other_user = await db.users.find_one({"_id": ObjectId(other_id)}, {"_id": 0, "nickname": 1, "full_name": 1, "username": 1, "role": 1, "profile_photo": 1, "profile_picture": 1, "business_name": 1, "profile.business_name": 1, "profile.full_name": 1, "profile.fullName": 1, "profile.logo": 1, "profile.profile_photo": 1, "profile.profile_picture": 1})
                 except Exception:
                     other_user = None
             # Never drop a real message. Show the thread even if the account can't be
@@ -6866,7 +6914,12 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
                     "profile": other_user.get('profile') or {},
                     "username": other_user.get('username'),
                     "role": other_user.get('role', ''),
-                    "profile_picture": other_user.get('profile_photo') or other_user.get('profile_picture'),
+                    "profile_picture": first_non_empty(
+                        other_user.get('profile_photo'), other_user.get('profile_picture'),
+                        (other_user.get('profile') or {}).get('profile_photo'),
+                        (other_user.get('profile') or {}).get('profile_picture'),
+                        (other_user.get('profile') or {}).get('logo'),
+                    ),
                     "last_message": item,
                     "last_item_snippet": snippet[:120],
                     "timestamp": item_timestamp,
@@ -9412,9 +9465,31 @@ async def get_dispute_detail(dispute_id: str, current_user: dict = Depends(requi
         {"_id": 0},
     ).sort("created_at", 1).to_list(500) if bid and crid else []
     prior = await db.disputes.find({"$or": [{"business_id": dispute.get("business_id")}, {"creator_id": dispute.get("creator_id")}], "id": {"$ne": dispute_id}}, {"_id": 0}).to_list(100)
+
+    # Resolve REAL names so the timeline/chat never surface a raw "@handle" username.
+    # Remapping by actor_type/sender_id fixes both historical rows (already stored with
+    # a nickname) and future ones in one place.
+    brand_user = await db.users.find_one({"id": bid}, {"_id": 0}) if bid else None
+    creator_user = await db.users.find_one({"id": crid}, {"_id": 0}) if crid else None
+    brand_name = person_display_name(brand_user, "Brand")
+    creator_name = person_display_name(creator_user, "Creator")
+    for ev in timeline:
+        at = (ev.get("actor_type") or "").lower()
+        if at == "brand":
+            ev["actor_name"] = brand_name
+        elif at == "creator":
+            ev["actor_name"] = creator_name
+        elif at in ("system", "admin"):
+            ev["actor_name"] = ev.get("actor_name") or ("System" if at == "system" else "Admin")
+    for m in chat:
+        m["sender_name"] = brand_name if m.get("sender_id") == bid else (creator_name if m.get("sender_id") == crid else m.get("sender_name") or m.get("sender_nickname"))
+
     return {
         "dispute": dispute,
         "brief": normalize_campaign_response(campaign) if campaign else None,
+        # Explicit party names so the panel can label "Brand: X · Creator: Y".
+        "brand_name": brand_name,
+        "creator_name": creator_name,
         "timeline": timeline,
         "content_versions": content,
         "shipment": shipment,
@@ -12583,7 +12658,7 @@ ADMIN_SUB_ROLES = ["founder", "ops_senior", "ops_regular", "finance"]
 ADMIN_ROLE_LABELS = {
     "founder": "Founder / Admin",
     "ops_senior": "Ops (Senior)",
-    "ops_regular": "Ops (Regular)",
+    "ops_regular": "Operations Team",
     "finance": "Finance",
 }
 FOUNDER_EMAIL = (os.environ.get("FOUNDER_EMAIL") or "admin@gmail.com").lower()
@@ -12604,6 +12679,7 @@ def _map_staff_row(u: dict) -> dict:
         "admin_role": u.get("admin_role") or "founder",
         "assigned_categories": u.get("assigned_categories") or [],
         "admin_caps": u.get("admin_caps") or [],
+        "admin_cap_modes": u.get("admin_cap_modes") or {},
         "admin_scope": u.get("admin_scope") or "all",
     }
 
@@ -12641,6 +12717,12 @@ async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Reques
     # derive their capabilities from the fixed CAPS matrix.
     is_custom = admin_role == "custom"
     custom_caps = [c for c in (data.get("admin_caps") or []) if c in admin_caps.ALL_CAPS] if is_custom else []
+    raw_modes = data.get("admin_cap_modes") or {}
+    custom_cap_modes = {
+        cap: raw_modes.get(cap, "both")
+        for cap in custom_caps
+        if raw_modes.get(cap, "both") in ("view", "edit", "both")
+    } if is_custom else {}
     custom_scope = data.get("admin_scope") if data.get("admin_scope") in ("all", "creator", "business") else "all"
 
     user = None
@@ -12668,6 +12750,7 @@ async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Reques
             "role": UserRole.ADMIN,
             "admin_role": admin_role,
             "admin_caps": custom_caps,
+            "admin_cap_modes": custom_cap_modes,
             "admin_scope": custom_scope if is_custom else "all",
             "approval_status": "approved",
             "profile_completed": True,
@@ -12685,6 +12768,7 @@ async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Reques
             "role": UserRole.ADMIN,
             "admin_role": admin_role,
             "admin_caps": custom_caps,
+            "admin_cap_modes": custom_cap_modes,
             "admin_scope": custom_scope if is_custom else "all",
             "approval_status": "approved",
             "profile_completed": True,
@@ -12919,10 +13003,10 @@ async def export_withdrawals(current_user: dict = Depends(require_cap("view_fina
     for withdrawal in withdrawals:
         user = await db.users.find_one(
             {"id": withdrawal['user_id']},
-            {"_id": 0, "bank_details": 1, "upi_id": 1, "nickname": 1, "email": 1}
+            {"_id": 0, "bank_details": 1, "upi_id": 1, "nickname": 1, "email": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "profile": 1}
         )
         if user:
-            withdrawal['creator_name'] = user.get('nickname', 'N/A')
+            withdrawal['creator_name'] = person_display_name(user, 'N/A')
             withdrawal['creator_email'] = user.get('email', 'N/A')
             withdrawal['bank_name'] = user.get('bank_details', {}).get('bank_name', 'N/A')
             withdrawal['account_number'] = user.get('bank_details', {}).get('account_number', 'N/A')
@@ -13375,11 +13459,11 @@ async def admin_payout_queue(status_filter: Optional[str] = None, current_user: 
     escrows = await db.escrow.find(query, {"_id": 0}).sort("payout_scheduled_at", 1).to_list(2000)
     rows = []
     for e in escrows:
-        creator = await db.users.find_one({"id": e.get("creator_id")}, {"_id": 0, "nickname": 1, "upi_id": 1}) or {}
+        creator = await db.users.find_one({"id": e.get("creator_id")}, {"_id": 0, "nickname": 1, "upi_id": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1, "profile": 1}) or {}
         campaign = await db.campaigns.find_one({"id": e.get("campaign_id")}, {"_id": 0, "title": 1}) or {}
         rows.append({
             "escrow_id": e.get("id"), "campaign_id": e.get("campaign_id"), "campaign_title": campaign.get("title"),
-            "creator_id": e.get("creator_id"), "creator_nickname": creator.get("nickname"),
+            "creator_id": e.get("creator_id"), "creator_nickname": person_display_name(creator, "Creator"),
             "gross_amount": to_float(e.get("gross_amount") or e.get("amount")),
             "tds_amount": to_float(e.get("tds_amount")), "net_payable": to_float(e.get("net_payable") or e.get("amount")),
             "payout_status": e.get("payout_status"), "scheduled_at": e.get("payout_scheduled_at"),
@@ -13396,10 +13480,10 @@ async def admin_escrow_list(current_user: dict = Depends(require_cap("view_finan
     rows = []
     for e in escrows:
         campaign = await db.campaigns.find_one({"id": e.get("campaign_id")}, {"_id": 0, "title": 1}) or {}
-        creator = await db.users.find_one({"id": e.get("creator_id")}, {"_id": 0, "nickname": 1}) or {}
+        creator = await db.users.find_one({"id": e.get("creator_id")}, {"_id": 0, "nickname": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1, "profile": 1}) or {}
         rows.append({
             "id": e.get("id"), "campaign_id": e.get("campaign_id"), "campaign_title": campaign.get("title"),
-            "creator": creator.get("nickname"), "amount": to_float(e.get("amount")),
+            "creator": person_display_name(creator, "Creator"), "amount": to_float(e.get("amount")),
             "held_amount": to_float(e.get("amount")), "status": e.get("status"),
             "payout_status": e.get("payout_status"), "created_at": e.get("created_at"),
         })
@@ -13426,9 +13510,9 @@ async def export_tds(current_user: dict = Depends(require_cap("export_tax"))):
     invoices = await db.invoices.find({}, {"_id": 0}).to_list(20000)
     rows = []
     for inv in invoices:
-        creator = await db.users.find_one({"id": inv.get("creator_id")}, {"_id": 0, "nickname": 1, "email": 1}) or {}
+        creator = await db.users.find_one({"id": inv.get("creator_id")}, {"_id": 0, "nickname": 1, "email": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "profile": 1}) or {}
         rows.append({
-            "creator_id": inv.get("creator_id"), "creator": creator.get("nickname"), "email": creator.get("email"),
+            "creator_id": inv.get("creator_id"), "creator": person_display_name(creator, "Creator"), "email": creator.get("email"),
             "campaign_id": inv.get("campaign_id"), "gross_amount": inv.get("gross_amount"),
             "tds_amount": inv.get("tds_amount"), "net_to_creator": inv.get("net_to_creator"),
             "date": (inv.get("created_at") or "")[:10],
@@ -13832,8 +13916,8 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
             continue  # legacy campaign without a UUID id — skip rather than 500
         sh = await db.shipments.find_one({"campaign_id": cid}, {"_id": 0}) or {}
         ship_status = sh.get("courier_status") or sh.get("status") or "pending"
-        brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "nickname": 1, "profile": 1}) or {}
-        creator = await db.users.find_one({"id": c.get("selected_creator")}, {"_id": 0, "nickname": 1, "profile": 1}) or {}
+        brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "nickname": 1, "profile": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1}) or {}
+        creator = await db.users.find_one({"id": c.get("selected_creator")}, {"_id": 0, "nickname": 1, "profile": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1}) or {}
         requested = sh.get("requested_at") or c.get("work_started_at") or c.get("updated_at") or c.get("created_at")
         prod = sh.get("product") or {}
         dims = prod.get("dimensions") or {}
@@ -13842,7 +13926,7 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
         product_name = sh.get("product_summary") or prod.get("description") or c.get("product_name") or "—"
         rows.append({
             "id": cid, "deal_id": cid, "campaign_title": c.get("title"),
-            "brand": brand.get("nickname"), "creator": creator.get("nickname"),
+            "brand": person_display_name(brand, "Brand"), "creator": person_display_name(creator, "Creator"),
             "product": product_name, "product_summary": product_name,
             "weight": (f"{prod.get('weight')} kg" if prod.get("weight") else None),
             "dimensions": dim_str,
@@ -13938,7 +14022,13 @@ async def admin_list_deals(state: Optional[str] = None, current_user: dict = Dep
         return out
 
     uids = [u for u in {c.get("business_id") for c in campaigns} | {c.get("selected_creator") for c in campaigns} if u]
-    users = {u["id"]: u for u in await db.users.find({"id": {"$in": uids}}, {"_id": 0, "id": 1, "nickname": 1}).to_list(None)}
+    # Pull the real-name fields (not just the nickname) so the admin table shows
+    # actual names via person_display_name — no raw "@handle" usernames.
+    users = {u["id"]: u for u in await db.users.find(
+        {"id": {"$in": uids}},
+        {"_id": 0, "id": 1, "nickname": 1, "full_name": 1, "business_name": 1,
+         "name": 1, "username": 1, "email": 1, "profile": 1},
+    ).to_list(None)}
     escrows = first_by_campaign(await db.escrow.find({"campaign_id": {"$in": cids}}, {"_id": 0}).to_list(None))
     shipments = first_by_campaign(await db.shipments.find({"campaign_id": {"$in": cids}}, {"_id": 0}).to_list(None))
     receipts = first_by_campaign(await db.deal_receipts.find({"campaign_id": {"$in": cids}}, {"_id": 0}).to_list(None))
@@ -13972,7 +14062,7 @@ async def admin_list_deals(state: Optional[str] = None, current_user: dict = Dep
         creator = users.get(c.get("selected_creator")) or {}
         rows.append({
             "id": cid, "deal_id": cid, "campaign_title": c.get("title"), "campaign": c.get("title"),
-            "brand": brand.get("nickname"), "creator": creator.get("nickname"),
+            "brand": person_display_name(brand, "Brand"), "creator": person_display_name(creator, "Creator"),
             "current_state": st["current_state"], "state": st["current_state"],
             "active_party": st["active_party"], "primary_next_action": st["primary_next_action"],
             "deadline": c.get("final_delivery_by") or c.get("due_date"),
@@ -13994,11 +14084,21 @@ async def admin_deal_detail(campaign_id: str, current_user: dict = Depends(requi
     c = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
     if not c:
         raise HTTPException(status_code=404, detail="Deal not found")
-    brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "nickname": 1}) or {}
-    creator = await db.users.find_one({"id": c.get("selected_creator")}, {"_id": 0, "nickname": 1}) or {}
+    _name_proj = {"_id": 0, "nickname": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1, "profile": 1}
+    brand = await db.users.find_one({"id": c.get("business_id")}, _name_proj) or {}
+    creator = await db.users.find_one({"id": c.get("selected_creator")}, _name_proj) or {}
+    brand_name = person_display_name(brand, "Brand")
+    creator_name = person_display_name(creator, "Creator")
     escrow = await db.escrow.find_one({"campaign_id": campaign_id}, {"_id": 0}) or {}
     shipment = await db.shipments.find_one({"campaign_id": campaign_id}, {"_id": 0}) or {}
     timeline = await db.deal_activity.find({"campaign_id": campaign_id}, {"_id": 0}).sort("timestamp", 1).to_list(500)
+    # Show real names in the timeline, never a raw "@handle" (remap by actor_type).
+    for ev in timeline:
+        at = (ev.get("actor_type") or "").lower()
+        if at == "brand":
+            ev["actor_name"] = brand_name
+        elif at == "creator":
+            ev["actor_name"] = creator_name
     content = await db.deal_content_submissions.find({"campaign_id": campaign_id}, {"_id": 0}).sort("version", 1).to_list(50)
     # Same fix as the list endpoint: the drawer showed the raw campaign status enum
     # instead of the deal's real state, so it disagreed with the deal room.
@@ -14008,7 +14108,7 @@ async def admin_deal_detail(campaign_id: str, current_user: dict = Depends(requi
     st = compute_deal_state(c, shipment or None, normalize_receipt(shipment, receipt), work, escrow, action_cards)
     return {
         "deal_id": campaign_id, "id": campaign_id, "campaign_title": c.get("title"),
-        "brand": brand.get("nickname"), "creator": creator.get("nickname"),
+        "brand": brand_name, "creator": creator_name,
         "brand_id": c.get("business_id"), "creator_id": c.get("selected_creator"),
         "current_state": st["current_state"],
         "active_party": st["active_party"],
@@ -14034,6 +14134,33 @@ async def admin_business_profile(business_id: str, current_user: dict = Depends(
     return profile
 
 
+@api_router.post("/admin/business/{business_id}/operate")
+async def admin_open_brand_workspace(
+    business_id: str,
+    request: Request,
+    current_user: dict = Depends(require_cap("manage_deals")),
+):
+    """Issue short-lived delegated access to the normal brand workspace."""
+    brand = await db.users.find_one({"id": business_id}, {"_id": 0, "password": 0})
+    if not brand or brand.get("role") != UserRole.BUSINESS:
+        raise HTTPException(status_code=404, detail="Brand account not found")
+    token = create_delegated_brand_token(brand, current_user)
+    public_brand = {k: v for k, v in brand.items() if k != "password"}
+    public_brand["_delegated_admin_id"] = current_user.get("id")
+    public_brand["_delegated_admin_name"] = person_display_name(current_user, "Operations Team")
+    public_brand["_delegated_admin_email"] = current_user.get("email")
+    await log_admin_action(
+        current_user,
+        "delegated_brand.started",
+        target_type="business",
+        target_id=business_id,
+        after={"expires_in_minutes": 120},
+        reason="Operations opened the brand workspace",
+        request=request,
+    )
+    return {"access_token": token, "token_type": "bearer", "user": public_brand, "expires_in": 7200}
+
+
 @api_router.get("/admin/business/{business_id}/campaigns")
 async def admin_business_campaigns(business_id: str, current_user: dict = Depends(require_cap("manage_deals"))):
     """Every campaign a brand has posted — live and completed — for the admin
@@ -14056,6 +14183,73 @@ async def admin_business_campaigns(business_id: str, current_user: dict = Depend
         "created_at": c.get("created_at"),
     } for c in campaigns if c.get("id")]
     return _json_safe(rows)
+
+
+async def _brand_actor_for_admin_deal(campaign: dict, admin: dict) -> dict:
+    """Build a brand-scoped actor for an audited Ops action.
+
+    Existing deal services enforce ownership through _brand_ws_id(), so Ops uses
+    the real brand workspace without impersonating its login credentials.
+    """
+    brand = await db.users.find_one({"id": campaign.get("business_id")}, {"_id": 0})
+    if not brand:
+        raise HTTPException(status_code=404, detail="Brand account for this deal was not found")
+    brand["nickname"] = f"Operations Team ({person_display_name(admin, 'Admin')})"
+    return brand
+
+
+@api_router.post("/admin/deals/{campaign_id}/approve-content")
+async def admin_approve_content_for_brand(
+    campaign_id: str,
+    request: Request = None,
+    current_user: dict = Depends(require_cap("manage_deals")),
+):
+    """Approve the latest submission on behalf of the brand, with an audit record."""
+    campaign = await _admin_deal_or_404(campaign_id, current_user)
+    work = await db.work_submissions.find_one(
+        {"campaign_id": campaign_id}, {"_id": 0}, sort=[("submitted_at", -1)]
+    )
+    if not work:
+        raise HTTPException(status_code=404, detail="No submitted work is available to approve")
+    brand_actor = await _brand_actor_for_admin_deal(campaign, current_user)
+    result = await approve_work(work["id"], brand_actor)
+    await log_admin_action(
+        current_user,
+        "deal.brand_content_approved",
+        target_type="deal",
+        target_id=campaign_id,
+        after={"work_id": work["id"], "acted_for_business_id": campaign.get("business_id")},
+        reason="Operations acted on behalf of brand",
+        request=request,
+    )
+    return result
+
+
+@api_router.post("/admin/deals/{campaign_id}/request-revision")
+async def admin_request_revision_for_brand(
+    campaign_id: str,
+    data: DealRevisionRequest,
+    request: Request = None,
+    current_user: dict = Depends(require_cap("manage_deals")),
+):
+    """Request changes on the latest submission on behalf of the brand."""
+    campaign = await _admin_deal_or_404(campaign_id, current_user)
+    brand_actor = await _brand_actor_for_admin_deal(campaign, current_user)
+    result = await request_deal_revision(campaign_id, data, brand_actor)
+    await log_admin_action(
+        current_user,
+        "deal.brand_revision_requested",
+        target_type="deal",
+        target_id=campaign_id,
+        after={
+            "acted_for_business_id": campaign.get("business_id"),
+            "feedback": data.feedback,
+            "requested_changes": data.requested_changes,
+        },
+        reason="Operations acted on behalf of brand",
+        request=request,
+    )
+    return result
 
 
 @api_router.post("/admin/deals/{campaign_id}/force-transition")

@@ -16,7 +16,7 @@ ADMIN_ROLES = ["founder", "ops_senior", "ops_regular", "finance", "custom"]
 ROLE_LABELS = {
     "founder": "Founder / Admin",
     "ops_senior": "Ops (Senior)",
-    "ops_regular": "Ops (Regular)",
+    "ops_regular": "Operations Team",
     "finance": "Finance",
     "custom": "Custom Admin",
 }
@@ -67,14 +67,21 @@ def normalize_role(role):
     return role if role in ADMIN_ROLES else "founder"
 
 
-def can(user_or_role, capability) -> bool:
+def can(user_or_role, capability, access="view") -> bool:
     """True if the admin has `capability`. Accepts a user dict
-    ({admin_role, admin_caps}) or a bare role string."""
+    ({admin_role, admin_caps, admin_cap_modes}) or a bare role string.
+
+    Custom-admin capability modes are "view", "edit", or "both". Existing
+    records without a mode map remain "both" for backward compatibility.
+    """
     is_obj = isinstance(user_or_role, dict)
     role = normalize_role(user_or_role.get("admin_role") if is_obj else user_or_role)
     if role == "custom":
         caps = (user_or_role.get("admin_caps") or []) if is_obj else []
-        return capability in caps
+        if capability not in caps:
+            return False
+        mode = (user_or_role.get("admin_cap_modes") or {}).get(capability, "both")
+        return mode == "both" or mode == access
     caps = CAPS.get(role, [])
     return "*" in caps or capability in caps
 
