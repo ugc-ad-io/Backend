@@ -18,7 +18,7 @@ function EmptyPanel({ text }) {
   return <div className="pcd-empty-panel">{text}</div>;
 }
 
-function CampaignGrid({ items, empty, renderActions }) {
+function CampaignGrid({ items, empty, renderActions, renderProgress }) {
   if (!items.length) return <EmptyPanel text={empty} />;
 
   return (
@@ -35,6 +35,7 @@ function CampaignGrid({ items, empty, renderActions }) {
             <div><dt>Brand</dt><dd>{campaign.business_nickname || campaign.brand_handle || 'Brand'}</dd></div>
             <div><dt>Objectives</dt><dd>{campaign.objectives?.length || 0}</dd></div>
           </dl>
+          {renderProgress?.(campaign)}
           <div className="pcd-card-actions">{renderActions(campaign)}</div>
         </article>
       ))}

@@ -175,19 +175,9 @@ async def test_brand_wallet_gate_real_db():
 
 
 @pytest.mark.asyncio
-async def test_creator_relationship_gate_real_db():
+async def test_creator_can_start_chat_without_invite_or_deal_real_db():
     test_ids, _brand, crt = await seed_pair()
     try:
-        with pytest.raises(HTTPException):
-            await server.validate_chat_access(crt, test_ids["brand_id"])
-
-        await server.db.campaigns.insert_one({
-            "id": test_ids["campaign_id"],
-            "business_id": test_ids["brand_id"],
-            "selected_creator": test_ids["creator_id"],
-            "status": "in_progress",
-            "title": "Test Campaign",
-        })
         recipient = await server.validate_chat_access(crt, test_ids["brand_id"])
         assert recipient["id"] == test_ids["brand_id"]
     finally:

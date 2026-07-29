@@ -1622,9 +1622,9 @@ async def validate_chat_access(current_user: dict, recipient_id: str, allow_acti
             raise HTTPException(status_code=403, detail="Brand profile must be approved before starting chat.")
         if float(fresh_user.get("balance") or 0) < MIN_BRAND_CHAT_BALANCE:
             raise HTTPException(status_code=403, detail="Brand wallet balance must be at least INR 2,500 to start chat.")
-    elif role == UserRole.CREATOR and recipient_role == UserRole.BUSINESS:
-        if not await creator_has_chat_relationship(current_user["id"], recipient_id):
-            raise HTTPException(status_code=403, detail="Creators can chat only with brands who invited them or with whom they have a deal.")
+    elif role == UserRole.CREATOR:
+        if recipient_role != UserRole.BUSINESS:
+            raise HTTPException(status_code=403, detail="Creators can start chats only with brand accounts.")
     elif role not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]:
         raise HTTPException(status_code=403, detail="Chat is only available to creators, brands, and staff.")
     return recipient
@@ -6491,6 +6491,17 @@ async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Dep
     campaign = await db.campaigns.find_one({"id": campaign_id})
     if not campaign or campaign['status'] != CampaignStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Campaign not available for bidding")
+
+    budget_ceiling = (
+        to_float(campaign.get("budget_max"))
+        or to_float(campaign.get("max_budget"))
+        or to_float(campaign.get("budget"))
+    )
+    if budget_ceiling and data.amount > budget_ceiling:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Bid cannot exceed the campaign budget of ₹{budget_ceiling:,.0f}",
+        )
     
     # Check if creator has already bid on this campaign
     existing_bids = campaign.get('bids', [])
