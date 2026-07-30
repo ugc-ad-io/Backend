@@ -2476,6 +2476,49 @@ def make_deal_id(campaign: dict) -> str:
     return f"DEAL-{number}"
 
 
+def selected_creator_ids(campaign: dict) -> List[str]:
+    """Every creator hired on this brief, in pick order. `selected_creators` is the
+    source of truth; the singular `selected_creator` is a legacy fallback so old
+    single-creator campaigns still resolve to exactly one id."""
+    ids = [str(c) for c in (campaign.get("selected_creators") or []) if c]
+    if ids:
+        return ids
+    return [str(campaign["selected_creator"])] if campaign.get("selected_creator") else []
+
+
+# A brief can hire several creators, so one campaign now has one deal PER creator.
+# The deal id the UI shows is still "DEAL-####" for the first (or only) creator —
+# unchanged, so every existing single-creator deal keeps its id — and gains a
+# "~<creator_id>" suffix for creators 2..N. "~" is URL-safe and never appears in a
+# uuid or a "DEAL-####" base, so splitting on it is unambiguous.
+DEAL_CREATOR_SEP = "~"
+
+def person_deal_id(campaign: dict, creator_id: Optional[str]) -> str:
+    base = make_deal_id(campaign)
+    ids = selected_creator_ids(campaign)
+    # First / only / legacy creator keeps the bare base id (backward compatible).
+    if not creator_id or not ids or str(creator_id) == ids[0]:
+        return base
+    return f"{base}{DEAL_CREATOR_SEP}{creator_id}"
+
+def split_deal_id(deal_id: str) -> tuple:
+    """(base_deal_id, creator_override|None) — pull the per-creator suffix off a deal id."""
+    if deal_id and DEAL_CREATOR_SEP in str(deal_id):
+        base, _, creator = str(deal_id).partition(DEAL_CREATOR_SEP)
+        return base, (creator or None)
+    return deal_id, None
+
+def deal_creator_scope(campaign: dict, creator_id: str) -> dict:
+    """A Mongo filter for one creator's deal-scoped rows (messages, cards, activity).
+    On a single-creator brief it's just campaign_id (nothing to disambiguate). On a
+    multi-creator brief it's this creator's rows PLUS untagged/legacy rows, so private
+    per-creator rows never leak into another creator's deal room."""
+    if len(selected_creator_ids(campaign)) > 1:
+        return {"campaign_id": campaign['id'],
+                "$or": [{"creator_id": creator_id}, {"creator_id": {"$in": [None, ""]}}, {"creator_id": {"$exists": False}}]}
+    return {"campaign_id": campaign['id']}
+
+
 async def find_campaign_by_any_id(any_id: str) -> Optional[dict]:
     """Look a campaign up by its real id, or by the DEAL-#### id the UI displays.
 
@@ -2486,6 +2529,7 @@ async def find_campaign_by_any_id(any_id: str) -> Optional[dict]:
     """
     if not any_id:
         return None
+    any_id, _ = split_deal_id(any_id)  # tolerate a per-creator "~<id>" suffix
     campaign = await db.campaigns.find_one({"$or": [{"id": any_id}, {"deal_id": any_id}]}, {"_id": 0})
     if campaign:
         return campaign
@@ -2763,11 +2807,14 @@ def map_sender_type(sender_id: str, campaign: dict, creator_id: str, sender_role
         return "brand"
     return sender_role or "system"
 
-async def insert_deal_activity(campaign: dict, actor_type: str, actor_name: str, event_type: str, message: str) -> dict:
+async def insert_deal_activity(campaign: dict, actor_type: str, actor_name: str, event_type: str, message: str, creator_id: Optional[str] = None) -> dict:
+    # creator_id scopes the event to one creator's deal on a multi-creator brief.
+    # Left None it's campaign-wide (shows in every hired creator's deal).
     event = {
         "id": str(uuid.uuid4()),
-        "deal_id": make_deal_id(campaign),
+        "deal_id": person_deal_id(campaign, creator_id),
         "campaign_id": campaign['id'],
+        "creator_id": creator_id,
         "timestamp": now_iso(),
         "actor_type": actor_type,
         "actor_name": actor_name,
@@ -2777,11 +2824,12 @@ async def insert_deal_activity(campaign: dict, actor_type: str, actor_name: str,
     await db.deal_activity.insert_one(event)
     return event
 
-async def insert_deal_system_message(campaign: dict, message: str) -> dict:
+async def insert_deal_system_message(campaign: dict, message: str, creator_id: Optional[str] = None) -> dict:
     msg = {
         "id": str(uuid.uuid4()),
-        "deal_id": make_deal_id(campaign),
+        "deal_id": person_deal_id(campaign, creator_id),
         "campaign_id": campaign['id'],
+        "creator_id": creator_id,
         "sender_id": "system",
         "sender_name": "System",
         "sender_type": "system",
@@ -2794,6 +2842,7 @@ async def insert_deal_system_message(campaign: dict, message: str) -> dict:
     return msg
 
 async def get_campaign_by_deal_id(deal_id: str) -> Optional[dict]:
+    deal_id, _ = split_deal_id(deal_id)  # a "~<creator_id>" suffix addresses the creator, not the campaign
     campaign = await db.campaigns.find_one({"$or": [{"deal_id": deal_id}, {"id": deal_id}]}, {"_id": 0})
     if campaign:
         return campaign
@@ -2802,7 +2851,9 @@ async def get_campaign_by_deal_id(deal_id: str) -> Optional[dict]:
 
 def ensure_deal_access(campaign: dict, current_user: dict):
     role = current_user.get('role')
-    if role == UserRole.CREATOR and campaign.get('selected_creator') == current_user['id']:
+    # A creator is on the deal if they're ANY of the hired creators — not just the
+    # first pick. Reading the singular field here locked creators 2..N out with a 403.
+    if role == UserRole.CREATOR and current_user['id'] in selected_creator_ids(campaign):
         return
     if role == UserRole.BUSINESS and campaign.get('business_id') == _brand_ws_id(current_user):
         return
@@ -2835,29 +2886,52 @@ async def settle_deal_lazily(campaign: dict) -> None:
 
 
 async def get_deal_context(deal_id: str, current_user: dict) -> dict:
-    campaign = await get_campaign_by_deal_id(deal_id)
+    base_deal_id, creator_override = split_deal_id(deal_id)
+    campaign = await get_campaign_by_deal_id(base_deal_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Deal not found")
     ensure_deal_access(campaign, current_user)
     # Lazy settlement (no cron needed): release a due payout / auto-approve a stale
     # submission for this specific deal when it is viewed (PRD 8.4 / 8.7).
     await settle_deal_lazily(campaign)
-    campaign = await get_campaign_by_deal_id(deal_id) or campaign
-    creator = await db.users.find_one({"id": campaign.get('selected_creator')}, {"_id": 0, "password": 0})
+    campaign = await get_campaign_by_deal_id(base_deal_id) or campaign
+
+    # Which creator's deal is this? A campaign now has one deal per hired creator.
+    #  - a "~<id>" suffix on the deal id names the creator explicitly (brand/admin view);
+    #  - otherwise a creator viewer sees THEIR OWN deal (so creators 2..N aren't shown
+    #    the first creator's deal), and a brand/admin defaults to the first creator.
+    hired = selected_creator_ids(campaign)
+    target_creator_id = creator_override
+    if not target_creator_id:
+        if current_user.get('role') == UserRole.CREATOR and current_user['id'] in hired:
+            target_creator_id = current_user['id']
+        else:
+            target_creator_id = hired[0] if hired else campaign.get('selected_creator')
+    if hired and target_creator_id not in hired:
+        raise HTTPException(status_code=404, detail="That creator is not on this deal")
+
+    creator = await db.users.find_one({"id": target_creator_id}, {"_id": 0, "password": 0})
     if not creator:
         raise HTTPException(status_code=404, detail="Creator not found for deal")
     brand = await db.users.find_one({"id": campaign.get('business_id')}, {"_id": 0, "password": 0})
     if not brand:
         raise HTTPException(status_code=404, detail="Brand not found for deal")
     my_bid = next((bid for bid in campaign.get('bids', []) if bid.get('creator_id') == creator['id']), None)
-    shipment = await db.shipments.find_one({"campaign_id": campaign['id']}, {"_id": 0})
-    receipt = await db.deal_receipts.find_one({"campaign_id": campaign['id']}, {"_id": 0})
+    # Per-creator scoping with a legacy fallback: prefer a doc tagged with this
+    # creator; if none exists (older single-creator deals never stored creator_id on
+    # the shipment/receipt/escrow), fall back to the untagged campaign-level doc.
+    shipment = (await db.shipments.find_one({"campaign_id": campaign['id'], "creator_id": creator['id']}, {"_id": 0})
+                or await db.shipments.find_one({"campaign_id": campaign['id'], "creator_id": {"$in": [None, ""]}}, {"_id": 0})
+                or (await db.shipments.find_one({"campaign_id": campaign['id']}, {"_id": 0}) if len(hired) <= 1 else None))
+    receipt = (await db.deal_receipts.find_one({"campaign_id": campaign['id'], "creator_id": creator['id']}, {"_id": 0})
+               or (await db.deal_receipts.find_one({"campaign_id": campaign['id']}, {"_id": 0}) if len(hired) <= 1 else None))
     work = await db.work_submissions.find_one(
         {"campaign_id": campaign['id'], "creator_id": creator['id']},
         {"_id": 0},
         sort=[("submitted_at", -1)]
     )
-    escrow = await db.escrow.find_one({"campaign_id": campaign['id']}, {"_id": 0})
+    escrow = (await db.escrow.find_one({"campaign_id": campaign['id'], "creator_id": creator['id']}, {"_id": 0})
+              or (await db.escrow.find_one({"campaign_id": campaign['id']}, {"_id": 0}) if len(hired) <= 1 else None))
     content_versions = await db.deal_content_submissions.find(
         {"campaign_id": campaign['id'], "creator_id": creator['id']},
         {"_id": 0}
@@ -2867,8 +2941,12 @@ async def get_deal_context(deal_id: str, current_user: dict) -> dict:
         {"_id": 0},
         sort=[("created_at", -1)]
     )
-    action_cards = await db.deal_action_cards.find({"campaign_id": campaign['id']}, {"_id": 0}).sort("created_at", 1).to_list(100)
-    activity = await db.deal_activity.find({"campaign_id": campaign['id']}, {"_id": 0}).sort("timestamp", 1).to_list(200)
+    # Action cards / activity: on a multi-creator brief, show this creator's rows plus
+    # any untagged (legacy or campaign-wide) rows, so one creator's cards don't leak
+    # into another's deal. Single-creator deals are unaffected (everything matches).
+    creator_scope = deal_creator_scope(campaign, creator['id'])
+    action_cards = await db.deal_action_cards.find(creator_scope, {"_id": 0}).sort("created_at", 1).to_list(100)
+    activity = await db.deal_activity.find(creator_scope, {"_id": 0}).sort("timestamp", 1).to_list(200)
     revision_history = await deal_revision_history(campaign['id'], creator['id'])
     return {
         "campaign": campaign,
@@ -2913,7 +2991,7 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
             {"sender_id": "system", "recipient_id": {"$in": [creator['id'], brand['id']]}}
         ]
     }, {"_id": 0}).sort("timestamp", 1).to_list(100)
-    deal_messages = await db.deal_messages.find({"campaign_id": campaign['id']}, {"_id": 0}).sort("created_at", 1).to_list(100)
+    deal_messages = await db.deal_messages.find(deal_creator_scope(campaign, creator['id']), {"_id": 0}).sort("created_at", 1).to_list(100)
     messages = []
     for msg in legacy_messages:
         messages.append({
@@ -2936,7 +3014,7 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
     messages.sort(key=lambda item: item.get('created_at') or '')
     unread_count = await db.messages.count_documents({"sender_id": brand['id'], "recipient_id": viewer['id'], "read": False})
     unread_count += await db.deal_messages.count_documents({
-        "campaign_id": campaign['id'],
+        **deal_creator_scope(campaign, creator['id']),
         "sender_id": {"$ne": viewer['id']},
         "read_by": {"$ne": viewer['id']}
     })
@@ -3001,7 +3079,7 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
     ]
 
     return {
-        "deal_id": make_deal_id(campaign),
+        "deal_id": person_deal_id(campaign, creator['id']),
         "campaign": campaign_details,
         "brand": {
             "id": brand.get('id'),
@@ -3026,7 +3104,7 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
         "content_submission": content_submission,
         "revision_tracker": revision_tracker,
         "chat_summary": {
-            "thread_id": make_deal_id(campaign),
+            "thread_id": person_deal_id(campaign, creator['id']),
             "messages": messages,
             "unread_count": unread_count
         },
@@ -7983,7 +8061,7 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         raise HTTPException(status_code=403, detail="Only creators can submit work")
 
     campaign = await db.campaigns.find_one({"id": data.campaign_id}, {"_id": 0})
-    if not campaign or campaign.get('selected_creator') != current_user['id']:
+    if not campaign or current_user['id'] not in selected_creator_ids(campaign):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     # PRD 8.3: gate submission on shipment receipt (and pause during disputes).
@@ -8021,8 +8099,8 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         }}
     )
 
-    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", "Content was submitted for brand review.")
-    await insert_deal_system_message(campaign, "Content was submitted and is awaiting brand review.")
+    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", "Content was submitted for brand review.", creator_id=current_user['id'])
+    await insert_deal_system_message(campaign, "Content was submitted and is awaiting brand review.", creator_id=current_user['id'])
 
     # Notify the brand that content is ready for review.
     if campaign.get("business_id"):
@@ -8782,14 +8860,17 @@ async def get_my_deals(current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
         raise HTTPException(status_code=403, detail="Only creators can access this")
 
+    # Match on selected_creators (any hired creator), not just the singular first pick,
+    # so a creator hired as #2..N on a multi-creator brief still sees their deal.
     campaigns = await db.campaigns.find({
-        "selected_creator": current_user['id'],
+        "$or": [{"selected_creators": current_user['id']}, {"selected_creator": current_user['id']}],
         "archived_by_creator": {"$ne": True},  # hide what the creator has archived
     }, {"_id": 0}).to_list(100)
 
     result = []
     for campaign in campaigns:
-        context = await get_deal_context(make_deal_id(campaign), current_user)
+        # This creator's own deal (get_deal_context resolves it to the viewer).
+        context = await get_deal_context(person_deal_id(campaign, current_user['id']), current_user)
         result.append(await build_deal_response(context, current_user))
 
     return result
@@ -8801,14 +8882,17 @@ async def get_business_deals(current_user: dict = Depends(get_current_user)):
 
     campaigns = await db.campaigns.find({
         "business_id": _brand_ws_id(current_user),  # team members see the owner's deals
-        "selected_creator": {"$nin": [None, ""]},
+        "$or": [{"selected_creators": {"$nin": [None, [], ""]}}, {"selected_creator": {"$nin": [None, ""]}}],
         "archived_by_brand": {"$ne": True},  # hide what the brand has archived
     }, {"_id": 0}).to_list(200)
 
     result = []
     for campaign in campaigns:
-        context = await get_deal_context(make_deal_id(campaign), current_user)
-        result.append(await build_deal_response(context, current_user))
+        # One deal per hired creator — a multi-creator brief yields several deal rows,
+        # each addressed by its own per-creator deal id.
+        for cid in selected_creator_ids(campaign):
+            context = await get_deal_context(person_deal_id(campaign, cid), current_user)
+            result.append(await build_deal_response(context, current_user))
 
     return result
 
@@ -8922,7 +9006,7 @@ async def submit_deal_receipt(deal_id: str, data: DealReceiptSubmit, current_use
         raise HTTPException(status_code=403, detail="Only creators can submit receipts")
     context = await get_deal_context(deal_id, current_user)
     campaign = context['campaign']
-    if campaign.get('selected_creator') != current_user['id']:
+    if current_user['id'] not in selected_creator_ids(campaign):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     # A receipt can only be confirmed once the brand has actually shipped the
@@ -8996,7 +9080,7 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         raise HTTPException(status_code=403, detail="Only creators can submit content")
     context = await get_deal_context(deal_id, current_user)
     campaign = context['campaign']
-    if campaign.get('selected_creator') != current_user['id']:
+    if current_user['id'] not in selected_creator_ids(campaign):
         raise HTTPException(status_code=403, detail="Not authorized")
     # PRD 8.3/9.3: must have received the product (if required) and no open dispute.
     await ensure_ready_for_content(campaign)
@@ -9091,8 +9175,8 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         },
         "updated_at": now_iso(),
     }})
-    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", f"Content version {version} submitted for review.")
-    await insert_deal_system_message(campaign, f"Content version {version} was submitted and is awaiting brand review.")
+    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", f"Content version {version} submitted for review.", creator_id=current_user['id'])
+    await insert_deal_system_message(campaign, f"Content version {version} was submitted and is awaiting brand review.", creator_id=current_user['id'])
 
     # Notify the brand that content is ready for review. The sibling /work/submit
     # path did this; this deal-room path (the one the Deal Room actually uses) did
@@ -9118,7 +9202,7 @@ async def submit_revision_response(deal_id: str, data: DealRevisionResponseSubmi
         raise HTTPException(status_code=400, detail="Invalid revision response")
     context = await get_deal_context(deal_id, current_user)
     campaign = context['campaign']
-    if campaign.get('selected_creator') != current_user['id']:
+    if current_user['id'] not in selected_creator_ids(campaign):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     response_doc = {
@@ -9151,8 +9235,8 @@ async def submit_revision_response(deal_id: str, data: DealRevisionResponseSubmi
     # /deals/{deal_id}/escalate) turns it into a real dispute. So here we just record
     # the pushback and nudge both sides to talk it out in the deal chat.
     event_type = "revision_requested" if data.response == "accepted" else "revision_pushback"
-    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), event_type, f"Creator {label}.")
-    await insert_deal_system_message(campaign, f"Creator {label}.")
+    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), event_type, f"Creator {label}.", creator_id=current_user['id'])
+    await insert_deal_system_message(campaign, f"Creator {label}.", creator_id=current_user['id'])
 
     # Tell the brand — previously this was recorded silently and nothing happened.
     if campaign.get('business_id'):
@@ -9173,7 +9257,7 @@ async def get_deal_chat(deal_id: str, current_user: dict = Depends(get_current_u
     context = await get_deal_context(deal_id, current_user)
     deal = await build_deal_response(context, current_user)
     await db.deal_messages.update_many(
-        {"campaign_id": context['campaign']['id'], "sender_id": {"$ne": current_user['id']}},
+        {**deal_creator_scope(context['campaign'], context['creator']['id']), "sender_id": {"$ne": current_user['id']}},
         {"$addToSet": {"read_by": current_user['id']}}
     )
     return deal["chat_summary"]
@@ -9196,8 +9280,11 @@ async def post_deal_chat(deal_id: str, data: DealChatSubmit, current_user: dict 
 
     message_doc = {
         "id": str(uuid.uuid4()),
-        "deal_id": make_deal_id(campaign),
+        "deal_id": person_deal_id(campaign, context['creator']['id']),
         "campaign_id": campaign['id'],
+        # Scope the message to THIS deal's creator so a brand's chat with one hired
+        # creator never surfaces in another creator's deal room.
+        "creator_id": context['creator']['id'],
         "sender_id": current_user['id'],
         "sender_name": current_user.get('nickname') or current_user.get('email') or 'User',
         "sender_type": sender_type,
@@ -10213,7 +10300,7 @@ async def submit_review(data: ReviewSubmit, current_user: dict = Depends(get_cur
         campaign = await db.campaigns.find_one({"id": data.campaign_id})
         if not campaign:
             raise HTTPException(status_code=404, detail="Deal not found")
-        if campaign.get("selected_creator") != current_user['id'] or campaign.get("business_id") != data.business_id:
+        if current_user['id'] not in selected_creator_ids(campaign) or campaign.get("business_id") != data.business_id:
             raise HTTPException(status_code=403, detail="You can only review a brand you've completed a deal with")
         if campaign.get("status") != CampaignStatus.COMPLETED:
             raise HTTPException(status_code=400, detail="You can review a brand only after the deal is completed")
@@ -10327,7 +10414,7 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
 @api_router.post("/shipment/receive")
 async def receive_shipment(data: ShipmentReceive, current_user: dict = Depends(get_current_user)):
     campaign = await db.campaigns.find_one({"id": data.campaign_id})
-    if not campaign or campaign['selected_creator'] != current_user['id']:
+    if not campaign or current_user['id'] not in selected_creator_ids(campaign):
         raise HTTPException(status_code=403, detail="Not authorized")
     
     update_data = {
