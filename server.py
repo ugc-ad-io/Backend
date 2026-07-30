@@ -2081,19 +2081,33 @@ def campaign_per_asset_budget(campaign: dict) -> float:
     return budget_min or budget_max
 
 
-def campaign_budget_total(campaign: dict) -> float:
-    """TOTAL budget a brief commits = per-asset budget x total deliverable quantity.
+def campaign_creators_wanted(campaign: dict) -> int:
+    """How many creators this brief hires (>=1)."""
+    try:
+        return max(1, int(campaign.get("creators_wanted") or 1))
+    except (TypeError, ValueError):
+        return 1
 
-    Previously this returned the per-asset figure, so a brief asking for 3 Reels only
-    ever held ONE video's budget while the creator owed three — the brand was
-    under-charged and the payout maths was wrong.
 
-    LEGACY SAFETY: total_deliverable_quantity() returns 1 when a brief has no
-    deliverable_items, so every pre-existing campaign yields exactly the old value.
-    Refunds are unaffected either way — refund_campaign_reservation() pays back the
-    escrow row's STORED reserved_amount rather than recomputing it here.
-    """
+def campaign_slot_budget(campaign: dict) -> float:
+    """Budget committed to ONE creator = per-asset budget x total deliverable quantity.
+    A brief asking each creator for 3 Reels holds three videos' worth per creator."""
     return campaign_per_asset_budget(campaign) * total_deliverable_quantity(campaign)
+
+
+def campaign_budget_total(campaign: dict) -> float:
+    """TOTAL budget a brief commits = one creator's slot budget x creators_wanted.
+
+    A brief that pays ₹3,000 and hires 4 creators commits ₹12,000. Multiplying by the
+    creator count is what lets a multi-creator brief reserve every slot up front (so
+    creators 2..N are funded from the reservation, not a fresh wallet charge) and what
+    lets "finish hiring early" refund the unfilled slots.
+
+    LEGACY SAFETY: total_deliverable_quantity() returns 1 for briefs with no
+    deliverable_items and creators_wanted defaults to 1, so every pre-existing
+    single-creator campaign yields exactly the old value.
+    """
+    return campaign_slot_budget(campaign) * campaign_creators_wanted(campaign)
 
 async def reserve_campaign_budget(user: dict, campaign_doc: dict) -> Optional[dict]:
     """Hold a campaign's full budget from the brand wallet at post time so it shows as
@@ -2118,6 +2132,11 @@ async def reserve_campaign_budget(user: dict, campaign_doc: dict) -> Optional[di
         "creator_id": None,
         "amount": amount,
         "reserved_amount": amount,
+        # Per-slot bookkeeping so a multi-creator brief can consume one creator's
+        # share at a time and refund the slots that never get filled.
+        "slot_amount": round(campaign_slot_budget(campaign_doc), 2),
+        "slots_total": campaign_creators_wanted(campaign_doc),
+        "slots_filled": 0,
         "status": "reserved",
         "funded": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -6723,41 +6742,44 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
     brand_fee = brand_commission(deal_amount)
     brand_total = round(deal_amount + brand_fee, 2)
 
-    # The campaign budget was reserved on the wallet at post time. Convert that
-    # reservation into the deal instead of charging again: refund any surplus
-    # (reserved budget − deal total), or top up the small shortfall if commission
-    # pushes the deal above the reserved budget.
+    # The campaign budget was reserved on the wallet at post time — ONE slot's worth
+    # per creator the brief wants to hire. Draw down this creator's single slot from
+    # that pool instead of charging the wallet again: refund the surplus if they were
+    # hired for less than the slot's reserve, or top up the shortfall if commission
+    # pushes their deal above it. The pool lives on (with the remaining slots) until
+    # every slot is filled, when it's deleted; "finish hiring early" refunds whatever
+    # is left. A brief with no reservation (posted before budget-at-post) charges now.
     reservation = await db.escrow.find_one({"campaign_id": campaign_id, "status": "reserved"}, {"_id": 0})
+    funded = True
     if reservation:
-        escrow_id = reservation["id"]
-        reserved = to_float(reservation.get("reserved_amount") or reservation.get("amount"))
-        funded = True
-        if brand_total <= reserved:
-            surplus = round(reserved - brand_total, 2)
+        slots_total = int(reservation.get("slots_total") or wanted or 1)
+        slot_amount = to_float(reservation.get("slot_amount"))
+        if slot_amount <= 0:  # legacy reservation without per-slot bookkeeping
+            slot_amount = round(to_float(reservation.get("reserved_amount") or reservation.get("amount")) / max(1, slots_total), 2)
+        if brand_total <= slot_amount:
+            surplus = round(slot_amount - brand_total, 2)
             if surplus > 0:
                 await db.users.update_one({"id": current_user['id']}, {"$inc": {"balance": surplus}})
         else:
-            shortfall = round(brand_total - reserved, 2)
+            shortfall = round(brand_total - slot_amount, 2)
             topup = await db.users.update_one(
                 {"id": current_user['id'], "balance": {"$gte": shortfall}},
                 {"$inc": {"balance": -shortfall}},
             )
             funded = topup.modified_count == 1
-        escrow_doc = {
-            "id": escrow_id,
-            "campaign_id": campaign_id,
-            "business_id": _brand_ws_id(current_user),
-            "creator_id": creator_id,
-            "amount": deal_amount,
-            "brand_commission_amount": brand_fee,
-            "brand_commission_percent": commission_percent(),
-            "brand_charged": brand_total,
-            "reserved_amount": reserved,
-            "funded": funded,
-            "status": "held",
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        await db.escrow.update_one({"id": escrow_id}, {"$set": escrow_doc})
+        # Draw this slot out of the pool. Delete the pool once every slot is filled so
+        # its leftover (now ₹0) never lingers as a phantom "Budget Reserved" row.
+        remaining = round(max(0.0, to_float(reservation.get("reserved_amount") or reservation.get("amount")) - slot_amount), 2)
+        slots_filled = int(reservation.get("slots_filled") or 0) + 1
+        if slots_filled >= slots_total or remaining <= 0:
+            await db.escrow.delete_one({"id": reservation["id"]})
+        else:
+            await db.escrow.update_one(
+                {"id": reservation["id"]},
+                {"$set": {"reserved_amount": remaining, "amount": remaining,
+                          "slots_filled": slots_filled,
+                          "updated_at": datetime.now(timezone.utc).isoformat()}},
+            )
     else:
         # Legacy path (campaign posted before budget-at-post reservation): charge now.
         # Best-effort debit: only deduct if the wallet can cover it.
@@ -6765,20 +6787,26 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
             {"id": current_user['id'], "balance": {"$gte": brand_total}},
             {"$inc": {"balance": -brand_total}},
         )
-        escrow_doc = {
-            "id": escrow_id,
-            "campaign_id": campaign_id,
-            "business_id": _brand_ws_id(current_user),
-            "creator_id": creator_id,
-            "amount": deal_amount,
-            "brand_commission_amount": brand_fee,
-            "brand_commission_percent": commission_percent(),
-            "brand_charged": brand_total,
-            "funded": debit.modified_count == 1,
-            "status": "held",
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }
-        await db.escrow.insert_one(escrow_doc)
+        funded = debit.modified_count == 1
+        slot_amount = brand_total
+    # One held escrow PER creator (a fresh id — never the pool's), so each hire has its
+    # own escrow that get_deal_context / payout can resolve by creator_id.
+    escrow_doc = {
+        "id": escrow_id,
+        "campaign_id": campaign_id,
+        "business_id": _brand_ws_id(current_user),
+        "creator_id": creator_id,
+        "amount": deal_amount,
+        "brand_commission_amount": brand_fee,
+        "brand_commission_percent": commission_percent(),
+        "brand_charged": brand_total,
+        "reserved_amount": slot_amount,
+        "funded": funded,
+        "status": "held",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.escrow.insert_one(escrow_doc)
     
     # Add this creator to the roster. Keep the brief ACTIVE (still biddable, still
     # visible in creator Browse) while slots remain — only flip to IN_PROGRESS once
@@ -6909,6 +6937,75 @@ You can now communicate directly with {creator_display} to coordinate the work. 
         "creators_hired": len(already) + 1,
         "slots_left": max(0, slots_left),
         "fully_staffed": fully_staffed,
+    }
+
+
+@api_router.post("/campaigns/{campaign_id}/finish-hiring")
+async def finish_hiring(campaign_id: str, current_user: dict = Depends(get_current_user)):
+    """Close a multi-creator brief early with the creators already hired.
+
+    A brand that asked for 5 creators but only wants to keep the 2 it hired calls this
+    to stop the brief: it's removed from creator Browse, the bid list closes, and the
+    reserved budget for the UNFILLED slots is refunded to the brand's wallet."""
+    campaign = await db.campaigns.find_one({"id": campaign_id})
+    if not campaign or campaign.get("business_id") != _brand_ws_id(current_user):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if current_user.get("role") != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only the brand can close its own brief")
+
+    hired = selected_creator_ids(campaign)
+    wanted = campaign_creators_wanted(campaign)
+    if not hired:
+        raise HTTPException(status_code=400, detail="No creator is hired yet. Cancel the brief instead of finishing it.")
+    if len(hired) >= wanted:
+        raise HTTPException(status_code=400, detail="This brief is already fully staffed — nothing to close.")
+
+    # Refund the pool that was still reserved for the slots you're not filling.
+    reservation = await db.escrow.find_one({"campaign_id": campaign_id, "status": "reserved"}, {"_id": 0})
+    refunded = 0.0
+    if reservation:
+        refunded = round(to_float(reservation.get("reserved_amount") or reservation.get("amount")), 2)
+        if refunded > 0:
+            await db.users.update_one({"id": current_user["id"]}, {"$inc": {"balance": refunded}})
+            await db.wallet_ledger.insert_one({
+                "id": str(uuid.uuid4()),
+                "user_id": current_user["id"],
+                "campaign_id": campaign_id,
+                "type": "budget_refund",
+                "amount": refunded,
+                "direction": "credit",
+                "status": "success",
+                "note": f"Unfilled creator slots refunded — hired {len(hired)} of {wanted}.",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+        # Mark the pool refunded (kept, not deleted, so it shows as a "Budget Refund"
+        # row in the ledger) and zero its held amount so it can't be drawn again.
+        await db.escrow.update_one(
+            {"id": reservation["id"]},
+            {"$set": {"status": "refunded", "reserved_amount": 0, "amount": refunded,
+                      "refunded_at": datetime.now(timezone.utc).isoformat()}},
+        )
+
+    # Shrink the brief to the creators actually hired and take it out of Browse.
+    await db.campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {"creators_wanted": len(hired), "status": CampaignStatus.IN_PROGRESS,
+                  "hiring_closed_at": datetime.now(timezone.utc).isoformat()}},
+    )
+
+    await notify_user(
+        current_user["id"],
+        "Hiring closed",
+        (f"You kept {len(hired)} creator(s) on '{campaign.get('title', 'your brief')}' and closed the rest. "
+         + (f"₹{int(refunded):,} for the unfilled slots is back in your wallet." if refunded > 0 else "")).strip(),
+        link="/dashboard/business/wallet",
+        ntype="success",
+    )
+    return {
+        "message": "Hiring closed",
+        "creators_hired": len(hired),
+        "slots_closed": wanted - len(hired),
+        "refunded": refunded,
     }
 
 # Chat Routes
