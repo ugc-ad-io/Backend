@@ -6623,7 +6623,23 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
     selected_bid = next((bid for bid in campaign.get('bids', []) if bid['creator_id'] == creator_id), None)
     if not selected_bid:
         raise HTTPException(status_code=404, detail="Bid not found")
-    
+
+    # Multi-creator hiring: a brief can hire `creators_wanted` creators. `selected_creators`
+    # is the source of truth (the singular `selected_creator` is kept only as a legacy
+    # mirror of the most-recent pick). Guard against re-picking the same creator and
+    # against overshooting the number of slots the brand asked for.
+    wanted = max(1, int(campaign.get("creators_wanted") or 1))
+    already = [str(c) for c in (campaign.get("selected_creators") or []) if c]
+    if not already and campaign.get("selected_creator"):
+        already = [str(campaign["selected_creator"])]
+    if creator_id in already:
+        raise HTTPException(status_code=400, detail="This creator is already hired on this brief.")
+    if len(already) >= wanted:
+        raise HTTPException(status_code=400, detail=f"All {wanted} creator slot(s) on this brief are already filled.")
+    first_pick = len(already) == 0
+    slots_left = wanted - (len(already) + 1)
+    fully_staffed = slots_left <= 0
+
     escrow_id = str(uuid.uuid4())
     deal_amount = float(selected_bid['amount'])
     brand_fee = brand_commission(deal_amount)
@@ -6686,14 +6702,25 @@ async def select_creator(campaign_id: str, creator_id: str, current_user: dict =
         }
         await db.escrow.insert_one(escrow_doc)
     
+    # Add this creator to the roster. Keep the brief ACTIVE (still biddable, still
+    # visible in creator Browse) while slots remain — only flip to IN_PROGRESS once
+    # every slot is filled, otherwise the first pick would close the brief to everyone
+    # else and no second creator could ever be hired.
+    set_fields = {
+        # legacy single-creator reads (e.g. the brand's "Creator" card) point at the
+        # FIRST pick so that card stays stable as more creators are added.
+        "selected_creator": already[0] if already else creator_id,
+        "escrow_id": escrow_id,
+        "status": CampaignStatus.IN_PROGRESS if fully_staffed else CampaignStatus.ACTIVE,
+    }
+    if first_pick:
+        set_fields["work_started_at"] = datetime.now(timezone.utc).isoformat()
     await db.campaigns.update_one(
         {"id": campaign_id},
-        {"$set": {
-            "selected_creator": creator_id,
-            "status": CampaignStatus.IN_PROGRESS,
-            "escrow_id": escrow_id,
-            "work_started_at": datetime.now(timezone.utc).isoformat()
-        }}
+        {
+            "$set": set_fields,
+            "$addToSet": {"selected_creators": creator_id, "escrow_ids": escrow_id},
+        }
     )
     
     # Send automated system messages to both parties
@@ -6799,7 +6826,11 @@ You can now communicate directly with {creator_display} to coordinate the work. 
         "creator_nickname": creator['nickname'],
         "creator_name": creator_display,
         "escrow_id": escrow_id,
-        "amount": selected_bid['amount']
+        "amount": selected_bid['amount'],
+        "creators_wanted": wanted,
+        "creators_hired": len(already) + 1,
+        "slots_left": max(0, slots_left),
+        "fully_staffed": fully_staffed,
     }
 
 # Chat Routes
