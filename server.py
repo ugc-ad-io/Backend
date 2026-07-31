@@ -8889,6 +8889,14 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
     if claim.modified_count == 0:
         raise HTTPException(status_code=409, detail="This submission is no longer awaiting review — it was just approved or revised. Refresh to see the latest state.")
 
+    # Clear the creator's response to the PREVIOUS revision round — it's keyed only by
+    # (campaign_id, creator_id), not by round, so without this the tracker kept showing
+    # "You accepted this revision" (from round 1) on a brand-new round 2 request the
+    # creator hadn't responded to yet.
+    await db.deal_revision_responses.delete_one(
+        {"campaign_id": work['campaign_id'], "creator_id": work['creator_id']}
+    )
+
     # Take the version row out of "submitted" too. Leaving it there is what let the
     # approve sweep later stamp every past version as Approved.
     sent_back = await db.deal_content_submissions.find_one(
