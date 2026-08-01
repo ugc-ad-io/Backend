@@ -915,18 +915,18 @@
 }
 
 .msg-system-pill {
+  width: 100%;
+  max-width: 100%;
   text-align: center;
-  background: rgba(115, 135, 255, 0.08);
-  border-radius: 12px;
-  padding: 14px 24px;
+  background: #eef2ff;
+  color: #667085;
+  border-radius: 15px;
+  padding: 10px 12px;
   font-size: 0.85rem;
-  color: #7387FF;
-  margin: 16px auto;
-  align-self: center;
-  max-width: 85%;
-  border: 1px solid rgba(115, 135, 255, 0.15);
-  font-weight: 600;
+  margin: 10px 0;
+  font-weight: 700;
   font-family: 'Inter', sans-serif;
+  overflow-wrap: anywhere;
 }
 
 .msg-quick-chips {

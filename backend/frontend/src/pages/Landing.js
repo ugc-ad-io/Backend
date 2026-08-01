@@ -400,6 +400,7 @@ export default function Landing() {
         .lp-root {
           min-height: 100vh;
           font-family: 'Inter', sans-serif;
+          background: #ffffff;
         }
 
         /* ── Navbar ───────────────────────────────────────────────────────── */
@@ -463,7 +464,7 @@ export default function Landing() {
           display: flex;
           align-items: center;
           padding: 140px 8% 80px;
-          background: linear-gradient(160deg, #050510 0%, #0D0B26 100%);
+          background: linear-gradient(160deg, #ffffff 0%, #f8fafc 100%);
           overflow: hidden;
         }
 
@@ -675,7 +676,7 @@ export default function Landing() {
 
         /* ── Brands Scroll ────────────────────────────────────────────────── */
         .lp-brands {
-          background: #0a0a0a;
+          background: #f8fafc;
           padding: 60px 0;
           overflow: hidden;
         }
@@ -696,7 +697,7 @@ export default function Landing() {
         .lp-brand-item {
           font-size: 1.5rem;
           font-weight: 700;
-          color: #F8FAFC;
+          color: #0F172A;
           white-space: nowrap;
           letter-spacing: 0.02em;
           opacity: 0.6;

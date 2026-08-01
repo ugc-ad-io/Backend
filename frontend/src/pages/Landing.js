@@ -400,6 +400,7 @@ export default function Landing() {
         .lp-root {
           min-height: 100vh;
           font-family: 'Inter', sans-serif;
+          background: #ffffff;
         }
 
         /* ── Navbar ───────────────────────────────────────────────────────── */
@@ -463,7 +464,7 @@ export default function Landing() {
           display: flex;
           align-items: center;
           padding: 140px 8% 80px;
-          background: linear-gradient(160deg, #050510 0%, #0D0B26 100%);
+          background: linear-gradient(160deg, #ffffff 0%, #f8fafc 100%);
           overflow: hidden;
         }
 
@@ -675,7 +676,7 @@ export default function Landing() {
 
         /* ── Brands Scroll ────────────────────────────────────────────────── */
         .lp-brands {
-          background: #0a0a0a;
+          background: #f8fafc;
           padding: 60px 0;
           overflow: hidden;
         }
@@ -696,7 +697,7 @@ export default function Landing() {
         .lp-brand-item {
           font-size: 1.5rem;
           font-weight: 700;
-          color: #F8FAFC;
+          color: #0F172A;
           white-space: nowrap;
           letter-spacing: 0.02em;
           opacity: 0.6;
@@ -722,6 +723,10 @@ export default function Landing() {
           padding: 120px 8%;
           background: #ffffff;
           overflow: hidden;
+        }
+
+        .lp-root, body {
+          background: #ffffff;
         }
 
         .lp-features__inner {
@@ -778,8 +783,8 @@ export default function Landing() {
           background: #ffffff;
           padding: 32px 26px 26px;
           border-radius: 20px;
-          border: 1.5px solid #F1F5F9;
-          box-shadow: 0 2px 12px rgba(0, 0, 0, 0.05);
+          border: 1.5px solid #E8EEFF;
+          box-shadow: 0 2px 12px rgba(99, 102, 241, 0.06);
           cursor: default;
           transition: border-color 0.3s ease, box-shadow 0.3s ease, transform 0.3s ease;
           position: relative;
