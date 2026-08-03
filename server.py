@@ -5494,13 +5494,42 @@ async def deactivate_profile(current_user: dict = Depends(get_current_user)):
         {"id": current_user['id']},
         {"$set": {"active": False, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
+    # critical=True: an account-status change must reach the inbox regardless of
+    # quiet hours / notification prefs — this isn't a marketing/digest email.
+    await notify_user(
+        current_user['id'],
+        "Your account has been deactivated",
+        "Your UGCad.io account is now hidden from brands/creators. Log back in anytime to reactivate it automatically.",
+        ntype="warning",
+        email=True,
+        critical=True,
+    )
     return {"message": "Account deactivated"}
 
 
 @api_router.delete("/profile")
 async def delete_profile(current_user: dict = Depends(get_current_user)):
     """Permanently delete the signed-in user's account."""
+    # Capture the address/name BEFORE deleting — notify_user looks the user up by id,
+    # which would find nothing once the row is gone.
+    addr = current_user.get('email')
+    name = first_name_of(current_user, fallback="")
     await db.users.delete_one({"id": current_user['id']})
+    if addr:
+        html = _notification_email_html(
+            "Your account has been deleted",
+            "Your UGCad.io account and profile have been permanently deleted, as requested. "
+            "If this wasn't you, contact support immediately.",
+            None,
+            name,
+        )
+        try:
+            res = await send_email(addr, "Your account has been deleted", html,
+                                    "Your UGCad.io account and profile have been permanently deleted, as requested.")
+            if isinstance(res, dict) and (res.get("skipped") or res.get("error")):
+                logger.error(f"[email] NOT delivered to {addr} ('Account deleted'): {res}")
+        except Exception as e:
+            logger.exception(f"[email] failed sending account-deletion confirmation to {addr}: {e}")
     return {"message": "Account deleted"}
 
 @api_router.put("/profile/update-info")
