@@ -97,4 +97,50 @@ function applicationRevision({ name, role, message, items, frontendUrl } = {}) {
   };
 }
 
-module.exports = { applicationApproved, applicationRejected, applicationRevision };
+/**
+ * Account lifecycle emails — sent from the deactivate/delete routes in server.js.
+ * `name` — recipient display name, `frontendUrl` — base app URL for the login link.
+ */
+
+function accountDeactivated({ name, frontendUrl } = {}) {
+  const base = trimUrl(frontendUrl);
+  return {
+    subject: 'Your UGCad.io account has been deactivated',
+    html: baseTemplate({
+      title: 'Account deactivated',
+      content: `
+        <h2 style="margin:0 0 12px;font-size:22px;color:#15163a;">Hi${name ? ` ${name}` : ''},</h2>
+        <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">
+          Your UGCad.io account has been <strong>deactivated</strong>. Your profile is now hidden and
+          you won't receive new messages or campaign matches while it's off.
+        </p>
+        <p style="margin:0 0 24px;font-size:15px;line-height:1.6;color:#4a4f74;">
+          Changed your mind? Just log back in any time — your account reactivates automatically.
+        </p>
+        <p style="margin:0 0 24px;">${button('Log back in', `${base}/auth`)}</p>
+        <p style="margin:0;font-size:13px;color:#9296ba;">If you didn't request this, reply to this email right away.</p>
+      `,
+      footer: 'You received this because your UGCad.io account status changed.'
+    })
+  };
+}
+
+function accountDeleted({ name } = {}) {
+  return {
+    subject: 'Your UGCad.io account has been deleted',
+    html: baseTemplate({
+      title: 'Account deleted',
+      content: `
+        <h2 style="margin:0 0 12px;font-size:22px;color:#15163a;">Hi${name ? ` ${name}` : ''},</h2>
+        <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">
+          Your UGCad.io account and associated profile data have been <strong>permanently deleted</strong>,
+          as requested. This can't be undone, and there's no need to do anything else.
+        </p>
+        <p style="margin:0;font-size:13px;color:#9296ba;">If you didn't request this, reply to this email right away so we can investigate.</p>
+      `,
+      footer: 'You received this because your UGCad.io account was deleted.'
+    })
+  };
+}
+
+module.exports = { applicationApproved, applicationRejected, applicationRevision, accountDeactivated, accountDeleted };

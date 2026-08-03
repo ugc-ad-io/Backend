@@ -1628,16 +1628,33 @@ app.post('/api/profile/upload-banner', auth, (req, res) => photoUpload(req, res,
 // Deactivate: hide the account (active:false). Reactivated on next login.
 app.post('/api/profile/deactivate', auth, async (req, res) => {
   try {
-    await User.findByIdAndUpdate(req.user.id, { $set: { active: false } });
+    const user = await User.findByIdAndUpdate(req.user.id, { $set: { active: false } }, { new: true });
     res.json({ message: 'Account deactivated' });
+
+    // Notify the user by email (fire-and-forget — never block/fail the action on an email hiccup).
+    if (user?.email) {
+      const name = user.nickname || user.full_name || '';
+      const mail = applicationEmails.accountDeactivated({ name, frontendUrl: process.env.FRONTEND_URL });
+      sendEmail({ to: user.email, subject: mail.subject, html: mail.html })
+        .catch((err) => console.error('[profile/deactivate] email failed:', err.message));
+    }
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
 // Delete: permanently remove the account.
 app.delete('/api/profile', auth, async (req, res) => {
   try {
-    await User.findByIdAndDelete(req.user.id);
+    // findByIdAndDelete returns the deleted doc, so email/name are still available
+    // here even though the record itself is already gone.
+    const user = await User.findByIdAndDelete(req.user.id);
     res.json({ message: 'Account deleted' });
+
+    if (user?.email) {
+      const name = user.nickname || user.full_name || '';
+      const mail = applicationEmails.accountDeleted({ name });
+      sendEmail({ to: user.email, subject: mail.subject, html: mail.html })
+        .catch((err) => console.error('[profile/delete] email failed:', err.message));
+    }
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
