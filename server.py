@@ -3195,6 +3195,12 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
     # Block a suspended account (auto-lifts once the suspension window passes).
     await enforce_suspension(user)
 
+    # Self-deactivation (/profile/deactivate) hides the account until the user
+    # logs back in, per that endpoint's contract.
+    if user.get('active') is False:
+        await db.users.update_one({"id": user['id']}, {"$set": {"active": True}})
+        user['active'] = True
+
     # Check if 2FA is enabled
     if user.get('two_factor_enabled'):
         if not totp_token:
@@ -3318,6 +3324,13 @@ async def google_auth(data: GoogleAuthRequest):
         if user.get("banned", False):
             raise HTTPException(status_code=403, detail=f"Account banned: {user.get('ban_reason', 'Account suspended')}")
         await enforce_suspension(user)
+
+        # Self-deactivation hides the account until the user logs back in,
+        # mirroring /auth/login.
+        if user.get('active') is False:
+            link_active = {"active": True}
+            await db.users.update_one({"email": email}, {"$set": link_active})
+            user.update(link_active)
 
         # Backfill/link fields on the existing account. Match by email (always
         # present + unique) since a legacy account may have no "id" field.
