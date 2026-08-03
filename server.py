@@ -3708,6 +3708,7 @@ async def get_creator_directory(
         "approval_status": ApprovalStatus.APPROVED,
         "profile_completed": True,
         "creator_directory_visible": {"$ne": False},
+        "active": {"$ne": False},
     }, {"_id": 0}).to_list(10000)
 
     # Batch the review aggregates (avg rating + count) for ALL creators in one query,
