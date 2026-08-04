@@ -320,6 +320,9 @@ class ReviewSubmit(BaseModel):
 
 class ShipmentUpdate(BaseModel):
     campaign_id: str
+    # Which hired creator this shipment is for, on a multi-creator brief. Optional
+    # for backward compatibility — omitted, it defaults to the first hired creator.
+    creator_id: Optional[str] = None
     tracking_number: str
     courier_name: Optional[str] = None
     courier_tracking_url: Optional[str] = None
@@ -336,6 +339,10 @@ class ShipmentReceive(BaseModel):
 
 class ShippingAddressSubmit(BaseModel):
     campaign_id: Optional[str] = None  # when set, checks if both parties' addresses are in
+    # Brand-only: which hired creator's delivery address to check readiness against
+    # on a multi-creator brief. Ignored for a creator caller (they can only ever be
+    # confirming their own address).
+    creator_id: Optional[str] = None
     full_name: str
     phone: str
     line1: str
@@ -2524,6 +2531,47 @@ def selected_creator_ids(campaign: dict) -> List[str]:
     if ids:
         return ids
     return [str(campaign["selected_creator"])] if campaign.get("selected_creator") else []
+
+
+def resolve_shipment_creator_id(campaign: dict, current_user: dict, requested_creator_id: Optional[str] = None) -> Optional[str]:
+    """Which hired creator a shipment action targets. `db.shipments` used to be
+    keyed by campaign_id alone, so on a multi-creator brief every creator's
+    shipment silently overwrote the last one's. A creator can only ever act on
+    their own shipment (client-supplied id is ignored for them, for security); a
+    brand/admin may target a specific creator via requested_creator_id, defaulting
+    to the first hired creator so old callers that don't pass one keep working."""
+    ids = selected_creator_ids(campaign)
+    if current_user.get('role') == UserRole.CREATOR:
+        return current_user['id']
+    if requested_creator_id and requested_creator_id in ids:
+        return requested_creator_id
+    return ids[0] if ids else None
+
+
+async def shipment_match_filter(campaign_id: str, creator_id: Optional[str]) -> dict:
+    """Filter to find/upsert this creator's shipment doc. Migrates an old
+    campaign_id-only doc (from before shipments were creator-scoped) in place the
+    first time a creator-aware write touches it, instead of leaving it as an
+    orphaned duplicate once creator_id starts getting set going forward."""
+    if not creator_id:
+        return {"campaign_id": campaign_id}
+    exact = await db.shipments.find_one({"campaign_id": campaign_id, "creator_id": creator_id}, {"_id": 1})
+    if exact:
+        return {"campaign_id": campaign_id, "creator_id": creator_id}
+    legacy = await db.shipments.find_one({"campaign_id": campaign_id, "creator_id": {"$in": [None, ""]}}, {"_id": 1})
+    if legacy:
+        return {"_id": legacy["_id"]}
+    return {"campaign_id": campaign_id, "creator_id": creator_id}
+
+
+async def find_shipment(campaign_id: str, creator_id: Optional[str]) -> Optional[dict]:
+    """Read-side counterpart of shipment_match_filter: this creator's shipment if
+    it exists, else the legacy campaign-wide doc (pre-multi-creator shipments)."""
+    if creator_id:
+        sh = await db.shipments.find_one({"campaign_id": campaign_id, "creator_id": creator_id}, {"_id": 0})
+        if sh:
+            return sh
+    return await db.shipments.find_one({"campaign_id": campaign_id, "creator_id": {"$in": [None, ""]}}, {"_id": 0})
 
 
 # A brief can hire several creators, so one campaign now has one deal PER creator.
@@ -8196,14 +8244,21 @@ async def delete_filter_rule(rule_id: str, current_user: dict = Depends(require_
     return {"success": True}
 
 # Work Submission Routes
-async def ensure_ready_for_content(campaign: dict):
+async def ensure_ready_for_content(campaign: dict, creator_id: Optional[str] = None):
     """PRD 8.3: content can only be submitted once the deal has reached the
     content stage. If the brief requires shipment, the product must be received
-    first; and no submissions while a dispute is open."""
+    first; and no submissions while a dispute is open.
+
+    On a multi-creator brief, creator_id scopes the shipment/receipt check to that
+    one creator's own delivery — omitted, it falls back to the whole campaign
+    (single-creator behaviour)."""
     await ensure_not_disputed(campaign['id'])
     if campaign.get('requires_shipment'):
-        shipment = await db.shipments.find_one({"campaign_id": campaign['id']}, {"_id": 0})
-        receipt = await db.deal_receipts.find_one({"campaign_id": campaign['id']}, {"_id": 0})
+        shipment = await find_shipment(campaign['id'], creator_id) if creator_id else await db.shipments.find_one({"campaign_id": campaign['id']}, {"_id": 0})
+        receipt_query = {"campaign_id": campaign['id']}
+        if creator_id:
+            receipt_query["creator_id"] = creator_id
+        receipt = await db.deal_receipts.find_one(receipt_query, {"_id": 0})
         received = bool(
             (shipment or {}).get('received_at')
             or (shipment or {}).get('status') == 'received'
@@ -8226,7 +8281,7 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         raise HTTPException(status_code=403, detail="Not authorized")
 
     # PRD 8.3: gate submission on shipment receipt (and pause during disputes).
-    await ensure_ready_for_content(campaign)
+    await ensure_ready_for_content(campaign, creator_id=current_user['id'])
 
     uploads_dir = str(Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))))
     primary_file = data.work_files[0] if data.work_files else None
@@ -9227,8 +9282,9 @@ async def submit_deal_receipt(deal_id: str, data: DealReceiptSubmit, current_use
         }
         await db.deal_action_cards.insert_one({
             "id": str(uuid.uuid4()),
-            "deal_id": make_deal_id(campaign),
+            "deal_id": person_deal_id(campaign, current_user['id']),
             "campaign_id": campaign['id'],
+            "creator_id": current_user['id'],
             "type": "damage_report",
             "title": "Damaged or wrong product reported",
             "status": "open",
@@ -9237,7 +9293,7 @@ async def submit_deal_receipt(deal_id: str, data: DealReceiptSubmit, current_use
             "message": data.damage_report,
             "attachment_urls": [data.unboxing_video_url] if data.unboxing_video_url else []
         })
-    await db.shipments.update_one({"campaign_id": campaign['id']}, {"$set": shipment_update}, upsert=True)
+    await db.shipments.update_one(await shipment_match_filter(campaign['id'], current_user['id']), {"$set": shipment_update}, upsert=True)
     await insert_deal_activity(
         campaign,
         "creator",
@@ -9259,7 +9315,7 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
     if current_user['id'] not in selected_creator_ids(campaign):
         raise HTTPException(status_code=403, detail="Not authorized")
     # PRD 8.3/9.3: must have received the product (if required) and no open dispute.
-    await ensure_ready_for_content(campaign)
+    await ensure_ready_for_content(campaign, creator_id=current_user['id'])
 
     required = get_required_assets(campaign)
     missing = []
@@ -9764,7 +9820,7 @@ async def get_dispute_detail(dispute_id: str, current_user: dict = Depends(requi
     campaign = await db.campaigns.find_one({"id": cid}, {"_id": 0})
     timeline = await db.deal_activity.find({"campaign_id": cid}, {"_id": 0}).sort("timestamp", 1).to_list(500)
     content = await db.deal_content_submissions.find({"campaign_id": cid}, {"_id": 0}).sort("version", 1).to_list(50)
-    shipment = await db.shipments.find_one({"campaign_id": cid}, {"_id": 0})
+    shipment = await find_shipment(cid, crid)
     chat = await db.messages.find(
         {"$or": [{"sender_id": bid, "recipient_id": crid}, {"sender_id": crid, "recipient_id": bid}]},
         {"_id": 0},
@@ -10139,11 +10195,24 @@ async def get_brand_deal_campaign(deal_id: str, current_user: dict) -> dict:
         raise HTTPException(status_code=403, detail="Not authorized for this deal")
     return campaign
 
+async def get_brand_deal_context(deal_id: str, current_user: dict) -> tuple:
+    """Like get_brand_deal_campaign, but also resolves WHICH hired creator this
+    deal id addresses (person_deal_id's "~<creator_id>" suffix for creator 2..N on
+    a multi-creator brief; the bare id for the first/only creator). Shipment
+    endpoints need this — get_brand_deal_campaign alone discards the suffix, so
+    every shipment action landed on whichever creator happened to be first."""
+    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    _, suffix_creator = split_deal_id(deal_id)
+    ids = selected_creator_ids(campaign)
+    creator_id = suffix_creator if (suffix_creator and suffix_creator in ids) else (ids[0] if ids else None)
+    return campaign, creator_id
+
 @api_router.post("/deals/{deal_id}/tracking")
 async def submit_deal_tracking(deal_id: str, data: DealTrackingSubmit, current_user: dict = Depends(get_current_user)):
-    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    campaign, creator_id = await get_brand_deal_context(deal_id, current_user)
     shipment_doc = {
         "campaign_id": campaign['id'],
+        "creator_id": creator_id,
         "tracking_number": data.tracking_id,
         "courier_name": data.courier,
         "courier_tracking_url": data.courier_tracking_url,
@@ -10152,16 +10221,16 @@ async def submit_deal_tracking(deal_id: str, data: DealTrackingSubmit, current_u
         "updated_at": now_iso(),
         "status": "shipped",
     }
-    await db.shipments.update_one({"campaign_id": campaign['id']}, {"$set": shipment_doc}, upsert=True)
+    await db.shipments.update_one(await shipment_match_filter(campaign['id'], creator_id), {"$set": shipment_doc}, upsert=True)
     await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "tracking_uploaded", "Shipment tracking was uploaded.")
     await insert_deal_system_message(campaign, "Shipment tracking was uploaded by the brand.")
     return {"message": "Tracking uploaded"}
 
 @api_router.post("/deals/{deal_id}/delivered")
 async def mark_deal_delivered(deal_id: str, current_user: dict = Depends(get_current_user)):
-    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    campaign, creator_id = await get_brand_deal_context(deal_id, current_user)
     await db.shipments.update_one(
-        {"campaign_id": campaign['id']},
+        await shipment_match_filter(campaign['id'], creator_id),
         {"$set": {"courier_status": "delivered", "status": "delivered", "updated_at": now_iso()}},
     )
     await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "delivered", "Shipment was marked delivered.")
@@ -10217,11 +10286,11 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
 
     PHASE 1: label + tracking are MOCKED. Replace the marked block below with a
     real Shiprocket 'create order + generate label' call when the API is wired in."""
-    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    campaign, creator_id = await get_brand_deal_context(deal_id, current_user)
     if not campaign.get("requires_shipment"):
         raise HTTPException(status_code=400, detail="This deal does not require a shipment")
 
-    creator = await db.users.find_one({"id": campaign.get("selected_creator")}, {"_id": 0}) or {}
+    creator = await db.users.find_one({"id": creator_id}, {"_id": 0}) or {}
     # The creator's delivery address is NOT the brand's concern — don't block the brand on it.
     # If it isn't set yet, proceed anyway; the creator/platform completes it before dispatch.
     delivery = creator_delivery_address(creator)
@@ -10239,6 +10308,7 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
 
     shipment_doc = {
         "campaign_id": campaign["id"],
+        "creator_id": creator_id,
         "product": {"description": data.description, "weight": data.weight, "dimensions": dims},
         "pickup_address": data.pickup_address.dict(),
         "delivery_address": delivery or {},    # internal only — completed before dispatch
@@ -10251,7 +10321,7 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
         "label_generated_at": now_iso(),
         "updated_at": now_iso(),
     }
-    await db.shipments.update_one({"campaign_id": campaign["id"]}, {"$set": shipment_doc}, upsert=True)
+    await db.shipments.update_one(await shipment_match_filter(campaign["id"], creator_id), {"$set": shipment_doc}, upsert=True)
     await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "label_generated",
                                "Shipping label generated. Awaiting courier pickup.")
     await insert_deal_system_message(campaign, "The brand generated a shipping label. The product will be picked up by the courier shortly.")
@@ -10271,16 +10341,17 @@ async def request_shipment(deal_id: str, data: ShipLabelRequest, current_user: d
     """Brand submits product + pickup details → creates a shipment REQUEST. The admin
     shipping queue then generates the label and marks it shipped. The creator's
     delivery address is captured server-side and is NEVER shown to the brand."""
-    campaign = await get_brand_deal_campaign(deal_id, current_user)
+    campaign, creator_id = await get_brand_deal_context(deal_id, current_user)
     if not campaign.get("requires_shipment"):
         raise HTTPException(status_code=400, detail="This deal does not require a shipment")
 
-    creator = await db.users.find_one({"id": campaign.get("selected_creator")}, {"_id": 0}) or {}
+    creator = await db.users.find_one({"id": creator_id}, {"_id": 0}) or {}
     delivery = creator_delivery_address(creator)
     dims = (data.dimensions.dict() if data.dimensions else {}) or {}
 
     shipment_doc = {
         "campaign_id": campaign["id"],
+        "creator_id": creator_id,
         "product": {"description": data.description, "weight": data.weight, "dimensions": dims},
         "product_summary": data.description,
         "pickup_address": data.pickup_address.dict(),
@@ -10291,7 +10362,7 @@ async def request_shipment(deal_id: str, data: ShipLabelRequest, current_user: d
         "requested_at": now_iso(),
         "updated_at": now_iso(),
     }
-    await db.shipments.update_one({"campaign_id": campaign["id"]}, {"$set": shipment_doc}, upsert=True)
+    await db.shipments.update_one(await shipment_match_filter(campaign["id"], creator_id), {"$set": shipment_doc}, upsert=True)
     await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "shipment_requested",
                                "Brand submitted product & pickup details. Awaiting label from the platform.")
     await insert_deal_system_message(campaign, "The brand submitted shipment details. The platform team will prepare the label shortly.")
@@ -10303,12 +10374,12 @@ async def mark_shipment_picked_up(deal_id: str, current_user: dict = Depends(get
     """Brand confirms the courier has picked up the package → deal moves to 'Shipped'.
     PHASE 2: this transition will be driven automatically by the Shiprocket pickup
     webhook instead of a manual button."""
-    campaign = await get_brand_deal_campaign(deal_id, current_user)
-    sh = await db.shipments.find_one({"campaign_id": campaign["id"]}, {"_id": 0})
+    campaign, creator_id = await get_brand_deal_context(deal_id, current_user)
+    sh = await find_shipment(campaign["id"], creator_id)
     if not sh:
         raise HTTPException(status_code=404, detail="No shipment/label found for this deal yet")
     await db.shipments.update_one(
-        {"campaign_id": campaign["id"]},
+        await shipment_match_filter(campaign["id"], creator_id),
         {"$set": {"courier_status": "shipped", "status": "shipped", "shipped_at": now_iso(), "updated_at": now_iso()}},
     )
     await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "shipped", "Package picked up by courier — shipment is in transit.")
@@ -10550,9 +10621,11 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
     campaign = await db.campaigns.find_one({"id": data.campaign_id})
     if not campaign or campaign['business_id'] != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
+    creator_id = resolve_shipment_creator_id(campaign, current_user, data.creator_id)
     shipment_doc = {
         "campaign_id": data.campaign_id,
+        "creator_id": creator_id,
         "tracking_number": data.tracking_number,
         "courier_name": data.courier_name,
         "courier_tracking_url": data.courier_tracking_url,
@@ -10564,13 +10637,14 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
         "status": data.courier_status or "shipped",
     }
 
-    existing = await db.shipments.find_one({"campaign_id": data.campaign_id}, {"_id": 0, "late_fee_applied": 1, "shipped_at": 1})
+    match = await shipment_match_filter(data.campaign_id, creator_id)
+    existing = await db.shipments.find_one(match, {"_id": 0, "late_fee_applied": 1, "shipped_at": 1})
     # Stamp when it first left the brand so the progress trackers can date the
     # "Product Shipped" step — but never overwrite the original ship date on re-edit.
     shipment_doc["shipped_at"] = (existing or {}).get("shipped_at") or datetime.now(timezone.utc).isoformat()
 
     await db.shipments.update_one(
-        {"campaign_id": data.campaign_id},
+        match,
         {"$set": shipment_doc},
         upsert=True
     )
@@ -10584,10 +10658,9 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
         days_late = (datetime.now(timezone.utc) - ship_by).days
         if days_late >= 1:
             fee = min(days_late * to_float(platform_setting("late_ship_fee_per_day", LATE_SHIP_FEE_PER_DAY)), to_float(platform_setting("late_ship_fee_cap", LATE_SHIP_FEE_CAP)))
-            creator_id = campaign.get('selected_creator')
             if creator_id and fee > 0:
                 await db.users.update_one({"id": creator_id}, {"$inc": {"balance": fee}})
-                await db.shipments.update_one({"campaign_id": data.campaign_id}, {"$set": {"late_fee_applied": fee, "late_fee_days": days_late}})
+                await db.shipments.update_one(match, {"$set": {"late_fee_applied": fee, "late_fee_days": days_late}})
                 await notify_user(creator_id, "Late-shipping fee credited", f"₹{fee} was credited to you because the brand shipped {days_late} day(s) late.", link="/withdrawal")
                 await insert_deal_system_message(campaign, f"Brand shipped {days_late} day(s) late — ₹{fee} late-shipping fee credited to the creator (PRD 8.9).")
 
@@ -10598,22 +10671,24 @@ async def receive_shipment(data: ShipmentReceive, current_user: dict = Depends(g
     campaign = await db.campaigns.find_one({"id": data.campaign_id})
     if not campaign or current_user['id'] not in selected_creator_ids(campaign):
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
+    # A creator only ever acts on their own shipment — never trust a client-supplied id here.
+    creator_id = current_user['id']
     update_data = {
         "status": "received",
         "unboxing_video": data.unboxing_video,
         "received_at": datetime.now(timezone.utc).isoformat()
     }
-    
+
     if data.items_damaged:
         update_data['dispute'] = {
             "reported": True,
             "reason": data.dispute_reason,
             "reported_at": datetime.now(timezone.utc).isoformat()
         }
-    
+
     await db.shipments.update_one(
-        {"campaign_id": data.campaign_id},
+        await shipment_match_filter(data.campaign_id, creator_id),
         {"$set": update_data}
     )
 
@@ -10627,8 +10702,9 @@ async def receive_shipment(data: ShipmentReceive, current_user: dict = Depends(g
     if data.items_damaged:
         await db.deal_action_cards.insert_one({
             "id": str(uuid.uuid4()),
-            "deal_id": make_deal_id(campaign),
+            "deal_id": person_deal_id(campaign, creator_id),
             "campaign_id": campaign['id'],
+            "creator_id": creator_id,
             "type": "damage_report",
             "title": "Damaged or wrong product reported",
             "status": "open",
@@ -10643,19 +10719,20 @@ async def receive_shipment(data: ShipmentReceive, current_user: dict = Depends(g
     return {"message": "Shipment marked as received"}
 
 @api_router.get("/shipment/{campaign_id}")
-async def get_shipment(campaign_id: str, current_user: dict = Depends(get_current_user)):
+async def get_shipment(campaign_id: str, creator_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     role = current_user.get('role')
     is_party = (
         campaign.get('business_id') == _brand_ws_id(current_user)
-        or campaign.get('selected_creator') == current_user['id']
+        or current_user['id'] in selected_creator_ids(campaign)
         or role in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF]
     )
     if not is_party:
         raise HTTPException(status_code=403, detail="Not authorized to view this shipment")
-    shipment = await db.shipments.find_one({"campaign_id": campaign_id}, {"_id": 0})
+    target_creator_id = resolve_shipment_creator_id(campaign, current_user, creator_id)
+    shipment = await find_shipment(campaign_id, target_creator_id)
     if not shipment:
         raise HTTPException(status_code=404, detail="Shipment not found")
     # The creator's delivery address is ops-only — never expose it to the brand.
@@ -10684,17 +10761,23 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
         if campaign:
             data.campaign_id = campaign["id"]  # normalise for the shipment lookups below
         if campaign and campaign.get("requires_shipment"):
-            is_party = current_user["id"] in [campaign.get("business_id"), campaign.get("selected_creator")]
+            is_party = current_user["id"] == campaign.get("business_id") or current_user["id"] in selected_creator_ids(campaign)
             if not is_party:
                 raise HTTPException(status_code=403, detail="Not a party to this deal")
-            creator = await db.users.find_one({"id": campaign.get("selected_creator")}, {"_id": 0, "profile": 1}) or {}
+            # Which hired creator's delivery this is about: the creator confirming
+            # their own address, or (brand caller) whichever creator_id they passed —
+            # defaulting to the first hired creator so old callers keep working.
+            target_creator_id = current_user["id"] if current_user.get("role") == UserRole.CREATOR \
+                else resolve_shipment_creator_id(campaign, current_user, data.creator_id)
+            creator = await db.users.find_one({"id": target_creator_id}, {"_id": 0, "profile": 1}) or {}
             creator_addr = (creator.get("profile") or {}).get("address")
-            sh = await db.shipments.find_one({"campaign_id": data.campaign_id}, {"_id": 0}) or {}
+            sh = await find_shipment(data.campaign_id, target_creator_id) or {}
             # The brand's side is their pickup address, submitted via the "Ship Product"
             # form and stored on the shipment — NOT on their profile.
             brand_addr = sh.get("pickup_address")
             in_flight = (sh.get("status") or sh.get("courier_status")) in ["shipped", "in_transit", "delivered", "received"]
             both_ready = bool(brand_addr and creator_addr)
+            match = await shipment_match_filter(data.campaign_id, target_creator_id)
 
             # The creator may confirm their address AFTER the brand already requested
             # the shipment — in which case the shipment was stored with an empty
@@ -10705,17 +10788,17 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
             # the old `if sh` guard meant an early confirmation was written nowhere
             # deal-specific, so the deal room could never tell it had happened and its button
             # still read "Confirm Delivery Address".
-            if creator_addr and current_user["id"] == campaign.get("selected_creator"):
+            if creator_addr and current_user["id"] == target_creator_id:
                 await db.shipments.update_one(
-                    {"campaign_id": data.campaign_id},
+                    match,
                     {"$set": {"delivery_address": creator_addr,
                               "awaiting_creator_address": False,
                               "updated_at": now_iso()},
                      "$setOnInsert": {
                          "id": str(uuid.uuid4()),
                          "campaign_id": data.campaign_id,
+                         "creator_id": target_creator_id,
                          "business_id": campaign.get("business_id"),
-                         "creator_id": campaign.get("selected_creator"),
                          # Not a courier state — compute_deal_state ignores it, so the deal
                          # stays in "Accepted — Awaiting Shipment" until the brand ships.
                          "status": "awaiting_pickup_address",
@@ -10726,7 +10809,7 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
 
             if both_ready and not in_flight:
                 await db.shipments.update_one(
-                    {"campaign_id": data.campaign_id},
+                    match,
                     {"$set": {"status": "awaiting_dispatch", "courier_status": "awaiting_dispatch",
                               "addresses_ready_at": now_iso(), "updated_at": now_iso()}},
                     upsert=True,
@@ -10742,10 +10825,13 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
 
 
 @api_router.get("/shipping/address")
-async def get_shipping_address(campaign_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+async def get_shipping_address(campaign_id: Optional[str] = None, creator_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     """Return MY saved address (for prefill) and, for a given deal, whether each
     side has confirmed. Masked-shipping safe: never returns the OTHER party's
-    address — only a boolean that they've confirmed."""
+    address — only a boolean that they've confirmed.
+
+    On a multi-creator brief, a brand caller passes ?creator_id=<id> to check one
+    specific hired creator's readiness (defaults to the first hired creator)."""
     me = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "profile": 1}) or {}
     my_address = (me.get("profile") or {}).get("address")
 
@@ -10767,11 +10853,14 @@ async def get_shipping_address(campaign_id: Optional[str] = None, current_user: 
     campaign = await find_campaign_by_any_id(campaign_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Deal not found")
-    if _brand_ws_id(current_user) not in [campaign.get("business_id"), campaign.get("selected_creator")]:
+    is_party = _brand_ws_id(current_user) == campaign.get("business_id") or current_user["id"] in selected_creator_ids(campaign)
+    if not is_party:
         raise HTTPException(status_code=403, detail="Not a party to this deal")
 
-    creator = await db.users.find_one({"id": campaign.get("selected_creator")}, {"_id": 0, "profile": 1}) or {}
-    sh = await db.shipments.find_one({"campaign_id": campaign["id"]}, {"_id": 0}) or {}
+    target_creator_id = current_user["id"] if current_user.get("role") == UserRole.CREATOR \
+        else resolve_shipment_creator_id(campaign, current_user, creator_id)
+    creator = await db.users.find_one({"id": target_creator_id}, {"_id": 0, "profile": 1}) or {}
+    sh = await find_shipment(campaign["id"], target_creator_id) or {}
 
     out["my_role"] = "brand" if _brand_ws_id(current_user) == campaign.get("business_id") else "creator"
     # The brand submits their pickup address through the "Ship Product" form
@@ -14225,87 +14314,94 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
         cid = c.get("id")
         if not cid:
             continue  # legacy campaign without a UUID id — skip rather than 500
-        sh = await db.shipments.find_one({"campaign_id": cid}, {"_id": 0}) or {}
-        ship_status = sh.get("courier_status") or sh.get("status") or "pending"
         brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "nickname": 1, "profile": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1}) or {}
-        creator = await db.users.find_one({"id": c.get("selected_creator")}, {"_id": 0, "nickname": 1, "profile": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1}) or {}
-        requested = sh.get("requested_at") or c.get("work_started_at") or c.get("updated_at") or c.get("created_at")
-        prod = sh.get("product") or {}
-        dims = prod.get("dimensions") or {}
-        dim_str = (f"{dims.get('length') or '?'}×{dims.get('width') or '?'}×{dims.get('height') or '?'} cm"
-                   if any(dims.get(k) for k in ("length", "width", "height")) else None)
-        product_name = sh.get("product_summary") or prod.get("description") or c.get("product_name") or "—"
-        rows.append({
-            "id": cid, "deal_id": cid, "campaign_title": c.get("title"),
-            "brand": person_display_name(brand, "Brand"), "creator": person_display_name(creator, "Creator"),
-            "product": product_name, "product_summary": product_name,
-            "weight": (f"{prod.get('weight')} kg" if prod.get("weight") else None),
-            "dimensions": dim_str,
-            "requested_at": requested, "created_at": requested,
-            # When it actually shipped — lets the queue freeze the SLA at ship time
-            # instead of showing an ever-growing "breached" on a done shipment.
-            "shipped_at": sh.get("shipped_at") or sh.get("updated_at"),
-            "status": ship_status, "courier": sh.get("courier_name"), "tracking_number": sh.get("tracking_number"),
-            "has_label": bool(sh.get("label_url")), "label_url": sh.get("label_url"),
-            # Prefer what was submitted for THIS shipment; fall back to the saved
-            # profile (the creator confirms their address there, and the shipment doc
-            # may not exist yet). Both branches go through _fmt_addr — the fallback
-            # used to return the raw dict, which the admin table rendered as
-            # "[object Object]".
-            "pickup_address": _fmt_addr(sh.get("pickup_address")) or _fmt_addr((brand.get("profile") or {}).get("address")),
-            "ship_address": _fmt_addr(sh.get("delivery_address")) or _fmt_addr((creator.get("profile") or {}).get("address")),
-            "shipping_address": _fmt_addr(sh.get("delivery_address")) or _fmt_addr((creator.get("profile") or {}).get("address")),
-            "ship_city": ((sh.get("delivery_address") or (creator.get("profile") or {}).get("address")) or {}).get("city")
-                         if isinstance(sh.get("delivery_address") or (creator.get("profile") or {}).get("address"), dict) else None,
-            # So ops can see at a glance who still owes an address.
-            "awaiting_creator_address": not bool(
-                sh.get("delivery_address") or (creator.get("profile") or {}).get("address")
-            ),
-        })
+        # One row PER HIRED CREATOR — a multi-creator brief needs a separate label/
+        # dispatch/address per creator. Looping only "selected_creator" (singular)
+        # meant creators 2..N on the same brief never appeared in the ops queue at
+        # all, so their shipments could never actually get fulfilled.
+        for creator_id in selected_creator_ids(c):
+            sh = await find_shipment(cid, creator_id) or {}
+            ship_status = sh.get("courier_status") or sh.get("status") or "pending"
+            creator = await db.users.find_one({"id": creator_id}, {"_id": 0, "nickname": 1, "profile": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1}) or {}
+            requested = sh.get("requested_at") or c.get("work_started_at") or c.get("updated_at") or c.get("created_at")
+            prod = sh.get("product") or {}
+            dims = prod.get("dimensions") or {}
+            dim_str = (f"{dims.get('length') or '?'}×{dims.get('width') or '?'}×{dims.get('height') or '?'} cm"
+                       if any(dims.get(k) for k in ("length", "width", "height")) else None)
+            product_name = sh.get("product_summary") or prod.get("description") or c.get("product_name") or "—"
+            rows.append({
+                "id": cid, "deal_id": cid, "creator_id": creator_id, "campaign_title": c.get("title"),
+                "brand": person_display_name(brand, "Brand"), "creator": person_display_name(creator, "Creator"),
+                "product": product_name, "product_summary": product_name,
+                "weight": (f"{prod.get('weight')} kg" if prod.get("weight") else None),
+                "dimensions": dim_str,
+                "requested_at": requested, "created_at": requested,
+                # When it actually shipped — lets the queue freeze the SLA at ship time
+                # instead of showing an ever-growing "breached" on a done shipment.
+                "shipped_at": sh.get("shipped_at") or sh.get("updated_at"),
+                "status": ship_status, "courier": sh.get("courier_name"), "tracking_number": sh.get("tracking_number"),
+                "has_label": bool(sh.get("label_url")), "label_url": sh.get("label_url"),
+                # Prefer what was submitted for THIS shipment; fall back to the saved
+                # profile (the creator confirms their address there, and the shipment doc
+                # may not exist yet). Both branches go through _fmt_addr — the fallback
+                # used to return the raw dict, which the admin table rendered as
+                # "[object Object]".
+                "pickup_address": _fmt_addr(sh.get("pickup_address")) or _fmt_addr((brand.get("profile") or {}).get("address")),
+                "ship_address": _fmt_addr(sh.get("delivery_address")) or _fmt_addr((creator.get("profile") or {}).get("address")),
+                "shipping_address": _fmt_addr(sh.get("delivery_address")) or _fmt_addr((creator.get("profile") or {}).get("address")),
+                "ship_city": ((sh.get("delivery_address") or (creator.get("profile") or {}).get("address")) or {}).get("city")
+                             if isinstance(sh.get("delivery_address") or (creator.get("profile") or {}).get("address"), dict) else None,
+                # So ops can see at a glance who still owes an address.
+                "awaiting_creator_address": not bool(
+                    sh.get("delivery_address") or (creator.get("profile") or {}).get("address")
+                ),
+            })
     rows.sort(key=lambda r: r.get("requested_at") or "")
     return rows
 
 
 @api_router.post("/admin/shipping/{campaign_id}/label")
-async def admin_upload_shipping_label(campaign_id: str, file: UploadFile = File(...),
+async def admin_upload_shipping_label(campaign_id: str, creator_id: Optional[str] = None, file: UploadFile = File(...),
                                       current_user: dict = Depends(require_cap("manage_shipping"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can upload labels")
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
     if not campaign:
         raise HTTPException(status_code=404, detail="Deal not found")
+    target_creator_id = resolve_shipment_creator_id(campaign, current_user, creator_id)
     content = await file.read()
     upload_dir = Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))) / "labels"
     ext = Path(file.filename or "label.pdf").suffix or ".pdf"
     fname = f"label_{campaign_id}_{uuid.uuid4().hex}{ext}"
     file_url = persist_file(content, fname, kind="other", local_dir=upload_dir,
                             public_path=f"/uploads/labels/{fname}", cloud_folder="ugcad/labels")
-    await db.shipments.update_one({"campaign_id": campaign_id},
-                                  {"$set": {"label_url": file_url, "updated_at": now_iso()}}, upsert=True)
+    await db.shipments.update_one(await shipment_match_filter(campaign_id, target_creator_id),
+                                  {"$set": {"label_url": file_url, "creator_id": target_creator_id, "updated_at": now_iso()}}, upsert=True)
     await log_admin_action(current_user, "shipping.label_uploaded", target_type="deal", target_id=campaign_id,
                            after={"label_url": file_url})
     return {"file_url": file_url, "label_url": file_url, "message": "Label uploaded"}
 
 
 @api_router.post("/admin/shipping/{campaign_id}/ship")
-async def admin_mark_shipped(campaign_id: str, data: Dict[str, Any] = Body(...), request: Request = None,
+async def admin_mark_shipped(campaign_id: str, creator_id: Optional[str] = None, data: Dict[str, Any] = Body(...), request: Request = None,
                              current_user: dict = Depends(require_cap("manage_shipping"))):
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can mark shipped")
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
     if not campaign:
         raise HTTPException(status_code=404, detail="Deal not found")
+    target_creator_id = resolve_shipment_creator_id(campaign, current_user, creator_id)
     update = {"courier_name": data.get("courier"), "courier_status": "shipped", "status": "shipped",
-              "tracking_number": data.get("tracking_number"), "updated_at": now_iso()}
+              "tracking_number": data.get("tracking_number"), "creator_id": target_creator_id, "updated_at": now_iso()}
     if data.get("label_url"):
         update["label_url"] = data["label_url"]
-    await db.shipments.update_one({"campaign_id": campaign_id}, {"$set": update}, upsert=True)
+    await db.shipments.update_one(await shipment_match_filter(campaign_id, target_creator_id), {"$set": update}, upsert=True)
     await log_admin_action(current_user, "shipping.marked_shipped", target_type="deal", target_id=campaign_id,
                            after={"courier": data.get("courier"), "tracking_number": data.get("tracking_number")}, request=request)
     if campaign.get("business_id"):
         await notify_user(campaign["business_id"], "Product shipped", "Your product has been shipped to the creator.", link="/dashboard/business/shipments", category="deal_updates")
-    if campaign.get("selected_creator"):
-        await notify_user(campaign["selected_creator"], "Product on the way", "The brand's product has been shipped to you.", link="/my-deals", email=True, category="deal_updates")
+    if target_creator_id:
+        await notify_user(target_creator_id, "Product on the way", "The brand's product has been shipped to you.", link="/my-deals", email=True, category="deal_updates")
     await insert_deal_system_message(campaign, "Shipment dispatched by the platform team.")
     return {"message": "Marked as shipped"}
 
