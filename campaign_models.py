@@ -227,6 +227,10 @@ class CampaignCreateExtended(BriefSectionsMixin):
     # Matching (PRD 5.2 Path B): brand requests an ops-curated shortlist
     match_requested: Optional[bool] = None
 
+    # How many creators this brief hires. server.py's select_creator keeps the
+    # brief open until every slot is filled, but only if this reaches storage.
+    creators_wanted: Optional[int] = Field(default=None, ge=1)
+
 
 class CampaignDraftCreate(BriefSectionsMixin):
     """Model for creating draft campaigns - allows partial data"""
@@ -279,6 +283,9 @@ class CampaignDraftCreate(BriefSectionsMixin):
 
     # Industry classification
     industry_type: Optional[IndustryType] = None
+
+    # How many creators this brief hires
+    creators_wanted: Optional[int] = Field(default=None, ge=1)
 
 
 class CampaignUpdate(BriefSectionsMixin):
@@ -339,6 +346,9 @@ class CampaignUpdate(BriefSectionsMixin):
     shipment_option: Optional[str] = None
     content_requirements: Optional[Dict[str, bool]] = None
     revision_limit: Optional[int] = None
+
+    # How many creators this brief hires
+    creators_wanted: Optional[int] = Field(default=None, ge=1)
 
     # Matching (PRD 5.2 Path B)
     match_requested: Optional[bool] = None
