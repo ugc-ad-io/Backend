@@ -689,20 +689,41 @@ def _send_email_sync(to, subject: str, html: str, text: Optional[str] = None) ->
         payload["text"] = text
     if reply_to:
         payload["reply_to"] = reply_to
-    try:
-        r = requests.post(
-            "https://api.resend.com/emails",
-            json=payload,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            timeout=15,
-        )
-        if r.status_code >= 400:
-            logger.error(f"[email] Resend send failed {r.status_code}: {r.text}")
-            return {"error": r.text}
-        return r.json()
-    except Exception as e:
-        logger.error(f"[email] send exception: {e}")
-        return {"error": str(e)}
+    # Resend rate-limits at ~2 req/sec. A burst from a sweep job (many due payouts /
+    # auto-approvals emailing creators back-to-back with no gap between them) used to
+    # trip a 429 that was silently dropped — the account action succeeded but the
+    # email just vanished. Retry transient failures (429 / 5xx / network hiccup) with
+    # a short backoff before giving up; a bad request (4xx other than 429) is not
+    # transient, so it fails immediately without wasting retries.
+    max_attempts = 3
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            r = requests.post(
+                "https://api.resend.com/emails",
+                json=payload,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                timeout=15,
+            )
+            if r.status_code == 429 or r.status_code >= 500:
+                last_err = f"{r.status_code}: {r.text}"
+                if attempt < max_attempts - 1:
+                    time.sleep(0.6 * (attempt + 1))
+                    continue
+                logger.error(f"[email] Resend send failed after {max_attempts} attempts: {last_err}")
+                return {"error": last_err}
+            if r.status_code >= 400:
+                logger.error(f"[email] Resend send failed {r.status_code}: {r.text}")
+                return {"error": r.text}
+            return r.json()
+        except Exception as e:
+            last_err = str(e)
+            if attempt < max_attempts - 1:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            logger.error(f"[email] send exception after {max_attempts} attempts: {e}")
+            return {"error": last_err}
+    return {"error": last_err or "unknown"}
 
 async def send_email(to, subject: str, html: str, text: Optional[str] = None) -> dict:
     return await asyncio.to_thread(_send_email_sync, to, subject, html, text)
@@ -8640,6 +8661,10 @@ async def release_due_payouts() -> int:
                 released += 1
         except Exception:
             logger.exception("Failed to release payout for escrow %s", escrow.get('id'))
+        # Each release emails the creator. Resend rate-limits at ~2 req/sec, and this
+        # sweep can hit dozens of due payouts in one run — stagger so a big batch
+        # doesn't out-run the retry budget in send_email() and start dropping mail.
+        await asyncio.sleep(0.4)
     return released
 
 
@@ -8668,6 +8693,9 @@ async def auto_approve_stale_submissions() -> int:
         await insert_deal_system_message(campaign, f"Content auto-approved after {int(platform_setting('auto_approval_days', AUTO_APPROVE_DAYS))} days with no brand review (PRD 8.4). The creator has been paid.")
         await notify_user(work['creator_id'], "Your content was auto-approved", "The brand didn't review in time, so your content was auto-approved and you've been paid.", link="/my-deals")
         approved += 1
+        # release_payout_now() above also emails the creator — stagger for the same
+        # rate-limit reason as release_due_payouts().
+        await asyncio.sleep(0.4)
     return approved
 
 
