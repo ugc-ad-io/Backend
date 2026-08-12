@@ -10997,7 +10997,7 @@ async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount
     return {k: v for k, v in receipt.items() if k != "_id"}
 
 
-MIN_WITHDRAWAL_AMOUNT = 500  # INR — minimum a creator can withdraw at once
+MIN_WITHDRAWAL_AMOUNT = 2500  # INR — minimum a creator can withdraw at once
 
 @api_router.post("/withdrawal/request")
 async def request_withdrawal(data: WithdrawalRequest, current_user: dict = Depends(get_current_user)):
