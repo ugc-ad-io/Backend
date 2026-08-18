@@ -1183,7 +1183,7 @@ ACTION_CARDS_ONLY_DAYS = 14
 ROLLING_STRIKE_DAYS = 30
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
 PDF_MAX_BYTES = 25 * 1024 * 1024
-VIDEO_MAX_BYTES = 150 * 1024 * 1024
+VIDEO_MAX_BYTES = 100 * 1024 * 1024
 MAX_IMAGES_PER_CHAT_MESSAGE = 5
 MAX_VIDEO_SECONDS = 120
 
@@ -1244,7 +1244,7 @@ def validate_upload_payload(content_type: Optional[str], filename: str, size: in
         raise HTTPException(status_code=400, detail="Images must be 10 MB or smaller.")
     if kind == "pdf":
         raise HTTPException(status_code=400, detail="PDFs must be 25 MB or smaller.")
-    raise HTTPException(status_code=400, detail="Videos must be 150 MB or smaller and 2 minutes or shorter.")
+    raise HTTPException(status_code=400, detail="Videos must be 100 MB or smaller and 2 minutes or shorter.")
 
 def get_video_duration_seconds(_content: bytes, _filename: str, _content_type: Optional[str]) -> Optional[float]:
     """Placeholder for ffprobe/moviepy integration. None means duration could not be determined."""
