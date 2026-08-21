@@ -5310,6 +5310,28 @@ async def get_creator_levels():
     }
 
 
+def _apply_reapplication_fields(current_user: dict, update_fields: dict, now_str: str) -> None:
+    """If this submit is a REAPPLICATION after a rejection, archive the previous
+    decision instead of letting the next `review` write silently overwrite it.
+
+    The person keeps the same account and the same email — /profile/creator and
+    /profile/business already flip approval_status back to PENDING — so without
+    this the only record of *why* they were rejected is destroyed the moment an
+    admin decides again. `review_history` keeps every past decision, and
+    `application_attempts` lets a reviewer see at a glance that this is a second
+    (or fifth) run at it. Mutates `update_fields` in place.
+    """
+    if current_user.get("approval_status") != ApprovalStatus.REJECTED:
+        return
+    history = list(current_user.get("review_history") or [])
+    prev_review = current_user.get("review") or {}
+    if prev_review:
+        history.append({**prev_review, "status": ApprovalStatus.REJECTED})
+    update_fields["review_history"] = history
+    update_fields["reapplied_at"] = now_str
+    update_fields["application_attempts"] = int(current_user.get("application_attempts") or 1) + 1
+
+
 @api_router.put("/profile/creator")
 async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
@@ -5378,6 +5400,8 @@ async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict 
                 raise HTTPException(status_code=400, detail="Handle already taken")
             update_fields["username"] = normalized
             update_fields["handle_locked"] = True
+
+    _apply_reapplication_fields(current_user, update_fields, now_str)
 
     await db.users.update_one(
         {"id": current_user['id']},
@@ -5450,6 +5474,7 @@ async def update_business_profile(data: BusinessProfileUpdate, current_user: dic
     ).strip().lstrip("@")
     if brand_display:
         set_fields["nickname"] = brand_display
+    _apply_reapplication_fields(current_user, set_fields, set_fields["updated_at"])
     await db.users.update_one({"id": current_user['id']}, {"$set": set_fields})
 
     # Cascade brand info updates to all existing campaigns for this business
@@ -15078,6 +15103,198 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 
+# ============================================================================
+# Onboarding-form reminders
+# ----------------------------------------------------------------------------
+# A user who signs up gets `profile_completed: False` (see /auth/signup). It only
+# flips true when they submit the creator/business profile-setup form. Plenty of
+# people create the account and never come back to finish it, so we nudge them
+# by email once at ~24h and again at ~48h, then stop.
+#
+# `onboarding_reminders` on the user doc records which nudges already went out
+# ({"h24": "<iso>", "h48": "<iso>"}), so a restart or a second sweep on the same
+# day can never double-send.
+# ============================================================================
+
+# (stage key, minimum account age in hours) - checked newest-stage-first.
+ONBOARDING_REMINDER_STAGES = [("h48", 48), ("h24", 24)]
+
+# Do not chase accounts forever: past this age we assume they are not coming back.
+ONBOARDING_REMINDER_MAX_AGE_HOURS = 24 * 14
+
+# How often the background sweep runs.
+ONBOARDING_SWEEP_INTERVAL_SECONDS = 60 * 60
+
+# Handle for the background sweep task, so shutdown can cancel it cleanly.
+_onboarding_reminder_task: Optional[asyncio.Task] = None
+
+
+def _onboarding_setup_path(role: str) -> str:
+    """Where the unfinished form actually lives, per role, so the email CTA
+    drops the person straight onto their own setup screen."""
+    return "/profile-setup/business" if role == UserRole.BUSINESS else "/profile-setup/creator"
+
+
+def _onboarding_reminder_email(user: dict, stage: str) -> tuple:
+    """(subject, html) for the nudge. The 48h copy is firmer than the 24h one."""
+    name = first_name_of(user)
+    is_brand = user.get("role") == UserRole.BUSINESS
+    what = "brand profile" if is_brand else "creator profile"
+    next_step = (
+        "start posting briefs and hiring creators"
+        if is_brand else
+        "start applying to briefs and landing brand deals"
+    )
+    cta = _email_button("Finish my profile", _onboarding_setup_path(user.get("role")))
+
+    if stage == "h48":
+        subject = f"Still pending: your UGCad.io {what}"
+        content = f"""
+            <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Your {what} is still unfinished, {name}</h1>
+            <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">You created your UGCad.io account a couple of days ago, but the profile form was never submitted &mdash; so your account is not live yet and cannot be reviewed.</p>
+            <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">It takes a few minutes. Once it is submitted and approved you can {next_step}.</p>
+            {cta}
+            <p style="margin:22px 0 0;font-size:13px;color:#9296ba;">Already finished it? You can ignore this email.</p>"""
+    else:
+        subject = f"You are one step away &mdash; finish your UGCad.io {what}"
+        content = f"""
+            <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Almost there, {name}!</h1>
+            <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">Thanks for signing up to UGCad.io. Your account is created, but your {what} form has not been submitted yet &mdash; that is the last step before we can review and activate you.</p>
+            <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">Finish it now and you can {next_step}.</p>
+            {cta}
+            <p style="margin:22px 0 0;font-size:13px;color:#9296ba;">Already finished it? You can ignore this email.</p>"""
+
+    return subject, _email_base_template(subject, content)
+
+
+def _pending_stage_for(user: dict, now: datetime) -> Optional[str]:
+    """Which reminder (if any) this user is due for right now - or None."""
+    created = user.get("created_at")
+    if not created:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(created))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    age_hours = (now - dt).total_seconds() / 3600.0
+    if age_hours > ONBOARDING_REMINDER_MAX_AGE_HOURS:
+        return None
+
+    already = user.get("onboarding_reminders") or {}
+    # Newest stage first, so an account that has aged past 48h without ever being
+    # emailed gets the (more relevant) 48h copy instead of a stale 24h one.
+    for stage, min_hours in ONBOARDING_REMINDER_STAGES:
+        if age_hours >= min_hours and not already.get(stage):
+            return stage
+    return None
+
+
+async def send_onboarding_reminders(dry_run: bool = False) -> dict:
+    """Email every creator/brand who signed up but never submitted the profile
+    form and is due for a 24h or 48h nudge. Safe to call repeatedly."""
+    now = datetime.now(timezone.utc)
+    candidates = await db.users.find(
+        {
+            "profile_completed": {"$ne": True},
+            "role": {"$in": [UserRole.CREATOR, UserRole.BUSINESS]},
+            "banned": {"$ne": True},
+            "email": {"$nin": [None, ""]},
+        },
+        {"_id": 0, "password": 0},
+    ).to_list(2000)
+
+    sent, failed, considered = 0, 0, 0
+    by_stage = {"h24": 0, "h48": 0}
+
+    for user in candidates:
+        stage = _pending_stage_for(user, now)
+        if not stage:
+            continue
+        considered += 1
+        if dry_run:
+            by_stage[stage] += 1
+            continue
+        try:
+            subject, html = _onboarding_reminder_email(user, stage)
+            await send_email(user["email"], subject, html)
+            # Recorded only after the send actually succeeds, so a transient mail
+            # failure retries on the next sweep instead of being silently lost.
+            await db.users.update_one(
+                {"id": user["id"]},
+                {"$set": {f"onboarding_reminders.{stage}": now.isoformat()}},
+            )
+            sent += 1
+            by_stage[stage] += 1
+        except Exception as exc:
+            failed += 1
+            logger.error(f"[onboarding-reminder] {user.get('email')} ({stage}) failed: {exc}")
+
+    return {"considered": considered, "sent": sent, "failed": failed, "by_stage": by_stage, "dry_run": dry_run}
+
+
+async def _onboarding_reminder_loop():
+    """Hourly sweep. Runs for the life of the process; never lets one bad pass
+    kill the loop."""
+    while True:
+        try:
+            result = await send_onboarding_reminders()
+            if result["sent"]:
+                logger.info(f"[onboarding-reminder] sent {result['sent']} reminder(s): {result['by_stage']}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"[onboarding-reminder] sweep failed: {exc}")
+        await asyncio.sleep(ONBOARDING_SWEEP_INTERVAL_SECONDS)
+
+
+@api_router.get("/admin/onboarding-pending")
+async def admin_onboarding_pending(current_user: dict = Depends(require_cap("user_management"))):
+    """Who signed up but never submitted the profile form - the same set the admin
+    Users page 'Form: not filled' filter shows, plus which nudges already went
+    out. Handy for eyeballing the queue without waiting for the sweep."""
+    if current_user['role'] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    scope_q = dict(admin_caps.user_scope_filter(current_user))
+    scope_q.update({
+        "profile_completed": {"$ne": True},
+        "role": {"$in": [UserRole.CREATOR, UserRole.BUSINESS]},
+    })
+    users = await db.users.find(scope_q, {"_id": 0, "password": 0}).to_list(1000)
+
+    now = datetime.now(timezone.utc)
+    rows = []
+    for u in users:
+        rows.append({
+            "id": u.get("id"),
+            "email": u.get("email"),
+            "role": u.get("role"),
+            "nickname": u.get("nickname"),
+            "full_name": u.get("full_name"),
+            "created_at": u.get("created_at"),
+            "approval_status": u.get("approval_status"),
+            "onboarding_reminders": u.get("onboarding_reminders", {}),
+            "due_stage": _pending_stage_for(u, now),
+        })
+    return _json_safe({"count": len(rows), "users": rows})
+
+
+@api_router.post("/admin/onboarding-reminders/run")
+async def admin_run_onboarding_reminders(
+    dry_run: bool = Query(False, description="Count who would be emailed without sending"),
+    current_user: dict = Depends(require_cap("user_management")),
+):
+    """Fire the 24h/48h 'your form is pending' sweep on demand. The hourly
+    background loop calls the same function, and the per-user record of what was
+    already sent means running this manually cannot double-email anyone."""
+    if current_user['role'] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return await send_onboarding_reminders(dry_run=dry_run)
+
+
 @app.on_event("startup")
 async def startup_initialization():
     """Initialize default data collections."""
@@ -15117,6 +15334,25 @@ async def startup_initialization():
     # Seed categories
     await seed_categories()
 
+    # Start the hourly "your onboarding form is still pending" sweep (24h + 48h
+    # nudges). Kept as a plain task rather than an external cron so it needs no
+    # extra infrastructure; it self-heals on error and is idempotent per user.
+    global _onboarding_reminder_task
+    try:
+        _onboarding_reminder_task = asyncio.create_task(_onboarding_reminder_loop())
+        print("Onboarding reminder sweep: started (hourly)")
+    except Exception as exc:
+        print(f"WARNING: could not start onboarding reminder sweep: {exc}")
+
 @app.on_event("shutdown")
 async def shutdown_db_client():
+    # Stop the reminder sweep before the DB handle goes away, so a mid-flight
+    # pass cannot log spurious "closed client" errors on the way down.
+    task = globals().get("_onboarding_reminder_task")
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
     client.close()
