@@ -143,4 +143,30 @@ function accountDeleted({ name } = {}) {
   };
 }
 
-module.exports = { applicationApproved, applicationRejected, applicationRevision, accountDeactivated, accountDeleted };
+/**
+ * Nudge for users who signed up but never submitted the onboarding form.
+ * Sent by the 24h auto-reminder cron (jobs/formReminderCron.js) and by the
+ * admin's manual "Send reminder" action in the Users panel.
+ */
+function formReminderEmail({ name, role, frontendUrl } = {}) {
+  const base = trimUrl(frontendUrl);
+  const formUrl = role === 'business' ? `${base}/profile-setup/business` : `${base}/profile-setup/creator`;
+  return {
+    subject: "You're almost set up on UGCad.io",
+    html: baseTemplate({
+      title: 'Complete your profile',
+      content: `
+        <h2 style="margin:0 0 12px;font-size:22px;color:#15163a;">Hi${name ? ` ${name}` : ''},</h2>
+        <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">
+          You signed up on UGCad.io but haven't finished your ${role === 'business' ? 'brand' : 'creator'} profile yet.
+          It only takes a couple of minutes, and you won't show up in ${role === 'business' ? 'searches or be able to post campaigns' : 'campaign matches or be able to send bids'} until it's done.
+        </p>
+        <p style="margin:0 0 24px;">${button('Complete your profile', formUrl)}</p>
+        <p style="margin:0;font-size:13px;color:#9296ba;">If you've already finished this, you can ignore this email.</p>
+      `,
+      footer: "You're receiving this because you signed up on UGCad.io and haven't completed your profile."
+    })
+  };
+}
+
+module.exports = { applicationApproved, applicationRejected, applicationRevision, accountDeactivated, accountDeleted, formReminderEmail };
