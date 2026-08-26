@@ -702,6 +702,18 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleSendFormReminder = async (u) => {
+    if (!window.confirm(`Send a "complete your profile" reminder email to ${u.nickname || u.email}?`)) return;
+
+    try {
+      await axios.post(`${API}/admin/user/send-form-reminder`, { user_id: u.id });
+      toast.success(`Reminder email sent to ${u.email}`);
+      fetchAllUsers();
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to send reminder');
+    }
+  };
+
   const handleCreateGateway = () => {
     setSelectedGateway(null);
     setGatewayFormData({
@@ -1155,7 +1167,14 @@ export default function AdminDashboard() {
                         </td>
                         <td>{u.email}</td>
                         <td><span className="badge badge-active">{u.role}</span></td>
-                        <td><span className={`badge badge-${u.approval_status}`}>{u.approval_status}</span></td>
+                        <td>
+                          <span className={`badge badge-${u.approval_status}`}>{u.approval_status}</span>
+                          {u.role !== 'admin' && !u.profile_completed && (
+                            <span className="badge badge-pending" title="User signed up but hasn't submitted the onboarding form" style={{ marginLeft: 6 }}>
+                              Form pending{u.form_reminder_sent_at ? ' · reminded' : ''}
+                            </span>
+                          )}
+                        </td>
                         <td>${u.balance?.toFixed(2) || '0.00'}</td>
                         <td>
                           <div className="action-buttons">
@@ -1166,6 +1185,15 @@ export default function AdminDashboard() {
                             >
                               Edit
                             </button>
+                            {u.role !== 'admin' && !u.profile_completed && (
+                              <button
+                                className="btn-edit-small"
+                                onClick={() => handleSendFormReminder(u)}
+                                title="Email this user to complete their profile form"
+                              >
+                                Remind
+                              </button>
+                            )}
                             <button
                               className={u.banned ? 'btn-unban-small' : 'btn-ban-small'}
                               onClick={() => handleBanUser(u.id, u.banned)}

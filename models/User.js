@@ -66,6 +66,10 @@ const userSchema = new mongoose.Schema(
     // Admin review trail: { reason_code, reason_details, more_info_message, more_info_items[], requested_at, decided_at }
     review: { type: mongoose.Schema.Types.Mixed, default: {} },
     submitted_at: { type: Date, default: null }, // when onboarding was submitted (for SLA / oldest-first)
+    // "Complete your profile" nudge — set once the 24h auto-reminder (or an admin's
+    // manual send) has fired, so the daily cron doesn't email the same user twice.
+    // Cleared implicitly: once profile_completed flips true this field is just ignored.
+    form_reminder_sent_at: { type: Date, default: null },
     active: { type: Boolean, default: true }, // false => suspended/deactivated (10.9)
 
     // Admin moderation state (spec 11.10 — Users module actions)

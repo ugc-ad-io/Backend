@@ -10,6 +10,7 @@ import time
 import asyncio
 import requests
 import logging
+import html
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Any
@@ -782,6 +783,26 @@ PLACEHOLDER_FIRST_NAMES = [
     'Neha', 'Kunal', 'Nikhil', 'Sara', 'Aisha', 'Tara', 'Karan', 'Sana', 'Yash', 'Zoya',
 ]
 
+# Email local-parts that are roles/brands rather than a person's name — never
+# used as a greeting.
+_NON_NAME_LOCALPARTS = {
+    "info", "admin", "contact", "hello", "hi", "support", "team", "sales",
+    "help", "office", "mail", "email", "no", "noreply", "founder", "ceo",
+    "marketing", "business", "work", "workwith", "the", "official", "id",
+    "media", "agency", "studio", "labs", "collab", "collabs", "digital",
+    "creator", "creators", "ugc", "brand", "brands", "co", "inc", "pvt",
+}
+
+
+def _is_placeholder_nickname(handle: str) -> bool:
+    """True if `handle` looks like generate_nickname() output — a name drawn at
+    random from PLACEHOLDER_FIRST_NAMES plus a 2-digit suffix. Such a nickname is
+    assigned by the server, not chosen by the user, so it must not be used to
+    address them by name in email."""
+    m = re.fullmatch(r"([A-Za-z]+)(\d{2})", (handle or "").strip().lstrip("@"))
+    return bool(m and m.group(1) in PLACEHOLDER_FIRST_NAMES)
+
+
 async def generate_nickname() -> str:
     """A realistic placeholder NAME (not a handle) until the person sets their own."""
     max_attempts = 50
@@ -1091,12 +1112,15 @@ def person_display_name(user: Optional[dict], fallback: str = "Someone") -> str:
 
 
 def first_name_of(user: dict, fallback: str = "there") -> str:
-    """First name for greetings. Prefers an explicit first_name, else the first
-    word of the real name (full_name). Only if no real name is set does it fall
-    back to the display nickname — with any auto-generated numeric suffix stripped
-    so a placeholder handle like 'Aarav42' (legacy 'BraveFalcon277') greets as a
-    name, never the raw username. Mirrors the frontend firstName() util so
-    greetings read 'Hi Meet!' not 'Hi Meet Jain!'."""
+    """First name for greetings, in descending order of trust:
+      1. explicit first_name, 2. first word of full_name, 3. a nickname the USER
+      chose, 4. the email local-part but only when it clearly splits into a name.
+    Anything less certain returns `fallback` and callers drop the name from the
+    copy. A server-assigned placeholder nickname (generate_nickname(), e.g.
+    'Zoya13') is never used — it is random, so greeting by it addresses the person
+    as someone else. Mirrors the frontend firstName() util so greetings read
+    'Hi Meet!' not 'Hi Meet Jain!'.
+    Pass fallback="" wherever the greeting is optional."""
     u = user or {}
     p = u.get("profile") or {}
     # Names may live at the root OR nested under profile (creator signup stores them
@@ -1107,12 +1131,47 @@ def first_name_of(user: dict, fallback: str = "there") -> str:
     real = str(u.get("full_name") or p.get("fullName") or p.get("full_name") or "").strip().lstrip("@")
     if real:
         return real.split()[0]
-    # No real name — this is the auto-generated placeholder handle. Drop the
-    # trailing digits so emails read as a first name, not a "@Name42" username.
-    # (Brands keep their typed business nickname as-is — it has no digit suffix.)
-    handle = re.sub(r"\d+$", "", str(u.get("nickname") or "").strip().lstrip("@")).strip()
-    parts = handle.split()
-    return parts[0] if parts else fallback
+    # No real name typed. The nickname may be a handle the person chose OR a
+    # placeholder this server assigned at signup (generate_nickname() =
+    # PLACEHOLDER_FIRST_NAMES + 2 digits, e.g. "Zoya13"). Those are drawn at
+    # RANDOM and are not the user's name — greeting someone as "Zoya" when they
+    # are Monika invents an identity and reads like a phishing mail-merge, so a
+    # placeholder must never be used as a greeting name.
+    raw = str(u.get("nickname") or "").strip().lstrip("@")
+    if not _is_placeholder_nickname(raw):
+        # A nickname the user actually typed — safe to greet with. Keep the old
+        # digit-strip so a self-chosen "Meera88" still reads as a name.
+        handle = re.sub(r"\d+$", "", raw).strip()
+        parts = handle.split()
+        if parts:
+            return parts[0]
+    # Placeholder (or nothing): fall back to the email local-part, which is at
+    # least the user's own string, before giving up on a name entirely.
+    local = str(u.get("email") or "").split("@")[0].strip()
+    # Split on separators AND digits rather than deleting digits — "monika27soni"
+    # must yield "monika", not the glued-together "monikasoni".
+    parts = [w for w in re.split(r"[._+\-0-9]+", local) if w]
+    first = parts[0] if parts else ""
+    # Use it ONLY when the local-part was actually delimited (a separator or digit
+    # split it), which is what makes "monika27soni" -> "Monika" trustworthy. An
+    # undelimited blob like "rohanmahur" cannot be split into a first name without
+    # guessing, and "Hi Rohanmahur" is no better than the random placeholder this
+    # replaced — so those get NO name and the copy drops the greeting entirely.
+    # A trailing role word ("rohanmahur.creator", "srathod.ugc") makes the address
+    # look delimited without the first token being a first name, so those suffixes
+    # do not count as a real split.
+    meaningful = [w for w in parts if w.lower() not in _NON_NAME_LOCALPARTS]
+    delimited = len(meaningful) > 1
+    # "mbaft2023.deshnashrimal" — letters, digits, then a SEPARATOR: an
+    # institutional/serial id whose real name may not be the first token.
+    # (Contrast "monika27soni", where digits sit between two name parts and the
+    # first token is genuinely the first name.)
+    if re.match(r"^[A-Za-z]+\d+[._+-]", local):
+        return fallback
+    if (delimited and 3 <= len(first) <= 12 and first.isalpha()
+            and first.lower() not in _NON_NAME_LOCALPARTS):
+        return first[:1].upper() + first[1:].lower()
+    return fallback
 
 
 def gst_public(user: dict) -> dict:
@@ -11229,12 +11288,12 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(req
     # Branded decision email to the applicant (fire-and-forget — never blocks the decision).
     try:
         to_email = user.get("email")
-        name = first_name_of(user)
+        name = first_name_of(user, fallback="")
         if to_email:
             if data.action == "approve":
                 subject = "Your UGCad.io application is approved 🎉"
                 content = f"""
-                    <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">You're approved, {name}!</h1>
+                    <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">{f"You're approved, {name}!" if name else "You're approved!"}</h1>
                     <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">Your profile has been reviewed and <strong>approved</strong>. You can now sign in and start on UGCad.io.</p>
                     {_email_button("Sign in to UGCad.io")}"""
             elif data.action == "request_info":
@@ -11251,7 +11310,7 @@ async def approve_profile(data: ApprovalAction, current_user: dict = Depends(req
                 subject = "Update on your UGCad.io application"
                 content = f"""
                     <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Application update</h1>
-                    <p style="margin:0 0 12px;font-size:15px;line-height:1.6;color:#4a4f74;">Hi {name}, unfortunately your application was <strong>not approved</strong> at this time.</p>
+                    <p style="margin:0 0 12px;font-size:15px;line-height:1.6;color:#4a4f74;">{f"Hi {name}, u" if name else "U"}nfortunately your application was <strong>not approved</strong> at this time.</p>
                     <p style="margin:0;font-size:14px;color:#4a4f74;"><strong>Reason:</strong> {reason}</p>"""
             await send_email(to_email, subject, _email_base_template(subject, content))
     except Exception as e:
@@ -11621,11 +11680,25 @@ async def admin_unsuspend_user(data: Dict[str, Any] = Body(...), current_user: d
 async def admin_message_user(data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("user_management"))):
     user_id = data.get("user_id")
     message = (data.get("message") or "").strip()
-    await _admin_target(user_id, current_user)
+    user = await _admin_target(user_id, current_user)
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
     await notify_user(user_id, "Message from the UGCad team", message, ntype="admin_message")
     await log_admin_action(current_user, "user.message", target_type="user", target_id=user_id, reason=message)
+
+    # Email is best-effort — the in-app notification above is the record of
+    # truth, so a Resend hiccup must never turn a sent message into a 500.
+    if user.get("email"):
+        try:
+            name = user.get("nickname") or user.get("full_name") or ""
+            subject = "Message from the UGCad.io team"
+            content = f"""
+                <h1 style="margin:0 0 12px;font-size:20px;color:#1f2340;">{f'Hi {name},' if name else 'Hi,'}</h1>
+                <p style="margin:0;font-size:15px;line-height:1.65;color:#4a4f74;white-space:pre-wrap;">{html.escape(message)}</p>"""
+            await send_email(user["email"], subject, _email_base_template(subject, content))
+        except Exception as e:
+            logger.error(f"[user/message] email failed: {e}")
+
     return {"message": "Message sent"}
 
 @api_router.post("/admin/user/level")
@@ -15137,7 +15210,9 @@ def _onboarding_setup_path(role: str) -> str:
 
 def _onboarding_reminder_email(user: dict, stage: str) -> tuple:
     """(subject, html) for the nudge. The 48h copy is firmer than the 24h one."""
-    name = first_name_of(user)
+    # fallback="" so a user with no real name gets a clean nameless headline
+    # rather than the literal word "there" spliced mid-sentence.
+    name = first_name_of(user, fallback="")
     is_brand = user.get("role") == UserRole.BUSINESS
     what = "brand profile" if is_brand else "creator profile"
     next_step = (
@@ -15150,7 +15225,7 @@ def _onboarding_reminder_email(user: dict, stage: str) -> tuple:
     if stage == "h48":
         subject = f"Still pending: your UGCad.io {what}"
         content = f"""
-            <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Your {what} is still unfinished, {name}</h1>
+            <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Your {what} is still unfinished{f", {name}" if name else ""}</h1>
             <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">You created your UGCad.io account a couple of days ago, but the profile form was never submitted &mdash; so your account is not live yet and cannot be reviewed.</p>
             <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">It takes a few minutes. Once it is submitted and approved you can {next_step}.</p>
             {cta}
@@ -15158,7 +15233,7 @@ def _onboarding_reminder_email(user: dict, stage: str) -> tuple:
     else:
         subject = f"You are one step away &mdash; finish your UGCad.io {what}"
         content = f"""
-            <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Almost there, {name}!</h1>
+            <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">{f"Almost there, {name}!" if name else "Almost there!"}</h1>
             <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">Thanks for signing up to UGCad.io. Your account is created, but your {what} form has not been submitted yet &mdash; that is the last step before we can review and activate you.</p>
             <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">Finish it now and you can {next_step}.</p>
             {cta}
