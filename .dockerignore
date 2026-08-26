@@ -1,0 +1,56 @@
+# Keeps the build context small and secrets out of the image.
+
+# Real credentials (MONGO_URL, JWT_SECRET, RESEND_API_KEY, CLOUDINARY_*).
+# These must arrive at RUNTIME via compose env_file / -e, never be baked in.
+.env
+.env.*
+!.env.example
+
+# Python noise
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+.venv
+venv
+env
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Locally-written uploads — the container gets a fresh volume for these, and
+# shipping a developer's copies into the image would bloat it and leak content.
+uploads
+
+# VCS + editor
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# Docs and scratch scripts. The image only needs the runtime code; the many
+# *_test.py / seed_* / check_* helpers are developer tooling.
+*.md
+*.txt
+!requirements.txt
+backend_test.py
+test_*.py
+seed_*.py
+check_*.py
+create_test_*.py
+delete_test_*.py
+cleanup_test_data.py
+inspect_dummy.py
+reset_demo.py
+
+# Docker's own files
+Dockerfile*
+.dockerignore
+docker-compose*.yml
+
+*.log
+.DS_Store
+Thumbs.db

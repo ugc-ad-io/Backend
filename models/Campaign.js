@@ -4,7 +4,15 @@ const campaignSchema = new mongoose.Schema({
   title: { type: String, required: true },
   business_id: { type: String, required: true }, // user ids may be UUID (migrated) or ObjectId — store as string
   business_nickname: { type: String, default: '' },
-  status: { type: String, enum: ['draft', 'pending_approval', 'active', 'in_progress', 'work_submitted', 'completed', 'rejected'], default: 'pending_approval' },
+  // 'paused' is a reversible admin freeze (see paused_from_status); 'banned' is
+  // a terminal admin kill. Both are set only by the admin moderation routes.
+  status: { type: String, enum: ['draft', 'pending_approval', 'active', 'in_progress', 'work_submitted', 'completed', 'rejected', 'paused', 'banned'], default: 'pending_approval' },
+  // Set while paused so Resume can restore the exact previous status.
+  paused_from_status: { type: String, default: '' },
+  pause_reason: { type: String, default: '' },
+  paused_at: { type: Date, default: null },
+  ban_reason: { type: String, default: '' },
+  banned_at: { type: Date, default: null },
   brief_text: { type: String, default: '' },
   objectives: { type: [String], default: [] },
   budget_min: { type: Number, default: 0 },
