@@ -15,8 +15,9 @@ const checkoutRoutes = require('./routes/checkoutRoutes');
 const { ensureDealForCampaign } = require('./utils/ensureDeal');
 const { auth, brandWrite, workspaceId } = require('./middleware/auth');
 const authCtrl = require('./controllers/authController');
-const { sendEmail } = require('./services/emailService');
+const { sendEmail, baseTemplate } = require('./services/emailService');
 const applicationEmails = require('./services/emailTemplates');
+const { startFormReminderCron } = require('./jobs/formReminderCron');
 
 const app = express();
 
@@ -72,6 +73,11 @@ app.get('/api/campaigns', auth, async (req, res) => {
     const filter = {};
     if (req.query.status) filter.status = req.query.status;
     if (req.user.role === 'business') filter.business_id = workspaceId(req);
+    // Creators must never see an admin-paused or banned brief while browsing.
+    // The brand still sees its own (with the badge) so it knows what happened.
+    if (req.user.role === 'creator' && !req.query.creator_id && !req.query.status) {
+      filter.status = { $nin: ['paused', 'banned'] };
+    }
     // A creator's own campaigns = those they were selected for. Without this the
     // creator_id query param was ignored, so e.g. "completed deals" counted every
     // completed campaign on the platform, not just this creator's.
@@ -331,6 +337,27 @@ app.get('/api/admin/users', adminAuth, requireCap('user_management'), async (req
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
+// Admin manually emails a "complete your profile" reminder to a single user
+// who hasn't finished onboarding (same email the 24h auto-cron sends).
+app.post('/api/admin/user/send-form-reminder', adminAuth, requireCap('user_management'), async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    const target = await User.findOne({ _id: user_id, ...userScopeFilter(req.user) });
+    if (!target) return res.status(404).json({ detail: 'User not found' });
+    if (target.profile_completed) return res.status(400).json({ detail: 'User has already completed their profile' });
+    if (!target.email) return res.status(400).json({ detail: 'User has no email on file' });
+
+    const name = target.nickname || target.full_name || '';
+    const mail = applicationEmails.formReminderEmail({ name, role: target.role, frontendUrl: process.env.FRONTEND_URL });
+    const result = await sendEmail({ to: target.email, subject: mail.subject, html: mail.html });
+    if (result?.error) return res.status(502).json({ detail: `Failed to send email: ${result.error}` });
+
+    target.form_reminder_sent_at = new Date();
+    await target.save();
+    res.json({ message: 'Reminder email sent', sent_to: target.email });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
 app.get('/api/admin/pending-profiles', adminAuth, requireCap('review_applications'), async (req, res) => {
   try {
     // All completed applications across every state (pending / more_info /
@@ -410,6 +437,149 @@ app.post('/api/admin/approve-campaign', adminAuth, requireCap('review_applicatio
     const { item_id, action } = req.body;
     await Campaign.findByIdAndUpdate(item_id, { status: action === 'approve' ? 'active' : 'rejected' });
     res.json({ success: true });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+// ── Admin campaign moderation: pause / resume / ban / delete ─────────────────
+// pause  -> reversible freeze; hidden from creators, no new bids. Resume undoes it.
+// ban    -> terminal kill. Money already escrowed is deliberately LEFT HELD so an
+//           admin releases or refunds it by hand from Financials.
+// delete -> permanent removal. Blocked while a deal still holds escrow.
+
+// Statuses worth moderating — anything already finished/dead is rejected.
+const MODERATABLE_CAMPAIGN_STATUSES = ['active', 'in_progress', 'pending_approval', 'work_submitted'];
+
+// Notify the brand, plus every creator already hired on the brief.
+const notifyCampaignParties = async (c, title, body) => {
+  const ids = [c.business_id, ...(c.selected_creators || []), c.selected_creator];
+  await Promise.all([...new Set(ids.filter(Boolean).map(String))]
+    .map((uid) => notifyUser(uid, 'campaign_update', title, body)));
+};
+
+// Any deal on this campaign that still has money sitting in escrow.
+const heldEscrowDeal = async (campaignId) => {
+  try {
+    return await Deal.findOne({
+      campaign_id: campaignId,
+      'escrow.status': { $in: ['held', 'queued'] },
+      'escrow.held_amount': { $gt: 0 },
+    }).lean();
+  } catch (e) { return null; }
+};
+
+app.post('/api/admin/campaigns/:id/pause', adminAuth, requireCap('review_applications'), async (req, res) => {
+  try {
+    const c = await Campaign.findById(req.params.id);
+    if (!c) return res.status(404).json({ detail: 'Campaign not found' });
+    if (c.status === 'paused') return res.status(400).json({ detail: 'This campaign is already paused' });
+    if (c.status === 'banned') return res.status(400).json({ detail: "This campaign is banned - it can't be paused" });
+    if (!MODERATABLE_CAMPAIGN_STATUSES.includes(c.status)) {
+      return res.status(400).json({ detail: `Cannot pause a campaign with status: ${c.status}` });
+    }
+
+    const before = c.status;
+    const reason = String(req.body?.reason || '').trim() || 'Paused by admin';
+    c.paused_from_status = before;   // so Resume restores the real previous state
+    c.pause_reason = reason;
+    c.paused_at = new Date();
+    c.status = 'paused';
+    await c.save();
+
+    await writeAdminLog(req, {
+      action: 'campaign.paused', module: 'applications', target_type: 'campaign',
+      target_id: String(c._id), before: { status: before }, after: { status: 'paused' },
+      reason_text: reason,
+    });
+    await notifyCampaignParties(c, 'Campaign paused',
+      `'${c.title}' has been paused by the Creasume team - ${reason}. It is hidden from creators until it is resumed.`);
+
+    res.json({ success: true, message: 'Campaign paused', status: 'paused', campaign_id: String(c._id) });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+app.post('/api/admin/campaigns/:id/resume', adminAuth, requireCap('review_applications'), async (req, res) => {
+  try {
+    const c = await Campaign.findById(req.params.id);
+    if (!c) return res.status(404).json({ detail: 'Campaign not found' });
+    if (c.status !== 'paused') return res.status(400).json({ detail: 'Only a paused campaign can be resumed' });
+
+    // Fall back to 'active' for older rows saved without a remembered status.
+    const restored = c.paused_from_status || 'active';
+    c.status = restored;
+    c.paused_from_status = '';
+    c.pause_reason = '';
+    c.paused_at = null;
+    await c.save();
+
+    await writeAdminLog(req, {
+      action: 'campaign.resumed', module: 'applications', target_type: 'campaign',
+      target_id: String(c._id), before: { status: 'paused' }, after: { status: restored },
+      reason_text: String(req.body?.reason || '').trim(),
+    });
+    await notifyCampaignParties(c, 'Campaign resumed', `'${c.title}' is live again - the pause has been lifted.`);
+
+    res.json({ success: true, message: 'Campaign resumed', status: restored, campaign_id: String(c._id) });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+app.post('/api/admin/campaigns/:id/ban', adminAuth, requireCap('ban_users'), async (req, res) => {
+  try {
+    const c = await Campaign.findById(req.params.id);
+    if (!c) return res.status(404).json({ detail: 'Campaign not found' });
+    if (c.status === 'banned') return res.status(400).json({ detail: 'This campaign is already banned' });
+
+    const reason = String(req.body?.reason || '').trim();
+    if (!reason) return res.status(400).json({ detail: 'A reason is required to ban a campaign' });
+
+    const before = c.status;
+    c.ban_reason = reason;
+    c.banned_at = new Date();
+    c.status = 'banned';
+    await c.save();
+
+    // Deliberately do NOT move money — just report that a human must settle it.
+    const held = await heldEscrowDeal(c._id);
+
+    await writeAdminLog(req, {
+      action: 'campaign.banned', module: 'applications', target_type: 'campaign',
+      target_id: String(c._id), before: { status: before },
+      after: { status: 'banned', escrow_held: !!held }, reason_text: reason,
+    });
+    await notifyCampaignParties(c, 'Campaign banned',
+      `'${c.title}' has been removed by the Creasume team - ${reason}. If any funds are held for this campaign, our team will contact you about them.`);
+
+    res.json({
+      success: true, message: 'Campaign banned', status: 'banned', campaign_id: String(c._id),
+      escrow_needs_manual_release: !!held,
+      escrow_amount: held ? (held.escrow?.held_amount || 0) : 0,
+    });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+app.delete('/api/admin/campaigns/:id', adminAuth, requireCap('ban_users'), async (req, res) => {
+  try {
+    const c = await Campaign.findById(req.params.id);
+    if (!c) return res.status(404).json({ detail: 'Campaign not found' });
+
+    // Never delete a brief whose money is still in escrow — that would orphan it.
+    const held = await heldEscrowDeal(c._id);
+    if (held) {
+      return res.status(400).json({
+        detail: 'This campaign still has money held in escrow. Release or refund it first, then delete.',
+      });
+    }
+
+    await Campaign.findByIdAndDelete(c._id);
+
+    await writeAdminLog(req, {
+      action: 'campaign.deleted', module: 'applications', target_type: 'campaign',
+      target_id: String(c._id),
+      before: { status: c.status, title: c.title, business_id: c.business_id },
+      after: { deleted: true },
+      reason_text: String(req.body?.reason || '').trim(),
+    });
+
+    res.json({ success: true, deleted: true, campaign_id: String(c._id) });
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
@@ -748,6 +918,24 @@ app.post('/api/admin/user/message', adminAuth, requireCap('user_management'), as
     await notifyUser(user_id, 'admin_message', 'Message from the team', message);
     await writeAdminLog(req, { action: 'user.message', module: 'users', target_type: 'user', target_id: String(user_id), detail: message });
     res.json({ success: true });
+
+    // Email is fire-and-forget (best-effort) — the in-app notification above is
+    // the record of truth, and a slow/failed Resend call must never block the
+    // admin's response or make a sent message look like it failed.
+    const target = await User.findById(user_id).select('email nickname full_name');
+    if (target?.email) {
+      const name = target.nickname || target.full_name || '';
+      sendEmail({
+        to: target.email,
+        subject: 'Message from the UGCad.io team',
+        html: baseTemplate({
+          title: 'Message from the team',
+          content: `
+            <h1 style="margin:0 0 12px;font-size:20px;color:#1f2340;">${name ? `Hi ${name},` : 'Hi,'}</h1>
+            <p style="margin:0 0 4px;font-size:15px;line-height:1.65;color:#4a4f74;white-space:pre-wrap;">${String(message).replace(/</g, '&lt;')}</p>`,
+        }),
+      }).catch((err) => console.error('[user/message] email failed:', err.message));
+    }
   } catch (e) { res.status(500).json({ detail: e.message }); }
 });
 
@@ -1701,6 +1889,10 @@ app.post('/api/campaigns/:id/bid', auth, async (req, res) => {
   try {
     const { amount, proposal, estimated_delivery_days } = req.body;
     const c = await Campaign.findById(req.params.id);
+    // A frozen or killed brief accepts no new bids.
+    if (c && (c.status === 'paused' || c.status === 'banned')) {
+      return res.status(400).json({ detail: 'This campaign is not accepting bids right now.' });
+    }
     if (!c) return res.status(404).json({ detail: 'Campaign not found' });
     const bid = { creator_id: req.user.id, amount: Number(amount) || 0, proposal: proposal || '', estimated_delivery_days: Number(estimated_delivery_days) || 0, status: 'pending', submitted_at: new Date() };
     c.bids = c.bids || [];
@@ -2903,4 +3095,5 @@ app.use(errorHandler);
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
+  startFormReminderCron();
 });
