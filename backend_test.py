@@ -82,7 +82,8 @@ class BackendTester:
         admin_data = {
             "email": f"admin{self.timestamp}@ugcconnect.com",
             "password": "AdminPass123!",
-            "role": "admin"
+            "role": "admin",
+            "phone": "9000010010"
         }
         
         result = self.make_request("POST", "/auth/signup", admin_data)
@@ -107,7 +108,8 @@ class BackendTester:
         creator_data = {
             "email": f"creator.sarah{self.timestamp}@example.com",
             "password": "CreatorPass123!",
-            "role": "creator"
+            "role": "creator",
+            "phone": "9000010009"
         }
         
         result = self.make_request("POST", "/auth/signup", creator_data)
@@ -166,7 +168,8 @@ class BackendTester:
         business_data = {
             "email": f"business.techcorp{self.timestamp}@example.com",
             "password": "BusinessPass123!",
-            "role": "business"
+            "role": "business",
+            "phone": "9000010008"
         }
         
         result = self.make_request("POST", "/auth/signup", business_data)
@@ -427,12 +430,14 @@ class BackendTester:
             {
                 "email": f"manager1{self.timestamp}@ugcconnect.com",
                 "password": "ManagerPass123!",
-                "role": "campaign_manager"
+                "role": "campaign_manager",
+                "phone": "9000010007"
             },
             {
                 "email": f"manager2{self.timestamp}@ugcconnect.com", 
                 "password": "ManagerPass123!",
-                "role": "campaign_manager"
+                "role": "campaign_manager",
+                "phone": "9000010006"
             }
         ]
         
@@ -1054,7 +1059,8 @@ class BackendTester:
         admin2_data = {
             "email": f"admin2{self.timestamp}@ugcconnect.com",
             "password": "Admin2Pass123!",
-            "role": "admin"
+            "role": "admin",
+            "phone": "9000010005"
         }
         
         result = self.make_request("POST", "/auth/signup", admin2_data)
@@ -1196,7 +1202,8 @@ class BackendTester:
         support_data = {
             "email": f"support{self.timestamp}@ugcconnect.com",
             "password": "SupportPass123!",
-            "role": "support_staff"
+            "role": "support_staff",
+            "phone": "9000010004"
         }
         
         result = self.make_request("POST", "/auth/signup", support_data)
@@ -3529,7 +3536,8 @@ class BackendTester:
             user_data = {
                 "email": f"uniquetest{i}{self.timestamp}@example.com",
                 "password": "TestPass123!",
-                "role": "creator"
+                "role": "creator",
+                "phone": "9000010003"
             }
             
             result = self.make_request("POST", "/auth/signup", user_data)
@@ -3965,7 +3973,8 @@ class BackendTester:
         business_data = {
             "email": f"chattest.business{self.timestamp}@example.com",
             "password": "BusinessPass123!",
-            "role": "business"
+            "role": "business",
+            "phone": "9000010002"
         }
         
         result = self.make_request("POST", "/auth/signup", business_data)
@@ -3979,7 +3988,8 @@ class BackendTester:
         creator_data = {
             "email": f"chattest.creator{self.timestamp}@example.com",
             "password": "CreatorPass123!",
-            "role": "creator"
+            "role": "creator",
+            "phone": "9000010001"
         }
         
         result = self.make_request("POST", "/auth/signup", creator_data)

@@ -190,12 +190,40 @@ class WithdrawalStatus(str, Enum):
     COMPLETED = "completed"
     REJECTED = "rejected"
 
+# Signup collects a mobile number alongside email + password. There is NO OTP —
+# the number is only stored so ops can reach the applicant, so all we do is check
+# it looks like a real number. Expected national-number length per dial code,
+# mirroring the profile-setup form; unknown codes fall back to a permissive range.
+SIGNUP_PHONE_LEN = {"+91": 10, "+1": 10, "+44": 10, "+61": 9}
+
+def normalize_signup_phone(raw: str, dial_code: str) -> str:
+    """Return the digits-only national number, or raise 400 if it can't be one."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    cc = re.sub(r"\D", "", str(dial_code or ""))
+    expected = SIGNUP_PHONE_LEN.get(dial_code)
+    # A pasted international number ("+91 9406879532") arrives with the country
+    # code merged in. Drop it, but only when the result is otherwise too long, so
+    # a legitimate number that happens to start with "91" is left alone.
+    if cc and digits.startswith(cc) and len(digits) > (expected or 10):
+        digits = digits[len(cc):]
+    if not digits:
+        raise HTTPException(status_code=400, detail="Mobile number is required")
+    if expected is not None:
+        if len(digits) != expected:
+            raise HTTPException(status_code=400, detail=f"Enter a valid {expected}-digit mobile number")
+    elif not (7 <= len(digits) <= 15):
+        raise HTTPException(status_code=400, detail="Enter a valid mobile number")
+    return digits
+
 # Models
 class SignupRequest(BaseModel):
     email: EmailStr
     password: str
     role: UserRole
     name: Optional[str] = None
+    # Mobile number is compulsory at signup (validated, never OTP-verified).
+    phone: str
+    dial_code: str = "+91"
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -3275,6 +3303,11 @@ async def signup(data: SignupRequest):
     # back to a generated placeholder if they didn't give one.
     typed_name = str(data.name or "").strip().lstrip("@")
     nickname = typed_name or await generate_nickname()
+    # Compulsory at signup, no OTP. Stored split (dial code + national number) to
+    # match how the profile-setup form keeps it, plus a ready-to-read combined
+    # string so the admin review screens don't have to reassemble it.
+    dial_code = str(data.dial_code or "+91").strip() or "+91"
+    phone = normalize_signup_phone(data.phone, dial_code)
 
     user_doc = {
         "id": user_id,
@@ -3283,6 +3316,9 @@ async def signup(data: SignupRequest):
         "role": data.role,
         "nickname": nickname,
         "full_name": typed_name,
+        "phone": phone,
+        "dial_code": dial_code,
+        "phone_full": f"{dial_code} {phone}",
         "profile_completed": False,
         "curated_brand_visible": False,
         "creator_directory_visible": False,
@@ -3307,6 +3343,8 @@ async def signup(data: SignupRequest):
         "nickname": nickname,
         "creator_code": user_doc.get("creator_code"),
         "role": data.role,
+        "phone": phone,
+        "dial_code": dial_code,
     }
 
 @api_router.post("/auth/login")
@@ -3357,6 +3395,8 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
         "creator_code": user.get('creator_code'),
         "level": user.get('level'),
         "role": user.get('role'),
+        "phone": user.get('phone'),
+        "dial_code": user.get('dial_code'),
         "admin_role": user.get('admin_role'),
         "admin_caps": user.get('admin_caps', []),
         "admin_cap_modes": user.get('admin_cap_modes', {}),

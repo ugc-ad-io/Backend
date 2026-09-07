@@ -76,7 +76,8 @@ class PaymentGatewayTester:
         admin_data = {
             "email": f"admin{self.timestamp}@ugcconnect.com",
             "password": "AdminPass123!",
-            "role": "admin"
+            "role": "admin",
+            "phone": "9000010003"
         }
         
         result = self.make_request("POST", "/auth/signup", admin_data)
@@ -92,7 +93,8 @@ class PaymentGatewayTester:
         creator_data = {
             "email": f"creator{self.timestamp}@example.com",
             "password": "CreatorPass123!",
-            "role": "creator"
+            "role": "creator",
+            "phone": "9000010002"
         }
         
         result = self.make_request("POST", "/auth/signup", creator_data)
@@ -108,7 +110,8 @@ class PaymentGatewayTester:
         business_data = {
             "email": f"business{self.timestamp}@example.com",
             "password": "BusinessPass123!",
-            "role": "business"
+            "role": "business",
+            "phone": "9000010001"
         }
         
         result = self.make_request("POST", "/auth/signup", business_data)
