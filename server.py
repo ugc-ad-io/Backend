@@ -2259,9 +2259,42 @@ async def reserve_campaign_budget(user: dict, campaign_doc: dict) -> Optional[di
     await db.escrow.insert_one(escrow_doc)
     return escrow_doc
 
+# A brief with this many creators (or more) is a "large multi-creator campaign" and
+# pays the top listing-fee tier. Two creators is where "multi-creator" starts.
+LARGE_CAMPAIGN_MIN_CREATORS = 11
+
+
+def campaign_listing_fee(campaign: dict) -> float:
+    """The one-time listing fee for a brief, tiered by how big the brief is.
+
+    Prices come from Settings so ops can change them without a deploy:
+      1 creator,  1 deliverable    -> listing_fee                    (₹500)
+      1 creator,  2+ deliverables  -> listing_fee_multi_deliverable  (₹1,500)
+      2–10 creators                -> listing_fee_multi_creator      (₹1,500)
+      11+ creators                 -> listing_fee_large_campaign     (₹3,000)
+
+    "Deliverables" is the TOTAL number of assets requested (the sum of every
+    deliverable row's quantity — the same count escrow and delivery use), so a
+    brief asking one creator for 3 Reels is a 3-deliverable brief, not a 1.
+    """
+    creators = campaign_creators_wanted(campaign)
+    deliverables = total_deliverable_quantity(campaign)
+    if creators >= LARGE_CAMPAIGN_MIN_CREATORS:
+        return to_float(platform_setting("listing_fee_large_campaign", 3000))
+    if creators > 1:
+        return to_float(platform_setting("listing_fee_multi_creator", 1500))
+    if deliverables > 1:
+        return to_float(platform_setting("listing_fee_multi_deliverable", 1500))
+    return to_float(platform_setting("listing_fee", 500))
+
+
 async def charge_listing_fee(user: dict, campaign_doc: dict) -> float:
-    """Charge the brand the platform listing fee (Settings → Listing fee) on publish."""
-    fee = to_float(platform_setting("listing_fee", 0))
+    """Charge the brand the platform listing fee on publish.
+
+    The fee is tiered by brief size — see campaign_listing_fee(). It is charged
+    ONCE per published brief and never multiplied by the creator count.
+    """
+    fee = campaign_listing_fee(campaign_doc)
     if fee <= 0:
         return 0.0
     debit = await db.users.update_one(
@@ -13747,7 +13780,11 @@ async def export_audit_logs(action: Optional[str] = None, module: Optional[str] 
 # --- Platform Settings (PRD 11.14, founder-only) ---------------------------
 DEFAULT_PLATFORM_SETTINGS = {
     "commission_rate": 20,
-    "listing_fee": 500,
+    # Listing fee is tiered by brief size — see campaign_listing_fee().
+    "listing_fee": 500,                     # 1 creator, 1 deliverable
+    "listing_fee_multi_deliverable": 1500,  # 1 creator, 2+ deliverables
+    "listing_fee_multi_creator": 1500,      # 2–10 creators
+    "listing_fee_large_campaign": 3000,     # 11+ creators
     "revision_price": 500,
     "auto_approval_days": 5,
     "late_ship_fee_per_day": 200,
