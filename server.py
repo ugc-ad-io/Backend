@@ -6516,6 +6516,57 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
 
     await db.campaigns.insert_one(campaign_doc)
 
+    # A published PRIVATE brief needs a Private Invitation card in the creator's chat -
+    # it is the only place they can accept or reject. The brief itself is invisible to
+    # them: it sits in the admin queue, and being private it never joins their browse
+    # list either.
+    #
+    # Created HERE rather than by the client, for a reason that bit us: publishing holds
+    # the budget on the brand's wallet, and POST /chat/action-cards runs
+    # validate_chat_access, which refuses a brand whose balance is under
+    # MIN_BRAND_CHAT_BALANCE. Right after a publish the balance is at its lowest, so the
+    # client's card call was being 403'd exactly when it was needed. Writing it inline
+    # skips that gate, which is correct: this is not the brand starting a chat, it is the
+    # platform delivering a brief they already paid to hold.
+    if is_publish and campaign_doc.get("visibility") == PRIVATE_VISIBILITY and campaign_doc.get("selected_creator"):
+        invited = str(campaign_doc["selected_creator"])
+        items = campaign_doc.get("deliverable_items") or []
+        first = items[0] if items else {}
+        qty = first.get("quantity") if isinstance(first, dict) else None
+        kind = (first.get("type") if isinstance(first, dict) else None) or "Video"
+        card_created = datetime.now(timezone.utc).isoformat()
+        await db.chat_action_cards.insert_one({
+            "id": str(uuid.uuid4()),
+            "thread_key": thread_key_for(current_user["id"], invited),
+            "participants": sorted([current_user["id"], invited]),
+            "sender_id": current_user["id"],
+            "sender_nickname": current_user.get("nickname"),
+            "recipient_id": invited,
+            # Ties the card to the brief, so accepting acts on the right campaign.
+            "deal_id": campaign_id,
+            "type": "private_invitation",
+            "fields": {
+                "campaign_name": campaign_doc.get("title") or "Private brief",
+                "deliverable_summary": f"{qty or 1} x {kind}",
+                "budget": to_float(campaign_doc.get("budget_max") or campaign_doc.get("budget_min")),
+                "timeline": str(campaign_doc.get("due_date") or campaign_doc.get("deadline") or ""),
+                "usage_rights": ", ".join(campaign_doc.get("usage_platforms") or []) or "Organic social",
+                "brief_details": campaign_doc.get("brief_text") or "",
+                # The brief is not live until an admin approves it. Surfaced on the card so
+                # the creator knows what they are agreeing to.
+                "pending_admin_approval": True,
+                "response_deadline": (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(),
+            },
+            "status": "open",
+            "created_at": card_created,
+            "available_actions": get_action_card_available_actions("private_invitation"),
+            "read_by": [current_user["id"]],
+            "immutable": True,
+        })
+        await notify_user(invited, "You've received a private brief",
+                          f"{brand_name or 'A brand'} sent you a brief. Open Messages to accept or decline.",
+                          link="/messages", ntype="info", email=True, category="deal_updates")
+
     message = "Campaign published" if is_publish else "Draft campaign created"
     
     return {
