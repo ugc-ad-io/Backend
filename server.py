@@ -337,8 +337,17 @@ class ChatMessage(BaseModel):
 
 class WorkSubmission(BaseModel):
     campaign_id: str
+    # Everything delivered, edited cut FIRST. work_files[0] is treated as the primary
+    # video by the watermarker and by the brand's review screen, so the ordering is
+    # load-bearing - do not sort this list.
     work_files: List[str]
     description: str
+    # The same URLs split by kind, so the brand can tell a cut from the raw footage.
+    # Both default to [] so a client that has not been updated still submits fine and
+    # simply carries no split - work_files remains the source of truth for "what was
+    # delivered".
+    edited_files: List[str] = []
+    raw_files: List[str] = []
 
 class ReviewSubmit(BaseModel):
     campaign_id: str
@@ -8447,6 +8456,8 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         "campaign_id": data.campaign_id,
         "creator_id": current_user['id'],
         "work_files": data.work_files,
+        "edited_files": data.edited_files,
+        "raw_files": data.raw_files,
         "description": data.description,
         "status": WorkStatus.SUBMITTED,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
@@ -8465,6 +8476,8 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
                 "id": work_doc["id"],
                 "creator_id": current_user['id'],
                 "work_files": data.work_files,
+                "edited_files": data.edited_files,
+                "raw_files": data.raw_files,
                 "video_url": primary_file,
                 "creator_note": data.description,
                 "submitted_at": work_doc["submitted_at"],

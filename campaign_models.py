@@ -41,7 +41,12 @@ class DeliverableItem(BaseModel):
     quantity: int = Field(default=1, ge=1, le=5)
     duration: Optional[str] = None
     aspect_ratios: List[str] = []
+    # Creators hand over the raw footage as a matter of course, so raw_required is
+    # the baseline. edited_required is the brand asking for a CUT as well: when it is
+    # true the creator's submission screen shows a second upload slot and the deal is
+    # not deliverable with raw footage alone.
     raw_required: bool = False
+    edited_required: bool = False
 
 
 class BriefSectionsMixin(BaseModel):
