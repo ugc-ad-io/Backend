@@ -155,6 +155,15 @@ class BudgetReview(BaseModel):
 
 # Extended Campaign Create Model (supports both old and new fields)
 class CampaignCreateExtended(BriefSectionsMixin):
+    # "private" marks a brief sent to ONE creator via Private Invitation. The model
+    # drops anything it does not declare (create_campaign uses data.dict()), so without
+    # this the flag never reached the database and every approved private brief went
+    # public. Absent/None means a normal, publicly browsable brief.
+    visibility: Optional[str] = None
+    # The creator a privately-invited brief is addressed to. Undeclared until now, which
+    # meant PlanBrief's `selected_creator` was dropped on the floor by data.dict() and the
+    # brief reached the database with no tie to the creator it was written for.
+    selected_creator: Optional[str] = None
     # Legacy fields (backward compatibility)
     title: Optional[str] = None
     objectives: Optional[List[str]] = None

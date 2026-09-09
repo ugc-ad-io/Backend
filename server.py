@@ -183,6 +183,11 @@ class CampaignStatus(str, Enum):
     PAUSED = "paused"
     BANNED = "banned"
 
+# Marks a brief that was sent to ONE creator through Private Invitation. Such a brief
+# never enters the public browse list, no matter what status it reaches - only the
+# invited creator sees it (in their messages and their deals).
+PRIVATE_VISIBILITY = "private"
+
 class WorkStatus(str, Enum):
     PENDING = "pending"
     SUBMITTED = "submitted"
@@ -6803,9 +6808,19 @@ async def get_campaigns(
         # Creators see active campaigns to browse, PLUS every deal they were selected
         # for in ANY status (in_progress, work_submitted, completed, cancelled) — so
         # the "Completed" / "Cancelled" tabs of My Active Work aren't empty.
+        #
+        # A brief sent PRIVATELY to one creator (visibility == "private", written by the
+        # Private Invitation flow) must not join the public browse list once an admin
+        # approves it and it turns ACTIVE. Without the visibility filter the first arm
+        # below matches it for EVERY creator, which is precisely the leak: a brief meant
+        # for one person becomes a public campaign the moment it is approved.
+        #
+        # $ne matches documents where the field is absent, so every pre-existing campaign
+        # is still public and nothing about normal briefs changes.
         query = {
             "$or": [
-                {"status": CampaignStatus.ACTIVE},
+                {"status": CampaignStatus.ACTIVE, "visibility": {"$ne": PRIVATE_VISIBILITY}},
+                # The invited creator still sees their own brief here, in any status.
                 {"selected_creator": current_user['id']}
             ]
         }
@@ -6843,7 +6858,16 @@ async def get_campaign(campaign_id: str, current_user: dict = Depends(get_curren
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    
+
+    # A privately-invited brief belongs to ONE creator. Keeping it out of the browse
+    # list is not enough on its own - without this, any creator holding the id could
+    # still open it directly. 404 rather than 403 so the endpoint does not confirm that
+    # a brief with this id exists. Brands and admins are unaffected.
+    if (current_user.get('role') == UserRole.CREATOR
+            and campaign.get('visibility') == PRIVATE_VISIBILITY
+            and current_user['id'] not in selected_creator_ids(campaign)):
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
     # Normalize response to include both old and new fields
     campaign = normalize_campaign_response(campaign)
     
