@@ -177,6 +177,11 @@ class CampaignStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     REJECTED = "rejected"
+    # Admin moderation states, mirrored in the Node backend (server.js) so both
+    # deployments agree. PAUSED is a reversible freeze; BANNED is terminal and
+    # deliberately leaves any held escrow in place for manual settlement.
+    PAUSED = "paused"
+    BANNED = "banned"
 
 class WorkStatus(str, Enum):
     PENDING = "pending"
@@ -11477,6 +11482,231 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
             )
 
     return {"message": f"Campaign {data.action}d"}
+
+
+# -- Admin campaign moderation: pause / resume / ban / delete -----------------
+# Three deliberately distinct actions on a live campaign:
+#   pause  -> temporary freeze, fully reversible via resume. Creators cannot bid.
+#   ban    -> terminal kill. Escrow is intentionally NOT auto-refunded; the money
+#             stays held so an admin releases or refunds it manually.
+#   delete -> permanent removal of the brief and its child records.
+
+class CampaignModerationAction(BaseModel):
+    reason: Optional[str] = None
+
+
+# Statuses that still represent a live/ongoing brief -- the only ones worth
+# pausing or banning. Anything already finished/dead is rejected with a 400.
+MODERATABLE_CAMPAIGN_STATUSES = {
+    CampaignStatus.ACTIVE.value,
+    CampaignStatus.IN_PROGRESS.value,
+    CampaignStatus.PENDING_APPROVAL.value,
+    "work_submitted",
+}
+
+
+async def _get_campaign_for_moderation(campaign_id: str) -> dict:
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return campaign
+
+
+async def _notify_campaign_parties(campaign: dict, title: str, message: str, ntype: str):
+    """Tell the brand, and the selected creator if one is already engaged."""
+    brand_id = campaign.get("business_id")
+    if brand_id:
+        await notify_user(brand_id, title, message,
+                          link=f"/dashboard/business/campaign/{campaign.get('id')}",
+                          ntype=ntype, email=True, category="deal_updates")
+    creator_id = campaign.get("selected_creator")
+    if creator_id:
+        await notify_user(creator_id, title, message, link="/my-deals",
+                          ntype=ntype, email=True, category="deal_updates")
+
+
+@api_router.post("/admin/campaigns/{campaign_id}/pause")
+async def admin_pause_campaign(campaign_id: str, data: CampaignModerationAction,
+                               current_user: dict = Depends(require_cap("review_applications"))):
+    """Temporarily freeze a campaign. Reversible -- see /resume."""
+    if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    campaign = await _get_campaign_for_moderation(campaign_id)
+    status = campaign.get("status")
+
+    if status == CampaignStatus.PAUSED.value:
+        raise HTTPException(status_code=400, detail="This campaign is already paused")
+    if status == CampaignStatus.BANNED.value:
+        raise HTTPException(status_code=400, detail="This campaign is banned - it can't be paused")
+    if status not in MODERATABLE_CAMPAIGN_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Cannot pause a campaign with status: {status}")
+
+    now = datetime.now(timezone.utc).isoformat()
+    reason = (data.reason or "").strip() or "Paused by admin"
+
+    await db.campaigns.update_one({"id": campaign_id}, {"$set": {
+        "status": CampaignStatus.PAUSED.value,
+        # Remember what it was, so Resume restores the true previous state
+        # instead of blindly forcing everything back to 'active'.
+        "paused_from_status": status,
+        "pause_reason": reason,
+        "paused_at": now,
+        "paused_by": current_user['id'],
+        "updated_at": now,
+    }})
+
+    await log_admin_action(current_user, "campaign.paused", target_type="campaign",
+                           target_id=campaign_id, before={"status": status},
+                           after={"status": CampaignStatus.PAUSED.value}, reason=reason)
+
+    title = campaign.get("title") or "A campaign"
+    await _notify_campaign_parties(
+        campaign, "Campaign paused",
+        f"'{title}' has been paused by the Creasume team - {reason}. "
+        "It is hidden from creators until it is resumed.", "warning")
+
+    return {"message": "Campaign paused", "status": CampaignStatus.PAUSED.value,
+            "campaign_id": campaign_id}
+
+
+@api_router.post("/admin/campaigns/{campaign_id}/resume")
+async def admin_resume_campaign(campaign_id: str, data: CampaignModerationAction,
+                                current_user: dict = Depends(require_cap("review_applications"))):
+    """Undo a pause -- restore the status the campaign had before it was paused."""
+    if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    campaign = await _get_campaign_for_moderation(campaign_id)
+    if campaign.get("status") != CampaignStatus.PAUSED.value:
+        raise HTTPException(status_code=400, detail="Only a paused campaign can be resumed")
+
+    # Fall back to 'active' if an older paused row has no remembered status.
+    restored = campaign.get("paused_from_status") or CampaignStatus.ACTIVE.value
+    now = datetime.now(timezone.utc).isoformat()
+
+    await db.campaigns.update_one({"id": campaign_id}, {
+        "$set": {"status": restored, "resumed_at": now,
+                 "resumed_by": current_user['id'], "updated_at": now},
+        "$unset": {"paused_from_status": "", "pause_reason": "",
+                   "paused_at": "", "paused_by": ""},
+    })
+
+    await log_admin_action(current_user, "campaign.resumed", target_type="campaign",
+                           target_id=campaign_id,
+                           before={"status": CampaignStatus.PAUSED.value},
+                           after={"status": restored}, reason=data.reason)
+
+    title = campaign.get("title") or "A campaign"
+    await _notify_campaign_parties(
+        campaign, "Campaign resumed",
+        f"'{title}' is live again - the pause has been lifted.", "success")
+
+    return {"message": "Campaign resumed", "status": restored, "campaign_id": campaign_id}
+
+
+@api_router.post("/admin/campaigns/{campaign_id}/ban")
+async def admin_ban_campaign(campaign_id: str, data: CampaignModerationAction,
+                             current_user: dict = Depends(require_cap("ban_users"))):
+    """Ban a campaign. Terminal and not undoable from the admin UI.
+
+    Any escrow is deliberately left untouched (still 'reserved'/'held') so an
+    admin can decide manually whether the brand gets refunded or the creator
+    gets paid -- a ban usually means something went wrong that needs a human call.
+    """
+    if current_user['role'] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    campaign = await _get_campaign_for_moderation(campaign_id)
+    status = campaign.get("status")
+    if status == CampaignStatus.BANNED.value:
+        raise HTTPException(status_code=400, detail="This campaign is already banned")
+
+    reason = (data.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="A reason is required to ban a campaign")
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.campaigns.update_one({"id": campaign_id}, {"$set": {
+        "status": CampaignStatus.BANNED.value,
+        "ban_reason": reason,
+        "banned_at": now,
+        "banned_by": current_user['id'],
+        "updated_at": now,
+    }})
+
+    # Flag the escrow for manual handling rather than moving any money.
+    escrow = await db.escrow.find_one({"campaign_id": campaign_id}, {"_id": 0, "id": 1, "status": 1})
+    escrow_note = None
+    if escrow and escrow.get("status") in ("reserved", "held"):
+        await db.escrow.update_one({"id": escrow["id"]}, {"$set": {
+            "needs_manual_review": True,
+            "manual_review_reason": f"campaign_banned: {reason}",
+            "updated_at": now,
+        }})
+        escrow_note = escrow.get("status")
+
+    await log_admin_action(current_user, "campaign.banned", target_type="campaign",
+                           target_id=campaign_id, before={"status": status},
+                           after={"status": CampaignStatus.BANNED.value,
+                                  "escrow_status": escrow_note},
+                           reason=reason)
+
+    title = campaign.get("title") or "A campaign"
+    await _notify_campaign_parties(
+        campaign, "Campaign banned",
+        f"'{title}' has been removed by the Creasume team - {reason}. "
+        "If any funds are held for this campaign, our team will contact you about them.",
+        "error")
+
+    return {"message": "Campaign banned", "status": CampaignStatus.BANNED.value,
+            "campaign_id": campaign_id,
+            "escrow_needs_manual_release": bool(escrow_note),
+            "escrow_status": escrow_note}
+
+
+@api_router.delete("/admin/campaigns/{campaign_id}")
+async def admin_delete_campaign(campaign_id: str,
+                                current_user: dict = Depends(require_cap("ban_users"))):
+    """Permanently delete a campaign and its child records.
+
+    Blocked while money is still live (escrow reserved/held) -- ban it first and
+    settle the escrow, then delete. This keeps deletion from silently orphaning
+    a brand's funds.
+    """
+    if current_user['role'] != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    campaign = await _get_campaign_for_moderation(campaign_id)
+
+    escrow = await db.escrow.find_one(
+        {"campaign_id": campaign_id, "status": {"$in": ["reserved", "held"]}},
+        {"_id": 0, "status": 1},
+    )
+    if escrow:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"This campaign still has {escrow.get('status')} escrow. "
+                    "Release or refund the money first, then delete."),
+        )
+
+    deleted = {}
+    for coll in set(CAMPAIGN_CHILD_COLLECTIONS):
+        res = await db[coll].delete_many({"campaign_id": campaign_id})
+        if res.deleted_count:
+            deleted[coll] = res.deleted_count
+
+    await db.campaigns.delete_one({"id": campaign_id})
+
+    await log_admin_action(current_user, "campaign.deleted", target_type="campaign",
+                           target_id=campaign_id,
+                           before={"status": campaign.get("status"),
+                                   "title": campaign.get("title"),
+                                   "business_id": campaign.get("business_id")},
+                           after={"deleted": True, "children": deleted})
+
+    return {"deleted": True, "campaign_id": campaign_id, "children_deleted": deleted}
+
 
 async def auto_assign_campaign_manager(campaign_id: str):
     """Auto-assign campaign to campaign manager with least campaigns"""
