@@ -7658,6 +7658,24 @@ def _accepted_offer_amount(card: dict) -> float:
 async def enforce_brand_wallet_for_acceptance(card: dict) -> None:
     """PRD 5.9: at acceptance the brand's wallet must cover the full deal value.
     If short, the acceptance is blocked and the brand is asked to top up within 24h."""
+    # A card raised from an already-PUBLISHED brief is the exception: publishing moved
+    # the budget out of the brand's balance and into escrow, so the money is on the table
+    # already. Re-checking `balance` here would ask them to fund the same deal twice and
+    # 402 every acceptance - which is exactly what a private invitation did, because its
+    # campaign is created and funded before the card ever reaches the creator.
+    #
+    # Only skips when escrow really is reserved/held for this campaign. Cards whose
+    # deal_id is not a campaign id (custom/counter offers) simply do not match, so they
+    # keep the balance check they have always had.
+    deal_id = card.get("deal_id")
+    if deal_id:
+        already_funded = await db.escrow.find_one(
+            {"campaign_id": deal_id, "status": {"$in": ["reserved", "held"]}},
+            {"_id": 0, "id": 1},
+        )
+        if already_funded:
+            return
+
     participants = card.get("participants") or []
     users = await db.users.find({"id": {"$in": participants}}, {"_id": 0}).to_list(2)
     brand = next((u for u in users if u.get("role") == UserRole.BUSINESS), None)
