@@ -14319,13 +14319,49 @@ async def admin_escrow_list(current_user: dict = Depends(require_cap("view_finan
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view escrow")
     escrows = await db.escrow.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+
+    # Batched, not per-row. This used to run two awaited finds INSIDE the loop, so a few
+    # thousand escrows meant a few thousand round trips; adding the brand lookup row by
+    # row would have made a slow endpoint slower. Two queries total now.
+    campaign_ids = {e.get("campaign_id") for e in escrows if e.get("campaign_id")}
+    campaigns = await db.campaigns.find(
+        {"id": {"$in": list(campaign_ids)}},
+        {"_id": 0, "id": 1, "title": 1, "brand_name": 1, "business_id": 1},
+    ).to_list(20000) if campaign_ids else []
+    camp_by_id = {c["id"]: c for c in campaigns if c.get("id")}
+
+    # The brand is the escrow's business_id, falling back to the campaign's - a reserved
+    # escrow always carries one even before any creator is hired, which is exactly the
+    # case where the Brand column was blank.
+    user_ids = {e.get("creator_id") for e in escrows if e.get("creator_id")}
+    user_ids |= {e.get("business_id") for e in escrows if e.get("business_id")}
+    user_ids |= {c.get("business_id") for c in campaigns if c.get("business_id")}
+    users = await db.users.find(
+        {"id": {"$in": list(user_ids)}},
+        {"_id": 0, "id": 1, "nickname": 1, "full_name": 1, "business_name": 1, "name": 1,
+         "username": 1, "email": 1, "profile": 1},
+    ).to_list(20000) if user_ids else []
+    user_by_id = {u["id"]: u for u in users if u.get("id")}
+
     rows = []
     for e in escrows:
-        campaign = await db.campaigns.find_one({"id": e.get("campaign_id")}, {"_id": 0, "title": 1}) or {}
-        creator = await db.users.find_one({"id": e.get("creator_id")}, {"_id": 0, "nickname": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1, "profile": 1}) or {}
+        campaign = camp_by_id.get(e.get("campaign_id")) or {}
+        brand_id = e.get("business_id") or campaign.get("business_id")
+        brand_user = user_by_id.get(brand_id) or {}
+        # The campaign stores the brand's company name at publish time; prefer it, then
+        # the live user record. Empty string (not a placeholder) when neither resolves,
+        # so the table renders its own em dash.
+        brand = (campaign.get("brand_name")
+                 or person_display_name(brand_user, "")
+                 or "")
+        creator_user = user_by_id.get(e.get("creator_id")) or {}
+        # Reserved escrow has no creator yet. It used to render the literal word
+        # "Creator" for every one of those rows, which read as a real name.
+        creator = person_display_name(creator_user, "") if e.get("creator_id") else ""
         rows.append({
             "id": e.get("id"), "campaign_id": e.get("campaign_id"), "campaign_title": campaign.get("title"),
-            "creator": person_display_name(creator, "Creator"), "amount": to_float(e.get("amount")),
+            "brand": brand, "business_id": brand_id,
+            "creator": creator, "amount": to_float(e.get("amount")),
             "held_amount": to_float(e.get("amount")), "status": e.get("status"),
             "payout_status": e.get("payout_status"), "created_at": e.get("created_at"),
         })
