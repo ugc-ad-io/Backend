@@ -1289,7 +1289,11 @@ ACTION_CARDS_ONLY_DAYS = 14
 ROLLING_STRIKE_DAYS = 30
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
 PDF_MAX_BYTES = 25 * 1024 * 1024
-VIDEO_MAX_BYTES = 100 * 1024 * 1024
+# 400MB, not 100. Deliverable RAW footage is uploaded uncompressed by design - the
+# whole point is that the brand gets the untouched source - and 100MB rejected it.
+# NOTE: MAX_VIDEO_SECONDS still caps every video at 2 minutes, which raw footage
+# also routinely exceeds; that limit is deliberately left alone here.
+VIDEO_MAX_BYTES = 400 * 1024 * 1024
 MAX_IMAGES_PER_CHAT_MESSAGE = 5
 MAX_VIDEO_SECONDS = 120
 
@@ -1350,7 +1354,7 @@ def validate_upload_payload(content_type: Optional[str], filename: str, size: in
         raise HTTPException(status_code=400, detail="Images must be 10 MB or smaller.")
     if kind == "pdf":
         raise HTTPException(status_code=400, detail="PDFs must be 25 MB or smaller.")
-    raise HTTPException(status_code=400, detail="Videos must be 100 MB or smaller and 2 minutes or shorter.")
+    raise HTTPException(status_code=400, detail="Videos must be 400 MB or smaller and 2 minutes or shorter.")
 
 def get_video_duration_seconds(_content: bytes, _filename: str, _content_type: Optional[str]) -> Optional[float]:
     """Placeholder for ffprobe/moviepy integration. None means duration could not be determined."""
@@ -8060,9 +8064,21 @@ async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_
     }, {"_id": 0, "id": 1}).to_list(100)
     deal_system_messages = []
     if shared_campaigns:
+        # Scope to THIS thread's creator. deal_messages carry a creator_id precisely to
+        # pin an event to one creator's deal on a multi-creator brief (None means
+        # campaign-wide - see insert_deal_system_message). Matching on campaign_id alone
+        # ignored that, so on a brief with two or more hires every creator saw every
+        # other creator's notices in their own 1:1 chat - "Content was submitted", and
+        # anything else scoped to a specific hire.
+        #
+        # $in with None also matches documents where the field is absent, so genuinely
+        # campaign-wide messages still reach everyone.
+        thread_creator_id = (current_user['id'] if current_user.get('role') == UserRole.CREATOR
+                             else other_user_id)
         deal_system_messages = await db.deal_messages.find({
             "campaign_id": {"$in": [c["id"] for c in shared_campaigns]},
             "sender_type": "system",
+            "creator_id": {"$in": [None, thread_creator_id]},
         }, {"_id": 0}).sort("created_at", 1).to_list(1000)
 
     if not current_user.get("disable_read_receipts"):
