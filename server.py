@@ -6192,6 +6192,10 @@ async def create_draft(data: CampaignDraftCreate, current_user: dict = Depends(g
     campaign_doc.update({
         "id": campaign_id,
         "business_id": _brand_ws_id(current_user),
+        # The USER who published, as opposed to business_id, which is the team's
+        # workspace id (the owner's, for a team member). The private-invitation chat
+        # thread has to be the creator's thread with this person.
+        "created_by": current_user["id"],
         "business_nickname": current_user.get('nickname', ''),
         "brand_name": brand_name,
         "brand_logo_url": brand_logo_url,
@@ -6422,6 +6426,82 @@ async def upload_campaign_image(
     updated = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
     return normalize_campaign_response(updated)
 
+async def deliver_private_invitation(campaign: dict) -> bool:
+    """Give a private brief's chosen creator the card they accept or decline it on.
+
+    Timing is the point: this runs when the brief goes LIVE (admin approval), not when
+    the brand submits it. The card IS the accept button, and accepting starts the deal,
+    so sending it at submit time let a creator commit to a brief no admin had reviewed.
+    The brief itself is invisible to them until then - it sits in the admin queue, and
+    being private it never joins their browse list either.
+
+    Written straight to the collection instead of through POST /chat/action-cards
+    because that route runs validate_chat_access, which refuses a brand whose balance is
+    under MIN_BRAND_CHAT_BALANCE - exactly where the balance sits once publishing has
+    held the budget. This is not the brand starting a chat; it is the platform delivering
+    a brief they already paid to hold.
+
+    Idempotent: one open card per brief. Re-approving, or approving a brief that was
+    published before this moved, cannot double-invite.
+    """
+    if campaign.get("visibility") != PRIVATE_VISIBILITY:
+        return False
+    invited = str(campaign.get("selected_creator") or "")
+    campaign_id = campaign.get("id")
+    if not invited or not campaign_id:
+        return False
+    if await db.chat_action_cards.find_one(
+        {"deal_id": campaign_id, "type": "private_invitation"}, {"_id": 0, "id": 1}
+    ):
+        return False
+
+    # The brand USER who published - never whoever triggered this call, which on the
+    # approval path is an admin. business_id is the fallback for briefs published before
+    # created_by was stamped; for a solo brand the two are the same id anyway.
+    brand_user_id = str(campaign.get("created_by") or campaign.get("business_id") or "")
+    if not brand_user_id:
+        return False
+    brand = await db.users.find_one(
+        {"id": brand_user_id}, {"_id": 0, "nickname": 1, "profile": 1}
+    ) or {}
+    brand_label = ((brand.get("profile") or {}).get("business_name")
+                   or brand.get("nickname") or campaign.get("brand_name") or "A brand")
+
+    items = campaign.get("deliverable_items") or []
+    first = items[0] if isinstance(items, list) and items else {}
+    qty = first.get("quantity") if isinstance(first, dict) else None
+    kind = (first.get("type") if isinstance(first, dict) else None) or "Video"
+    await db.chat_action_cards.insert_one({
+        "id": str(uuid.uuid4()),
+        "thread_key": thread_key_for(brand_user_id, invited),
+        "participants": sorted([brand_user_id, invited]),
+        "sender_id": brand_user_id,
+        "sender_nickname": brand.get("nickname"),
+        "recipient_id": invited,
+        # Ties the card to the brief, so accepting acts on the right campaign.
+        "deal_id": campaign_id,
+        "type": "private_invitation",
+        "fields": {
+            "campaign_name": campaign.get("title") or "Private brief",
+            "deliverable_summary": f"{qty or 1} x {kind}",
+            "budget": to_float(campaign.get("budget_max") or campaign.get("budget_min")),
+            "timeline": str(campaign.get("due_date") or campaign.get("deadline") or ""),
+            "usage_rights": ", ".join(campaign.get("usage_platforms") or []) or "Organic social",
+            "brief_details": campaign.get("brief_text") or "",
+            "response_deadline": (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(),
+        },
+        "status": "open",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "available_actions": get_action_card_available_actions("private_invitation"),
+        "read_by": [brand_user_id],
+        "immutable": True,
+    })
+    await notify_user(invited, "You've received a private brief",
+                      f"{brand_label} sent you a brief. Open Messages to accept or decline.",
+                      link="/messages", ntype="info", email=True, category="deal_updates")
+    return True
+
+
 @api_router.post("/campaigns")
 async def create_campaign(data: CampaignCreateExtended, current_user: dict = Depends(get_current_user)):
     """Create campaign - supports both legacy and extended fields"""
@@ -6475,6 +6555,10 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
     campaign_doc.update({
         "id": campaign_id,
         "business_id": _brand_ws_id(current_user),
+        # The USER who published, as opposed to business_id, which is the team's
+        # workspace id (the owner's, for a team member). The private-invitation chat
+        # thread has to be the creator's thread with this person.
+        "created_by": current_user["id"],
         "business_nickname": current_user.get('nickname', ''),
         "brand_name": brand_name,
         "brand_logo_url": brand_logo_url,
@@ -6516,56 +6600,14 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
 
     await db.campaigns.insert_one(campaign_doc)
 
-    # A published PRIVATE brief needs a Private Invitation card in the creator's chat -
-    # it is the only place they can accept or reject. The brief itself is invisible to
-    # them: it sits in the admin queue, and being private it never joins their browse
-    # list either.
-    #
-    # Created HERE rather than by the client, for a reason that bit us: publishing holds
-    # the budget on the brand's wallet, and POST /chat/action-cards runs
-    # validate_chat_access, which refuses a brand whose balance is under
-    # MIN_BRAND_CHAT_BALANCE. Right after a publish the balance is at its lowest, so the
-    # client's card call was being 403'd exactly when it was needed. Writing it inline
-    # skips that gate, which is correct: this is not the brand starting a chat, it is the
-    # platform delivering a brief they already paid to hold.
-    if is_publish and campaign_doc.get("visibility") == PRIVATE_VISIBILITY and campaign_doc.get("selected_creator"):
-        invited = str(campaign_doc["selected_creator"])
-        items = campaign_doc.get("deliverable_items") or []
-        first = items[0] if items else {}
-        qty = first.get("quantity") if isinstance(first, dict) else None
-        kind = (first.get("type") if isinstance(first, dict) else None) or "Video"
-        card_created = datetime.now(timezone.utc).isoformat()
-        await db.chat_action_cards.insert_one({
-            "id": str(uuid.uuid4()),
-            "thread_key": thread_key_for(current_user["id"], invited),
-            "participants": sorted([current_user["id"], invited]),
-            "sender_id": current_user["id"],
-            "sender_nickname": current_user.get("nickname"),
-            "recipient_id": invited,
-            # Ties the card to the brief, so accepting acts on the right campaign.
-            "deal_id": campaign_id,
-            "type": "private_invitation",
-            "fields": {
-                "campaign_name": campaign_doc.get("title") or "Private brief",
-                "deliverable_summary": f"{qty or 1} x {kind}",
-                "budget": to_float(campaign_doc.get("budget_max") or campaign_doc.get("budget_min")),
-                "timeline": str(campaign_doc.get("due_date") or campaign_doc.get("deadline") or ""),
-                "usage_rights": ", ".join(campaign_doc.get("usage_platforms") or []) or "Organic social",
-                "brief_details": campaign_doc.get("brief_text") or "",
-                # The brief is not live until an admin approves it. Surfaced on the card so
-                # the creator knows what they are agreeing to.
-                "pending_admin_approval": True,
-                "response_deadline": (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(),
-            },
-            "status": "open",
-            "created_at": card_created,
-            "available_actions": get_action_card_available_actions("private_invitation"),
-            "read_by": [current_user["id"]],
-            "immutable": True,
-        })
-        await notify_user(invited, "You've received a private brief",
-                          f"{brand_name or 'A brand'} sent you a brief. Open Messages to accept or decline.",
-                          link="/messages", ntype="info", email=True, category="deal_updates")
+    # NOT here: a private brief's invitation card is created when the brief GOES LIVE,
+    # in approve_campaign. The card is the creator's accept/decline surface and accepting
+    # starts the deal, so posting it at submit time invited a creator to a brief no admin
+    # had cleared yet - they could accept, and the "admin approves first" step was
+    # effectively skipped. The guard below is a safety net: it only fires if a private
+    # brief is ever created already-active, which today's publish path never does.
+    if campaign_doc.get("status") == CampaignStatus.ACTIVE.value:
+        await deliver_private_invitation(campaign_doc)
 
     message = "Campaign published" if is_publish else "Draft campaign created"
     
@@ -6868,11 +6910,22 @@ async def get_campaigns(
         #
         # $ne matches documents where the field is absent, so every pre-existing campaign
         # is still public and nothing about normal briefs changes.
+        # The status bound on the second arm is the "admin approves first" rule. A private
+        # brief names its creator the moment the brand submits it, so an unbounded arm
+        # showed the creator a brief that was still in the admin queue (and, being their
+        # own selected_creator row, let them open it). Everything from ACTIVE onward is
+        # still matched, so the in-progress / completed / cancelled tabs are unaffected.
+        pre_approval = [
+            CampaignStatus.DRAFT.value,
+            CampaignStatus.PENDING_APPROVAL.value,
+            CampaignStatus.REJECTED.value,
+        ]
         query = {
             "$or": [
                 {"status": CampaignStatus.ACTIVE, "visibility": {"$ne": PRIVATE_VISIBILITY}},
-                # The invited creator still sees their own brief here, in any status.
-                {"selected_creator": current_user['id']}
+                # The invited creator still sees their own brief here, in any status an
+                # admin has already cleared.
+                {"selected_creator": current_user['id'], "status": {"$nin": pre_approval}}
             ]
         }
     elif current_user['role'] == UserRole.BUSINESS:
@@ -9361,9 +9414,22 @@ async def get_my_deals(current_user: dict = Depends(get_current_user)):
 
     # Match on selected_creators (any hired creator), not just the singular first pick,
     # so a creator hired as #2..N on a multi-creator brief still sees their deal.
+    #
+    # The status filter is what keeps an unapproved brief off this list. A private brief
+    # names its creator in selected_creator the moment the brand submits it, so without
+    # this the creator saw the deal - and could open it - while it was still sitting in
+    # the admin queue, which defeats "admin approves first, then it goes to the creator".
+    # Nothing live is hidden: a brief only reaches these three statuses before an admin
+    # has cleared it (rejection only happens out of pending_approval), and a public brief
+    # never names a creator until long after it goes active.
     campaigns = await db.campaigns.find({
         "$or": [{"selected_creators": current_user['id']}, {"selected_creator": current_user['id']}],
         "archived_by_creator": {"$ne": True},  # hide what the creator has archived
+        "status": {"$nin": [
+            CampaignStatus.DRAFT.value,
+            CampaignStatus.PENDING_APPROVAL.value,
+            CampaignStatus.REJECTED.value,
+        ]},
     }, {"_id": 0}).to_list(100)
 
     result = []
@@ -11519,10 +11585,9 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
     if current_user['role'] not in [UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER]:
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    campaign = await db.campaigns.find_one(
-        {"id": data.item_id},
-        {"_id": 0, "status": 1, "business_id": 1, "title": 1}
-    )
+    # Whole doc, not a four-field projection: a private brief's invitation card is built
+    # from this campaign below, and it needs the creator, deliverables, budget and brief.
+    campaign = await db.campaigns.find_one({"id": data.item_id}, {"_id": 0})
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
@@ -11543,9 +11608,16 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
         }}
     )
 
+    is_private = campaign.get("visibility") == PRIVATE_VISIBILITY and campaign.get("selected_creator")
+
     if data.action == "approve":
         # Auto-assign to a campaign manager
         await auto_assign_campaign_manager(data.item_id)
+        # THIS is where a private brief reaches its creator. Until now they had no card,
+        # no notification and no way to see the brief at all - which is the whole point of
+        # "admin approves first, then it goes to the creator".
+        if is_private:
+            await deliver_private_invitation({**campaign, "status": status})
     else:
         # Rejected → refund the reserved budget back to the brand wallet.
         await refund_campaign_reservation(data.item_id, reason="campaign_rejected")
@@ -11561,7 +11633,10 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
             await notify_user(
                 brand_id,
                 "✅ Your brief is approved and live",
-                f"'{title}' has been approved and is now live — creators can start applying.",
+                (f"'{title}' has been approved and sent to the creator you picked — "
+                 "you'll be notified when they accept or decline."
+                 if is_private else
+                 f"'{title}' has been approved and is now live — creators can start applying."),
                 link=link, ntype="success", email=True, category="deal_updates",
             )
         else:
