@@ -1291,11 +1291,13 @@ IMAGE_MAX_BYTES = 10 * 1024 * 1024
 PDF_MAX_BYTES = 25 * 1024 * 1024
 # 400MB, not 100. Deliverable RAW footage is uploaded uncompressed by design - the
 # whole point is that the brand gets the untouched source - and 100MB rejected it.
-# NOTE: MAX_VIDEO_SECONDS still caps every video at 2 minutes, which raw footage
-# also routinely exceeds; that limit is deliberately left alone here.
 VIDEO_MAX_BYTES = 400 * 1024 * 1024
 MAX_IMAGES_PER_CHAT_MESSAGE = 5
-MAX_VIDEO_SECONDS = 120
+# 400 seconds (6m40s), up from 120. Raw deliverable footage is uploaded uncompressed
+# and routinely runs past two minutes, so the duration cap rejected it even once the
+# size cap allowed it. Raised globally - the same validator serves chat and portfolio
+# uploads, so those accept longer clips now too.
+MAX_VIDEO_SECONDS = 400
 
 IMAGE_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"}
 PDF_CONTENT_TYPES = {"application/pdf"}
@@ -1354,7 +1356,7 @@ def validate_upload_payload(content_type: Optional[str], filename: str, size: in
         raise HTTPException(status_code=400, detail="Images must be 10 MB or smaller.")
     if kind == "pdf":
         raise HTTPException(status_code=400, detail="PDFs must be 25 MB or smaller.")
-    raise HTTPException(status_code=400, detail="Videos must be 400 MB or smaller and 2 minutes or shorter.")
+    raise HTTPException(status_code=400, detail=f"Videos must be 400 MB or smaller and {MAX_VIDEO_SECONDS // 60} minutes or shorter.")
 
 def get_video_duration_seconds(_content: bytes, _filename: str, _content_type: Optional[str]) -> Optional[float]:
     """Placeholder for ffprobe/moviepy integration. None means duration could not be determined."""
