@@ -11763,25 +11763,46 @@ async def admin_delete_campaign(campaign_id: str,
                                 current_user: dict = Depends(require_cap("ban_users"))):
     """Permanently delete a campaign and its child records.
 
-    Blocked while money is still live (escrow reserved/held) -- ban it first and
-    settle the escrow, then delete. This keeps deletion from silently orphaning
-    a brand's funds.
+    Any escrow still reserved or held is refunded to the brand first. That has to
+    happen here rather than being left to the admin: escrow rows are child records
+    of the campaign, so deleting it removes them, and money still held would go with
+    them.
     """
     if current_user['role'] != UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Admin access required")
 
     campaign = await _get_campaign_for_moderation(campaign_id)
 
-    escrow = await db.escrow.find_one(
-        {"campaign_id": campaign_id, "status": {"$in": ["reserved", "held"]}},
-        {"_id": 0, "status": 1},
-    )
-    if escrow:
-        raise HTTPException(
-            status_code=400,
-            detail=(f"This campaign still has {escrow.get('status')} escrow. "
-                    "Release or refund the money first, then delete."),
-        )
+    # Give the brand its money back BEFORE the records go. Deleting used to be blocked
+    # while escrow was live, which left an admin having to ban, then refund by hand, then
+    # come back and delete. Worse, the escrow rows are child records: deleting the
+    # campaign removes them, so any money still held would have been destroyed along with
+    # the only record of it.
+    #
+    # Same semantics as admin_refund_escrow: gross_amount or amount, credited to the
+    # campaign's business_id, with a wallet_ledger entry and a notification, so a refund
+    # made this way is indistinguishable from one made by the Refund button.
+    live_escrows = await db.escrow.find(
+        {"campaign_id": campaign_id, "status": {"$in": ["reserved", "held"]}}, {"_id": 0},
+    ).to_list(200)
+    refunded_total = 0.0
+    for esc in live_escrows:
+        business_id = campaign.get("business_id") or esc.get("business_id")
+        amount = to_float(esc.get("gross_amount") or esc.get("amount"))
+        if not business_id or amount <= 0:
+            continue
+        note = f"Campaign deleted by admin: {campaign.get('title') or campaign_id}"
+        await db.users.update_one({"id": business_id}, {"$inc": {"balance": amount}})
+        await db.wallet_ledger.insert_one({
+            "id": str(uuid.uuid4()), "user_id": business_id, "transaction_id": str(uuid.uuid4()),
+            "campaign_id": campaign_id,
+            "type": "escrow_refund", "direction": "credit", "amount": round(amount, 2),
+            "status": "success", "note": note, "created_at": now_iso(), "date": now_iso(),
+        })
+        refunded_total += amount
+        await notify_user(business_id, "Escrow refunded",
+                          f"₹{int(amount)} held for a deleted campaign was refunded to your wallet.",
+                          link="/dashboard/business/wallet", ntype="success", email=True, category="payments")
 
     deleted = {}
     for coll in set(CAMPAIGN_CHILD_COLLECTIONS):
@@ -11796,9 +11817,11 @@ async def admin_delete_campaign(campaign_id: str,
                            before={"status": campaign.get("status"),
                                    "title": campaign.get("title"),
                                    "business_id": campaign.get("business_id")},
-                           after={"deleted": True, "children": deleted})
+                           after={"deleted": True, "children": deleted,
+                                  "refunded_to_brand": round(refunded_total, 2)})
 
-    return {"deleted": True, "campaign_id": campaign_id, "children_deleted": deleted}
+    return {"deleted": True, "campaign_id": campaign_id, "children_deleted": deleted,
+            "refunded_to_brand": round(refunded_total, 2)}
 
 
 async def auto_assign_campaign_manager(campaign_id: str):
