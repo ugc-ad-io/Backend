@@ -55,7 +55,7 @@ from applications import applications_router
 from categories import categories_router, seed_categories
 from gigs import gigs_router
 import creator_features as cf
-from storage import persist_file, cloudinary_enabled
+from storage import persist_file, cloudinary_enabled, CloudStorageError
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -13193,20 +13193,23 @@ async def admin_set_top_earners(data: TopEarnersUpdate, current_user: dict = Dep
     )
     return {"items": items}
 
-@api_router.get("/admin/top-earners/suggest")
-async def admin_suggest_top_earners(limit: int = 3, current_user: dict = Depends(require_cap("edit_settings"))):
-    """Compute the REAL top-earning creators from released payouts, so the admin can
-    seed the showcase from live data instead of typing it. Returns the same item
-    shape as the showcase; the admin can then edit and Save."""
-    n = max(1, min(int(limit or 3), 10))
-    released = await db.escrow.find({"status": "released"}, {"_id": 0, "campaign_id": 1, "net_payable": 1, "creator_payout": 1, "amount": 1}).to_list(20000)
-    camp_ids = list({e.get("campaign_id") for e in released if e.get("campaign_id")})
-    camps = await db.campaigns.find({"id": {"$in": camp_ids}}, {"_id": 0, "id": 1, "selected_creator": 1}).to_list(20000) if camp_ids else []
-    camp_to_creator = {c["id"]: c.get("selected_creator") for c in camps if c.get("id")}
-
+async def _creator_earnings_totals() -> dict:
+    """Released earnings per creator, keyed by the escrow's OWN creator_id (a deal is now
+    per-creator, so this is the source of truth) — falling back to the campaign's
+    selected_creator only for legacy escrow rows that predate the creator_id field."""
+    released = await db.escrow.find(
+        {"status": "released"},
+        {"_id": 0, "campaign_id": 1, "creator_id": 1, "net_payable": 1, "creator_payout": 1, "amount": 1},
+    ).to_list(20000)
+    # Resolve only the legacy rows that have no creator_id, via their campaign.
+    need_camp = list({e.get("campaign_id") for e in released if not e.get("creator_id") and e.get("campaign_id")})
+    camp_to_creator = {}
+    if need_camp:
+        camps = await db.campaigns.find({"id": {"$in": need_camp}}, {"_id": 0, "id": 1, "selected_creator": 1}).to_list(20000)
+        camp_to_creator = {c["id"]: c.get("selected_creator") for c in camps if c.get("id")}
     totals = {}
     for e in released:
-        cid = camp_to_creator.get(e.get("campaign_id"))
+        cid = e.get("creator_id") or camp_to_creator.get(e.get("campaign_id"))
         if not cid:
             continue
         pay = to_float(e.get("net_payable") if e.get("net_payable") is not None
@@ -13214,13 +13217,37 @@ async def admin_suggest_top_earners(limit: int = 3, current_user: dict = Depends
         t = totals.setdefault(cid, {"earned": 0.0, "deals": 0})
         t["earned"] += pay
         t["deals"] += 1
+    return totals
 
-    top = sorted(totals.items(), key=lambda kv: kv[1]["earned"], reverse=True)[:n]
-    out = []
-    for cid, agg in top:
-        u = await db.users.find_one({"id": cid}, {"_id": 0}) or {}
-        out.append(_creator_showcase_item(u, agg))
-    return {"items": out}
+
+async def _approved_creator_docs() -> list:
+    return await db.users.find(
+        {"role": "creator", "approval_status": "approved"},
+        {"_id": 0, "id": 1, "nickname": 1, "full_name": 1, "profile": 1, "average_rating": 1,
+         "level": 1, "category": 1, "portfolio": 1, "deals_completed": 1},
+    ).to_list(5000)
+
+
+@api_router.get("/admin/top-earners/suggest")
+async def admin_suggest_top_earners(limit: int = 3, current_user: dict = Depends(require_cap("edit_settings"))):
+    """Seed the showcase from live data instead of typing it. Ranks creators by REAL
+    released earnings; if no payout has been released yet (a brand-new platform), falls
+    back to the top approved creators by rating so the auto-fill still returns cards to
+    edit rather than coming back empty. Nothing is written until the admin hits Save."""
+    n = max(1, min(int(limit or 3), 10))
+    totals = await _creator_earnings_totals()
+    if totals:
+        top = sorted(totals.items(), key=lambda kv: kv[1]["earned"], reverse=True)[:n]
+        out = []
+        for cid, agg in top:
+            u = await db.users.find_one({"id": cid}, {"_id": 0}) or {}
+            out.append(_creator_showcase_item(u, agg))
+        return {"items": out, "source": "earnings"}
+    # No released payouts yet — fall back to approved creators ranked by rating then deals.
+    creators = await _approved_creator_docs()
+    creators.sort(key=lambda u: (to_float(u.get("average_rating")), int(u.get("deals_completed") or 0)), reverse=True)
+    out = [_creator_showcase_item(u, None) for u in creators[:n]]
+    return {"items": out, "source": "creators"}
 
 def _creator_showcase_item(u: dict, agg: dict) -> dict:
     """Map a creator user + earnings aggregate into a showcase card, including the
@@ -13250,24 +13277,8 @@ def _creator_showcase_item(u: dict, agg: dict) -> dict:
 async def admin_showcase_creators(current_user: dict = Depends(require_cap("edit_settings"))):
     """Every approved creator + their real earnings, for the per-card picker on the
     Home Showcase editor. Sorted by earnings so the top earners surface first."""
-    released = await db.escrow.find({"status": "released"}, {"_id": 0, "campaign_id": 1, "net_payable": 1, "creator_payout": 1, "amount": 1}).to_list(20000)
-    camp_ids = list({e.get("campaign_id") for e in released if e.get("campaign_id")})
-    camps = await db.campaigns.find({"id": {"$in": camp_ids}}, {"_id": 0, "id": 1, "selected_creator": 1}).to_list(20000) if camp_ids else []
-    camp_to_creator = {c["id"]: c.get("selected_creator") for c in camps if c.get("id")}
-    totals = {}
-    for e in released:
-        cid = camp_to_creator.get(e.get("campaign_id"))
-        if not cid:
-            continue
-        pay = to_float(e.get("net_payable") if e.get("net_payable") is not None
-                       else (e.get("creator_payout") if e.get("creator_payout") is not None else e.get("amount")))
-        t = totals.setdefault(cid, {"earned": 0.0, "deals": 0})
-        t["earned"] += pay
-        t["deals"] += 1
-    creators = await db.users.find(
-        {"role": "creator", "approval_status": "approved"},
-        {"_id": 0, "id": 1, "nickname": 1, "full_name": 1, "profile": 1, "average_rating": 1, "level": 1, "category": 1, "portfolio": 1},
-    ).to_list(5000)
+    totals = await _creator_earnings_totals()
+    creators = await _approved_creator_docs()
     out = [_creator_showcase_item(u, totals.get(u.get("id"))) for u in creators]
     out.sort(key=lambda x: x.get("earned", 0), reverse=True)
     return {"items": out}
@@ -15582,7 +15593,7 @@ app.add_middleware(UploadsCORSMiddleware)
 # `Access-Control-Allow-Credentials: true`. With an explicit origin list, Starlette
 # echoes the exact request origin (e.g. https://www.ugcad.io) instead of '*', which
 # browsers accept. Override/extend via the CORS_ORIGINS env var (comma-separated).
-_DEFAULT_CORS_ORIGINS = "https://www.ugcad.io,https://ugcad.io,http://localhost:3000"
+_DEFAULT_CORS_ORIGINS = "https://www.ugcad.io,https://ugcad.io,http://localhost:3000,http://10.0.2.2:3000"
 _cors_origins = [o.strip() for o in os.environ.get('CORS_ORIGINS', _DEFAULT_CORS_ORIGINS).split(',') if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -15713,6 +15724,23 @@ except Exception as _enc_err:  # pragma: no cover
 
 from fastapi.responses import JSONResponse as _JSONResponse
 import traceback as _traceback
+
+
+@app.exception_handler(CloudStorageError)
+async def _cloud_storage_error_handler(request: Request, exc: CloudStorageError):
+    """Cloudinary rejected an upload (quota/size). One handler covers every
+    persist_file() callsite — profile photos, logos, chat files, work
+    submissions — so the uploader always gets the real reason instead of a
+    silent fallback that loses the file on the next deploy."""
+    origin = request.headers.get("origin") or "*"
+    return _JSONResponse(
+        status_code=502,
+        content={"detail": str(exc)},
+        headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+        },
+    )
 
 
 @app.exception_handler(Exception)
