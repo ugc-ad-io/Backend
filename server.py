@@ -13197,12 +13197,20 @@ async def admin_set_top_earners(data: TopEarnersUpdate, current_user: dict = Dep
     )
     return {"items": items}
 
+# Escrow states that represent a REAL deal a creator was hired for (money committed to
+# them), for the Home Showcase numbers. Excludes "reserved" (the brand's unfilled-slot
+# budget — no creator yet) and "refunded" (money returned).
+SHOWCASE_DEAL_ESCROW_STATUSES = ["released", "held", "on_hold", "disputed"]
+
 async def _creator_earnings_totals() -> dict:
-    """Released earnings per creator, keyed by the escrow's OWN creator_id (a deal is now
-    per-creator, so this is the source of truth) — falling back to the campaign's
-    selected_creator only for legacy escrow rows that predate the creator_id field."""
+    """Deal value + count per creator for the showcase, keyed by the escrow's OWN
+    creator_id (a deal is now per-creator, so this is the source of truth) — falling
+    back to the campaign's selected_creator only for legacy rows without a creator_id.
+
+    Counts EVERY deal the creator was hired for (held + released, not just paid-out),
+    so the showcase reflects real activity instead of ₹0 before any payout releases."""
     released = await db.escrow.find(
-        {"status": "released"},
+        {"status": {"$in": SHOWCASE_DEAL_ESCROW_STATUSES}},
         {"_id": 0, "campaign_id": 1, "creator_id": 1, "net_payable": 1, "creator_payout": 1, "amount": 1},
     ).to_list(20000)
     # Resolve only the legacy rows that have no creator_id, via their campaign.
