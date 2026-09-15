@@ -16,11 +16,21 @@ Configure with either:
 from __future__ import annotations
 
 import io
+import logging
 import os
 from pathlib import Path
 from typing import Optional
 
+logger = logging.getLogger("storage")
+
 _cloudinary_ready: Optional[bool] = None
+
+
+class CloudStorageError(Exception):
+    """Cloudinary is configured but rejected the upload (plan limit, file too
+    large, quota exhausted). Raised instead of falling back to the local disk,
+    because on Render that disk is ephemeral — the file would 404 after the
+    next deploy, silently destroying creator work."""
 
 
 def _ensure_cloudinary() -> bool:
@@ -86,8 +96,11 @@ def upload_to_cloudinary(content: bytes, public_id: str, kind: Optional[str] = N
         else:
             result = cloudinary.uploader.upload(stream, **options)
         return result.get("secure_url")
-    except Exception:
-        # Surface as a fallback to local disk rather than failing the request.
+    except Exception as exc:
+        # Log the REAL reason (quota exhausted, file over the plan's size cap…)
+        # so a failing upload is visible in Render logs instead of silent.
+        logger.error("[cloudinary] upload failed for %s (kind=%s, %.1f MB): %s",
+                     public_id, kind, len(content) / (1024 * 1024), exc)
         return None
 
 
@@ -103,11 +116,23 @@ def persist_file(
     """Store an uploaded file and return a retrievable URL.
 
     Prefers Cloudinary (persistent); falls back to writing to the local uploads
-    disk and returning ``public_path`` (e.g. ``/uploads/profiles/x.jpg``)."""
+    disk and returning ``public_path`` (e.g. ``/uploads/profiles/x.jpg``) ONLY
+    when Cloudinary isn't configured at all (local dev). When Cloudinary is
+    configured but rejects the file, this raises CloudStorageError instead —
+    a local-disk fallback on Render just stores a path that 404s after the
+    next deploy (this silently destroyed creator work submissions before)."""
     public_id = Path(unique_filename).stem
     url = upload_to_cloudinary(content, public_id=public_id, kind=kind, folder=cloud_folder)
     if url:
         return url
+
+    if _ensure_cloudinary():
+        size_mb = len(content) / (1024 * 1024)
+        raise CloudStorageError(
+            f"Could not store this file ({size_mb:.0f} MB). It may be larger than the "
+            "media plan allows, or the monthly storage quota is exhausted. "
+            "Please try a smaller file; if this keeps happening, contact support."
+        )
 
     local_dir.mkdir(parents=True, exist_ok=True)
     with open(local_dir / unique_filename, "wb") as handle:

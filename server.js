@@ -212,6 +212,21 @@ app.get('/api/business/creator-directory', auth, async (req, res) => {
         portfolio_preview: preview,
         portfolio: mediaList(portfolio),
         deliverables_completed: (jobsByCreator.get(String(u._id)) || new Set()).size,
+        // Fields the app's creator quick-preview sheet and full profile show.
+        // The creator setup form stores these inside the Mixed `profile`, so
+        // they are unwrapped here rather than read off the top-level document.
+        bio: p.bio || p.description || '',
+        // "Rs. X / video" — the 30s rate is the headline price on the sheet.
+        price_per_video: Number(p.rate_card && (p.rate_card.video_30s || p.rate_card.video_60s)) || 0,
+        rate_card: p.rate_card || {},
+        level: u.level || 1,
+        level_label: User.LEVEL_LABELS[User.levelKeyOf(u.level)],
+        average_rating: Number(u.average_rating) || 0,
+        total_reviews: Number(u.total_reviews) || 0,
+        location: p.country || p.location || p.city || 'India',
+        languages: p.languages || [],
+        social_links: p.social_links || {},
+        kyc_verified: Boolean(u.kyc && u.kyc.status === 'verified'),
         premium: Boolean(preview) && /\.(mp4|webm|mov|m4v)$/i.test(String(preview).split('?')[0]),
       };
     }));
@@ -2488,6 +2503,132 @@ app.post('/api/campaigns/:id/shortlist/:creatorId/invite', auth, async (req, res
 
 // ── Brand: request a fresh shortlist (manual curation) ───────────────────────
 app.post('/api/campaigns/:id/shortlist/request-new', auth, async (req, res) => res.json({ success: true, message: 'New shortlist requested' }));
+
+// ── Reviews left on a brand ──────────────────────────────────────────────────
+// Reviews live on the reviewed user's document (see POST /api/reviews), so this
+// is the same read as /api/reviews/creator/:id. It exists because the app's
+// Reviews screen asks for /business/:id when the signed-in user is a brand, and
+// without this route that request 404'd and brands saw no reviews at all.
+app.get('/api/reviews/business/:id', auth, async (req, res) => {
+  try {
+    const u = await User.findById(req.params.id).select('reviews').lean();
+    res.json((u && u.reviews) || []);
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+// ── Brand: decline a bid ─────────────────────────────────────────────────────
+// Bids are plain sub-objects on the campaign with no id of their own, so the
+// creator_id identifies which one to decline. Declining only marks that bid —
+// the brief stays open and the other bids are untouched.
+app.post('/api/campaigns/:id/bids/:creatorId/decline', auth, async (req, res) => {
+  try {
+    const c = await Campaign.findById(req.params.id);
+    if (!c) return res.status(404).json({ detail: 'Campaign not found' });
+    if (req.user.role !== 'business') {
+      return res.status(403).json({ detail: 'Only brands can decline a bid.' });
+    }
+    if (req.user.team_role === 'viewer') {
+      return res.status(403).json({ detail: 'Your team role is view-only.' });
+    }
+    if (String(c.business_id) !== String(workspaceId(req))) {
+      return res.status(403).json({ detail: 'This campaign belongs to another brand.' });
+    }
+
+    const creatorId = String(req.params.creatorId);
+    const bids = c.bids || [];
+    const idx = bids.findIndex((b) => String(b.creator_id) === creatorId);
+    if (idx < 0) return res.status(404).json({ detail: 'Bid not found' });
+    // A creator already hired for this brief cannot be un-hired here; that is a
+    // deal-level action with money already in escrow.
+    if ((c.selected_creators || []).map(String).includes(creatorId)) {
+      return res.status(409).json({ detail: 'This creator has already been hired.' });
+    }
+    if (bids[idx].status === 'declined') {
+      return res.json({ success: true, already_declined: true });
+    }
+
+    bids[idx].status = 'declined';
+    bids[idx].declined_at = new Date();
+    c.markModified('bids');
+    await c.save();
+
+    // notifyUser swallows its own errors, so a notification failure can never
+    // fail a decline that has already been written.
+    await notifyUser(
+      creatorId,
+      'bid_declined',
+      'Application not selected',
+      `Your application for "${c.title}" was not selected.`
+    );
+
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+// ── Saved briefs (creator bookmarks a campaign) ──────────────────────────────
+// Stored as campaign ids on the user document, so the list follows the account
+// across devices instead of living only on the phone that saved it.
+app.get('/api/saved-briefs', auth, async (req, res) => {
+  try {
+    const u = await User.findById(req.user.id).select('saved_briefs').lean();
+    res.json({ campaign_ids: ((u && u.saved_briefs) || []).map(String) });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+app.post('/api/saved-briefs/:id', auth, async (req, res) => {
+  try {
+    const u = await User.findById(req.user.id);
+    if (!u) return res.status(404).json({ detail: 'User not found' });
+    // Saving a brief that no longer exists would leave an id that can never
+    // render, so verify it first rather than storing a dead reference.
+    const exists = await Campaign.exists({ _id: req.params.id });
+    if (!exists) return res.status(404).json({ detail: 'Campaign not found' });
+    const id = String(req.params.id);
+    u.saved_briefs = u.saved_briefs || [];
+    if (!u.saved_briefs.includes(id)) u.saved_briefs.push(id);
+    await u.save();
+    res.json({ saved: true, campaign_ids: u.saved_briefs.map(String) });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+app.delete('/api/saved-briefs/:id', auth, async (req, res) => {
+  try {
+    const u = await User.findById(req.user.id);
+    if (!u) return res.status(404).json({ detail: 'User not found' });
+    const id = String(req.params.id);
+    u.saved_briefs = (u.saved_briefs || []).filter((c) => String(c) !== id);
+    await u.save();
+    res.json({ saved: false, campaign_ids: u.saved_briefs.map(String) });
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
+
+// ── Work submissions for one campaign ────────────────────────────────────────
+// The brand's campaign detail screen lists what was submitted against a brief.
+// Only the owning brand (or an admin) may read it.
+app.get('/api/work/campaign/:id', auth, async (req, res) => {
+  try {
+    const c = await Campaign.findById(req.params.id).lean();
+    if (!c) return res.status(404).json({ detail: 'Campaign not found' });
+    const isOwner = String(c.business_id) === String(workspaceId(req));
+    if (!isOwner && req.user.role !== 'admin') {
+      return res.status(403).json({ detail: 'Not your campaign' });
+    }
+    const w = c.work_submission;
+    if (!w) return res.json([]);
+    // Stored as a single submission object; the screen expects a list.
+    res.json([{
+      id: String(c._id),
+      campaign_id: String(c._id),
+      campaign_title: c.title,
+      creator_id: w.creator_id,
+      public_creator_id: w.public_creator_id,
+      work_files: w.work_files || [],
+      description: w.description || '',
+      submitted_at: w.submitted_at,
+      status: w.status || 'pending_review'
+    }]);
+  } catch (e) { res.status(500).json({ detail: e.message }); }
+});
 
 // ── Gig wishlist (toggle + count) ────────────────────────────────────────────
 const Gig = require('./models/Gig');

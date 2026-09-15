@@ -99,6 +99,9 @@ const userSchema = new mongoose.Schema(
     public_creator_id: { type: String, default: null },
     profile: { type: mongoose.Schema.Types.Mixed, default: {} },
     portfolio: { type: mongoose.Schema.Types.Mixed, default: [] },
+    // Campaigns this creator bookmarked from the browse screen. Stored on the
+    // user (not the campaign) so the list follows the account to any device.
+    saved_briefs: { type: [String], default: [] },
     reviews: { type: [mongoose.Schema.Types.Mixed], default: [] },
     average_rating: { type: Number, default: 0 },
     total_reviews: { type: Number, default: 0 },
@@ -202,6 +205,7 @@ userSchema.methods.toPublic = function () {
     level_label: LEVEL_LABELS[levelKeyOf(this.level)],
     profile: this.profile || {},
     portfolio: this.portfolio || [],
+    saved_briefs: (this.saved_briefs || []).map(String),
     review: this.review || {},
     submitted_at: this.submitted_at,
     created_at: this.createdAt

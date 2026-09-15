@@ -5688,6 +5688,8 @@ async def upload_profile_photo(file: UploadFile = File(...), current_user: dict 
         )
         
         return {"photo_url": photo_url}
+    except CloudStorageError:
+        raise  # handled globally with the real reason (quota/size)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload photo: {str(e)}")
 
@@ -5724,6 +5726,8 @@ async def upload_profile_banner(file: UploadFile = File(...), current_user: dict
             }}
         )
         return {"banner": banner_url}
+    except CloudStorageError:
+        raise  # handled globally with the real reason (quota/size)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload banner: {str(e)}")
 
@@ -12551,7 +12555,7 @@ async def upload_file(file: UploadFile = File(...), current_user: dict = Depends
         }
         await db.uploaded_files.insert_one(metadata)
         return {key: value for key, value in metadata.items() if key != "_id"}
-    except HTTPException:
+    except (HTTPException, CloudStorageError):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
@@ -12663,7 +12667,7 @@ async def upload_campaign_file(file: UploadFile = File(...), current_user: dict 
         }
         await db.uploaded_files.insert_one(file_doc)
         return {"file_url": file_url, "filename": file.filename, "content_type": file.content_type, "size": len(content)}
-    except HTTPException:
+    except (HTTPException, CloudStorageError):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
