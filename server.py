@@ -2485,6 +2485,9 @@ def normalize_wallet_transaction(source: dict, default_type: str = "Wallet Recha
     elif tx_type in ["escrow_refund", "refund_escrow"]:
         tx_type = "Escrow Refund"
         direction = "credit"
+    elif tx_type in ["goodwill_credit"]:
+        tx_type = "Goodwill Credit"
+        direction = "credit"
     elif tx_type in ["refund", "wallet_refund"]:
         tx_type = "Refund"
         direction = "credit"
@@ -4127,19 +4130,27 @@ async def submit_business_gst(data: BusinessGSTSubmit, current_user: dict = Depe
 async def get_business_wallet(current_user: dict = Depends(get_approved_business_user)):
     if current_user.get("role") != UserRole.BUSINESS:
         raise HTTPException(status_code=403, detail="Only business users can access this resource")
-    balance = to_float(current_user.get("balance"))
-    settings = await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0})
+    # Wallet money (escrow credits/refunds/goodwill) is always applied to the workspace
+    # OWNER's user doc (every write site keys off campaign.business_id, which is
+    # _brand_ws_id) — so a team member viewing this page must read the SAME owner
+    # record, not their own personal `balance`, or the shared wallet reads as empty.
+    ws_id = _brand_ws_id(current_user)
+    wallet_owner = current_user if ws_id == current_user.get("id") else (
+        await db.users.find_one({"id": ws_id}, {"_id": 0}) or current_user
+    )
+    balance = to_float(wallet_owner.get("balance"))
+    settings = await db.business_settings.find_one({"business_id": ws_id}, {"_id": 0})
     plan_name = (
         ((settings or {}).get("billing") or {}).get("plan_name") or
         current_user.get("plan_name") or
         "Brand Starter"
     )
 
-    ledger_rows = await db.wallet_ledger.find({"user_id": current_user["id"]}, {"_id": 0}).to_list(1000)
+    ledger_rows = await db.wallet_ledger.find({"user_id": ws_id}, {"_id": 0}).to_list(1000)
     ledger_transaction_ids = {row.get("transaction_id") for row in ledger_rows if row.get("transaction_id")}
     transactions = [normalize_wallet_transaction(row) for row in ledger_rows]
 
-    payment_rows = await db.payment_transactions.find({"user_id": current_user["id"]}, {"_id": 0}).to_list(1000)
+    payment_rows = await db.payment_transactions.find({"user_id": ws_id}, {"_id": 0}).to_list(1000)
     for row in payment_rows:
         if row.get("id") in ledger_transaction_ids:
             continue
@@ -4147,7 +4158,7 @@ async def get_business_wallet(current_user: dict = Depends(get_approved_business
         transactions.append(normalize_wallet_transaction(row, tx_type, "credit"))
 
     brand_campaigns = await db.campaigns.find(
-        {"business_id": _brand_ws_id(current_user)},
+        {"business_id": ws_id},
         {"_id": 0, "id": 1, "title": 1, "status": 1, "budget": 1, "budget_min": 1, "budget_max": 1, "created_at": 1, "submitted_at": 1},
     ).to_list(10000)
     campaign_ids = [campaign.get("id") for campaign in brand_campaigns if campaign.get("id")]
@@ -6934,8 +6945,14 @@ async def get_campaigns(
             "$or": [
                 {"status": CampaignStatus.ACTIVE, "visibility": {"$ne": PRIVATE_VISIBILITY}},
                 # The invited creator still sees their own brief here, in any status an
-                # admin has already cleared.
-                {"selected_creator": current_user['id'], "status": {"$nin": pre_approval}}
+                # admin has already cleared. Checks BOTH the legacy singular field and
+                # the `selected_creators` array — the singular only ever holds the
+                # FIRST hired creator, so creator #2+ on a multi-creator brief matched
+                # neither arm and their own deal vanished from "My Active Work".
+                {
+                    "$or": [{"selected_creator": current_user['id']}, {"selected_creators": current_user['id']}],
+                    "status": {"$nin": pre_approval},
+                },
             ]
         }
     elif current_user['role'] == UserRole.BUSINESS:
@@ -8718,10 +8735,14 @@ async def download_work(work_id: str, current_user: dict = Depends(get_current_u
     if not work:
         campaign_match = await find_campaign_by_any_id(work_id)
         cid = (campaign_match or {}).get("id", work_id)
+        _, suffix_creator = split_deal_id(work_id)
+        base_query = {"campaign_id": cid}
+        if suffix_creator:
+            base_query["creator_id"] = suffix_creator
         work = await db.work_submissions.find_one(
-            {"campaign_id": cid, "status": WorkStatus.APPROVED}, {"_id": 0}, sort=[("submitted_at", -1)]
+            {**base_query, "status": WorkStatus.APPROVED}, {"_id": 0}, sort=[("submitted_at", -1)]
         ) or await db.work_submissions.find_one(
-            {"campaign_id": cid}, {"_id": 0}, sort=[("submitted_at", -1)]
+            base_query, {"_id": 0}, sort=[("submitted_at", -1)]
         )
     if not work:
         raise HTTPException(status_code=404, detail="No submitted work found for this deal")
@@ -9026,6 +9047,13 @@ async def release_scheduled_payout(escrow: dict) -> bool:
     brand_credit = float(escrow.get('penalty_brand_credit') or 0)
     if brand_credit > 0 and campaign.get('business_id'):
         await db.users.update_one({"id": campaign['business_id']}, {"$inc": {"balance": brand_credit}})
+        await db.wallet_ledger.insert_one({
+            "id": str(uuid.uuid4()), "user_id": campaign['business_id'], "transaction_id": str(uuid.uuid4()),
+            "campaign_id": campaign['id'],
+            "type": "goodwill_credit", "direction": "credit", "amount": round(brand_credit, 2),
+            "status": "success", "note": "Late-delivery penalty goodwill credit",
+            "created_at": now, "date": now,
+        })
         await notify_user(campaign['business_id'], "Goodwill credit applied", f"₹{int(brand_credit)} was credited to your wallet from a late-delivery penalty.", link="/dashboard/business/wallet")
 
     await create_payout_receipt(
@@ -10744,10 +10772,15 @@ async def mark_shipment_picked_up(deal_id: str, current_user: dict = Depends(get
 
 @api_router.post("/deals/{deal_id}/approve")
 async def approve_deal_content(deal_id: str, current_user: dict = Depends(get_current_user)):
-    campaign = await get_brand_deal_campaign(deal_id, current_user)
-    work = await db.work_submissions.find_one(
-        {"campaign_id": campaign['id']}, {"_id": 0}, sort=[("submitted_at", -1)]
-    )
+    # On a multi-creator brief, deal_id carries a "~<creator_id>" suffix (see
+    # get_brand_deal_context) — without resolving it, this always grabbed whichever
+    # creator submitted LAST across the whole campaign, so approving creator A's row
+    # could silently approve+pay creator B instead.
+    campaign, creator_id = await get_brand_deal_context(deal_id, current_user)
+    query = {"campaign_id": campaign['id']}
+    if creator_id:
+        query["creator_id"] = creator_id
+    work = await db.work_submissions.find_one(query, {"_id": 0}, sort=[("submitted_at", -1)])
     if not work:
         raise HTTPException(status_code=404, detail="No submitted work to approve")
     return await approve_work(work['id'], current_user)
@@ -10777,10 +10810,11 @@ async def request_deal_revision(deal_id: str, data: DealRevisionRequest, current
             status_code=400,
             detail="Revision requests can't include phone numbers or email addresses. Please keep all communication on-platform.",
         )
-    campaign = await get_brand_deal_campaign(deal_id, current_user)
-    work = await db.work_submissions.find_one(
-        {"campaign_id": campaign['id']}, {"_id": 0}, sort=[("submitted_at", -1)]
-    )
+    campaign, creator_id = await get_brand_deal_context(deal_id, current_user)
+    revise_query = {"campaign_id": campaign['id']}
+    if creator_id:
+        revise_query["creator_id"] = creator_id
+    work = await db.work_submissions.find_one(revise_query, {"_id": 0}, sort=[("submitted_at", -1)])
     if not work:
         raise HTTPException(status_code=404, detail="No submitted work to revise")
     # request_revision expects a RevisionRequestIn model (it reads .items/.feedback);
@@ -10866,6 +10900,77 @@ async def get_work_pending_review(current_user: dict = Depends(get_current_user)
     # Brand review happens on watermark-protected previews only; raw files are
     # withheld until approval (PRD Section 8).
     return [cf.to_brand_facing_asset(work, approved=False) for work in work_submissions]
+
+@api_router.get("/business/work-review")
+async def get_business_work_review(current_user: dict = Depends(get_current_user)):
+    """Every submission across the business's campaigns, one row per (campaign,
+    creator) — ALL statuses, for the Work Review tabs (approved / pending / revision).
+
+    campaign.work_submission is a single field overwritten on every /work/submit call,
+    so on a multi-creator brief a second hired creator's submission silently replaces
+    the first's there. This reads db.work_submissions directly instead, so every hired
+    creator's latest submission survives independently."""
+    if current_user.get('role') != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only businesses can review work")
+
+    ws_id = _brand_ws_id(current_user)
+    campaigns = await db.campaigns.find(
+        {"business_id": ws_id},
+        {"_id": 0, "id": 1, "title": 1, "status": 1, "deal_id": 1, "selected_creator": 1, "selected_creators": 1},
+    ).to_list(10000)
+    campaign_by_id = {c['id']: c for c in campaigns}
+    campaign_ids = list(campaign_by_id.keys())
+    if not campaign_ids:
+        return []
+
+    work_submissions = await db.work_submissions.find(
+        {"campaign_id": {"$in": campaign_ids}}, {"_id": 0}
+    ).sort("submitted_at", -1).to_list(20000)
+    # Most recent row per (campaign, creator) — rows are already newest-first.
+    latest_by_pair = {}
+    for w in work_submissions:
+        key = (w.get('campaign_id'), w.get('creator_id'))
+        latest_by_pair.setdefault(key, w)
+
+    creator_ids = {cid for (_, cid) in latest_by_pair if cid}
+    creators = await db.users.find(
+        {"id": {"$in": list(creator_ids)}},
+        {"_id": 0, "id": 1, "nickname": 1, "full_name": 1, "business_name": 1, "username": 1, "email": 1,
+         "profile": 1, "profile_photo": 1},
+    ).to_list(10000) if creator_ids else []
+    creator_by_id = {c['id']: c for c in creators}
+
+    rows = []
+    for (campaign_id, creator_id), work in latest_by_pair.items():
+        campaign = campaign_by_id.get(campaign_id)
+        if not campaign:
+            continue
+        work_status = work.get('status') or WorkStatus.SUBMITTED
+        if work_status == WorkStatus.APPROVED or campaign.get('status') == 'completed':
+            status = 'approved'
+        elif work_status == WorkStatus.REVISION_REQUESTED:
+            status = 'revision_requested'
+        else:
+            status = 'pending_review'
+        approved = status == 'approved'
+        asset = cf.to_brand_facing_asset(work, approved=approved)
+        creator = creator_by_id.get(creator_id) or {}
+        rows.append({
+            # Disambiguated deal id (bare for the first/only creator, "<id>~<creator_id>"
+            # for the rest) — approve/request-revision resolve this per-creator.
+            "id": person_deal_id(campaign, creator_id) if creator_id else campaign_id,
+            "campaignId": campaign_id,
+            "title": campaign.get('title') or 'Submitted content',
+            "campaign": campaign.get('title') or 'Submitted content',
+            "creatorId": creator_id,
+            "creator": person_display_name(creator, 'Creator'),
+            "photo": (creator.get('profile') or {}).get('profile_photo') or creator.get('profile_photo') or '',
+            "files": asset.get('work_files') or work.get('work_files') or [],
+            "submittedAt": work.get('submitted_at'),
+            "status": status,
+        })
+    rows.sort(key=lambda r: r.get('submittedAt') or '', reverse=True)
+    return rows
 
 @api_router.get("/work/{work_id}")
 async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_user)):
