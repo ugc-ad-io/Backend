@@ -29,6 +29,7 @@ import re
 import razorpay
 import hmac
 import hashlib
+import json
 import boto3
 from botocore.exceptions import ClientError as BotoClientError
 from twilio.rest import Client as TwilioClient
@@ -10694,6 +10695,127 @@ def creator_delivery_address(user: dict) -> Optional[dict]:
     return built
 
 
+# ─── DELHIVERY COURIER ───────────────────────────────────────────────────────
+# Real label + tracking. Active when DELHIVERY_API_TOKEN is set (production
+# token → track.delhivery.com); without it the Phase-1 mock below still works
+# for local dev. Sync `requests` calls, same as the rest of this file.
+DELHIVERY_BASE = os.environ.get("DELHIVERY_BASE_URL", "https://track.delhivery.com")
+
+def delhivery_token() -> str:
+    return (os.environ.get("DELHIVERY_API_TOKEN") or "").strip()
+
+def _dlv_headers() -> dict:
+    return {"Authorization": f"Token {delhivery_token()}",
+            "Content-Type": "application/json", "Accept": "application/json"}
+
+def delhivery_pin_serviceable(pincode) -> bool:
+    try:
+        r = requests.get(f"{DELHIVERY_BASE}/c/api/pin-codes/json/",
+                         params={"filter_codes": str(pincode)}, headers=_dlv_headers(), timeout=20)
+        return bool((r.json() or {}).get("delivery_codes"))
+    except Exception:
+        return True  # serviceability is advisory — a lookup outage must not block shipping
+
+def delhivery_register_pickup(pickup: dict) -> str:
+    """Delhivery only picks up from pre-registered 'client warehouses'. Register the
+    brand's pickup address on first use. The warehouse name is a hash of the address,
+    so a changed address registers as a fresh warehouse, and re-registering the same
+    one ('already exists') counts as success — idempotent, nothing stored our side."""
+    key = "|".join(str(pickup.get(k) or "").strip().lower() for k in ("line1", "line2", "city", "pincode"))
+    name = "ugcad-" + hashlib.md5(key.encode()).hexdigest()[:10]
+    address = ", ".join(filter(None, [pickup.get("line1"), pickup.get("line2")]))
+    payload = {
+        "name": name,
+        "email": "ops@ugcad.io",
+        "phone": str(pickup.get("phone") or ""),
+        "address": address,
+        "city": pickup.get("city") or "",
+        "state": pickup.get("state") or "",
+        "country": pickup.get("country") or "India",
+        "pin": str(pickup.get("pincode") or ""),
+        "return_address": address,
+        "return_pin": str(pickup.get("pincode") or ""),
+        "return_city": pickup.get("city") or "",
+        "return_state": pickup.get("state") or "",
+        "return_country": pickup.get("country") or "India",
+    }
+    try:
+        r = requests.post(f"{DELHIVERY_BASE}/api/backend/clientwarehouse/create/",
+                          json=payload, headers=_dlv_headers(), timeout=30)
+        body = r.json() if r.content else {}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Courier pickup registration failed: {exc}")
+    if r.ok and body.get("success"):
+        return name
+    if "already" in json.dumps(body).lower():
+        return name
+    raise HTTPException(status_code=502, detail=f"Courier rejected the pickup address: {body.get('error') or body}")
+
+def delhivery_create_package(order_id: str, pickup_name: str, delivery: dict,
+                             description: str, weight_kg, dims: dict) -> str:
+    """Manifest the shipment on Delhivery; returns the AWB (real tracking number)."""
+    shipment = {
+        "name": delivery.get("full_name") or "Creator",
+        "add": ", ".join(filter(None, [delivery.get("line1"), delivery.get("line2")])),
+        "pin": str(delivery.get("pincode") or ""),
+        "city": delivery.get("city") or "",
+        "state": delivery.get("state") or "",
+        "country": delivery.get("country") or "India",
+        "phone": str(delivery.get("phone") or ""),
+        "order": order_id,
+        "payment_mode": "Prepaid",
+        "products_desc": (description or "Campaign product")[:100],
+        "quantity": "1",
+        "weight": str(int(max(0.05, float(weight_kg or 0.5)) * 1000)),  # Delhivery wants grams
+    }
+    for src, dst in (("length", "shipment_length"), ("width", "shipment_width"), ("height", "shipment_height")):
+        if dims.get(src):
+            shipment[dst] = str(int(dims[src]))
+    # cmu/create.json takes a literal "format=json&data=<json>" body — not a JSON body.
+    body = "format=json&data=" + json.dumps({"shipments": [shipment], "pickup_location": {"name": pickup_name}})
+    try:
+        r = requests.post(f"{DELHIVERY_BASE}/api/cmu/create.json", data=body, headers=_dlv_headers(), timeout=45)
+        res = r.json() if r.content else {}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Courier shipment creation failed: {exc}")
+    pkg = ((res or {}).get("packages") or [{}])[0]
+    if pkg.get("waybill"):
+        return pkg["waybill"]
+    raise HTTPException(status_code=502, detail=f"Courier rejected the shipment: {pkg.get('remarks') or (res or {}).get('rmk') or res}")
+
+def delhivery_label_url(awb: str) -> str:
+    try:
+        r = requests.get(f"{DELHIVERY_BASE}/api/p/packing_slip",
+                         params={"wbns": awb, "pdf": "true"}, headers=_dlv_headers(), timeout=30)
+        pkg = ((r.json() or {}).get("packages") or [{}])[0]
+        return pkg.get("pdf_download_link") or ""
+    except Exception:
+        return ""  # AWB is the source of truth; the label can be re-fetched later
+
+# Courier status → our shipment status. Unknown statuses keep the current one.
+_DLV_STATUS_MAP = {
+    "manifested": "awaiting_pickup",
+    "not picked": "awaiting_pickup",
+    "in transit": "in_transit",
+    "pending": "in_transit",
+    "dispatched": "in_transit",  # out for delivery
+    "delivered": "delivered",
+    "rto": "returned",
+    "returned": "returned",
+    "lost": "lost",
+}
+
+def delhivery_track_status(awb: str) -> Optional[str]:
+    try:
+        r = requests.get(f"{DELHIVERY_BASE}/api/v1/packages/json/",
+                         params={"waybill": awb}, headers=_dlv_headers(), timeout=30)
+        data = (r.json() or {}).get("ShipmentData") or []
+        status = (((data[0] or {}).get("Shipment") or {}).get("Status") or {}).get("Status") or ""
+        return _DLV_STATUS_MAP.get(status.strip().lower())
+    except Exception:
+        return None
+
+
 @api_router.post("/deals/{deal_id}/ship-label")
 async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_user: dict = Depends(get_current_user)):
     """Brand submits product details + pickup address; the platform generates a
@@ -10713,13 +10835,25 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
 
     dims = (data.dimensions.dict() if data.dimensions else {}) or {}
 
-    # ─── MOCK SHIPROCKET (Phase 1) ─────────────────────────────────────────────
-    # A real integration would: authenticate, create an order with pickup +
-    # delivery + package, request a courier + label, and return awb/label_url.
-    short = uuid.uuid4().hex[:10].upper()
-    tracking_number = f"MOCK{short}"
-    label_url = f"/mock-labels/{campaign['id']}.pdf"
-    courier_name = "Shiprocket (mock)"
+    # ─── COURIER LABEL ─────────────────────────────────────────────────────────
+    if delhivery_token():
+        # Real Delhivery shipment — needs the creator's delivery address; a real
+        # courier can't manifest a package to nowhere.
+        if not delivery:
+            raise HTTPException(status_code=400, detail="The creator hasn't confirmed their delivery address yet. Ask them in the deal chat, then generate the label.")
+        if not delhivery_pin_serviceable(delivery.get("pincode")):
+            raise HTTPException(status_code=400, detail=f"Delhivery doesn't service the creator's pincode ({delivery.get('pincode')}). Contact support to arrange shipping.")
+        pickup_name = delhivery_register_pickup(data.pickup_address.dict())
+        order_id = f"UGC-{campaign['id'][:8]}-{(creator_id or 'x')[:6]}-{uuid.uuid4().hex[:4]}"
+        tracking_number = delhivery_create_package(order_id, pickup_name, delivery, data.description, data.weight, dims)
+        label_url = delhivery_label_url(tracking_number)
+        courier_name = "Delhivery"
+    else:
+        # Phase-1 mock — local dev without a courier token.
+        short = uuid.uuid4().hex[:10].upper()
+        tracking_number = f"MOCK{short}"
+        label_url = f"/mock-labels/{campaign['id']}.pdf"
+        courier_name = "Shiprocket (mock)"
     # ───────────────────────────────────────────────────────────────────────────
 
     shipment_doc = {
@@ -11228,6 +11362,25 @@ async def get_shipment(campaign_id: str, creator_id: Optional[str] = None, curre
     shipment = await find_shipment(campaign_id, target_creator_id)
     if not shipment:
         raise HTTPException(status_code=404, detail="Shipment not found")
+
+    # Lazy courier sync — no cron needed: refresh a live Delhivery status when
+    # someone actually opens the shipment, at most once per 30 minutes.
+    # ponytail: view-triggered polling; move to a scheduled job if brands complain
+    # that statuses lag while nobody is looking.
+    if shipment.get("courier_name") == "Delhivery" and shipment.get("tracking_number") \
+            and shipment.get("status") not in ("delivered", "received", "returned", "lost"):
+        last_sync = shipment.get("courier_synced_at") or ""
+        stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        if not last_sync or last_sync < stale_cutoff:
+            live_status = delhivery_track_status(shipment["tracking_number"])
+            sync_update = {"courier_synced_at": now_iso()}
+            if live_status and live_status != shipment.get("status"):
+                sync_update.update({"status": live_status, "courier_status": live_status, "updated_at": now_iso()})
+                if live_status == "delivered":
+                    sync_update["delivered_at"] = now_iso()
+            await db.shipments.update_one(await shipment_match_filter(campaign_id, target_creator_id), {"$set": sync_update})
+            shipment.update(sync_update)
+
     # The creator's delivery address is ops-only — never expose it to the brand.
     shipment.pop("delivery_address", None)
     return shipment
