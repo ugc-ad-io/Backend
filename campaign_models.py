@@ -47,6 +47,10 @@ class DeliverableItem(BaseModel):
     # not deliverable with raw footage alone.
     raw_required: bool = False
     edited_required: bool = False
+    # Who cuts the edited file when edited_required is true: the creator (default,
+    # covered by their bid) or UGC.ad's own team. 'ugc' triggers an admin notification
+    # on submission and the creator is not notified to deliver a cut themselves.
+    edited_by: Optional[str] = "creator"
 
 
 class BriefSectionsMixin(BaseModel):
@@ -64,6 +68,12 @@ class BriefSectionsMixin(BaseModel):
     # coerced to a bounded int instead of persisting whatever the client sent —
     # it now drives escrow and payout gating, so it can't be free-form.
     deliverable_items: Optional[List[DeliverableItem]] = None
+
+    # Script: who writes it. 'brand' means script_text is entered by the brand at
+    # posting time. 'ugc' means the brand leaves script_text blank and an admin
+    # must fill it in during brief review — approval is blocked until they do.
+    script_provider: Optional[str] = None
+    script_text: Optional[str] = None
 
     # Section 3: Must-Include
     product_visible: Optional[bool] = None

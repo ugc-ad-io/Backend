@@ -431,6 +431,9 @@ class ApprovalAction(BaseModel):
     reason_details: Optional[str] = None
     message: Optional[str] = None
     items: Optional[List[str]] = None
+    # Only used on action="approve" when the brief's script_provider is "ugc" —
+    # the script the admin wrote, saved onto the campaign as part of approval.
+    script_text: Optional[str] = None
 
 class PaymentGatewayConfig(BaseModel):
     gateway_name: str  # razorpay or cashfree
@@ -6307,6 +6310,19 @@ async def delete_campaign_route(campaign_id: str, current_user: dict = Depends(g
 
     return {"deleted": True, "campaign_id": campaign_id, "message": "Draft deleted"}
 
+
+def _pending_approval_note(campaign: dict) -> str:
+    """Extra sentence for the admin 'awaiting approval' notification, flagging
+    anything on this brief that needs UGC.ad's own team to act on it."""
+    deliverables = campaign.get('deliverable_items') or []
+    needs = []
+    if campaign.get('script_provider') == 'ugc':
+        needs.append("a script from UGC.ad (required before you can approve it)")
+    if any(d.get('edited_required') and d.get('edited_by') == 'ugc' for d in deliverables):
+        needs.append("UGC.ad-edited deliverable(s)")
+    return f" This brief needs {' and '.join(needs)}." if needs else ""
+
+
 @api_router.post("/campaigns/{campaign_id}/submit")
 async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(get_current_user)):
     """Submit a draft campaign for approval"""
@@ -6357,7 +6373,7 @@ async def submit_campaign_route(campaign_id: str, current_user: dict = Depends(g
     }
     await notify_admins(
         "New campaign awaiting approval",
-        f"'{campaign.get('title', '')}' was submitted and needs admin approval before it goes live to creators.",
+        f"'{campaign.get('title', '')}' was submitted and needs admin approval before it goes live to creators.{_pending_approval_note(campaign)}",
         link="/dashboard/admin/campaigns",
     )
 
@@ -6615,7 +6631,7 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
             campaign_doc['match_status'] = 'queued'
         await notify_admins(
             "New campaign awaiting approval",
-            f"'{campaign_doc.get('title', '')}' was submitted and needs admin approval before it goes live to creators.",
+            f"'{campaign_doc.get('title', '')}' was submitted and needs admin approval before it goes live to creators.{_pending_approval_note(campaign_doc)}",
             link="/dashboard/admin/campaigns",
         )
 
@@ -7363,6 +7379,22 @@ You can now communicate directly with {creator_display} to coordinate the work. 
         link="/dashboard/business/wallet",
         ntype="success",
     )
+
+    # If any deliverable's edited cut is on the creator (not UGC.ad), make sure they
+    # know — raw footage alone won't be deliverable on this deal.
+    self_edit_count = sum(
+        1 for d in (campaign.get('deliverable_items') or [])
+        if d.get('edited_required') and d.get('edited_by', 'creator') == 'creator'
+    )
+    if self_edit_count:
+        await notify_user(
+            creator_id,
+            "Edited file required",
+            f"For '{campaign['title']}', you'll need to deliver an edited cut as well as raw footage "
+            f"for {self_edit_count} deliverable{'s' if self_edit_count > 1 else ''}.",
+            link="/creator-dashboard",
+            ntype="info",
+        )
 
     return {
         "message": "Creator selected and payment held in escrow",
@@ -11726,13 +11758,23 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
 
     status = CampaignStatus.ACTIVE if data.action == "approve" else CampaignStatus.REJECTED
 
+    # A UGC-written script must exist before the brief can go live — otherwise the
+    # creator sees a brief promising a script that was never written.
+    script_text = (data.script_text or campaign.get("script_text") or "").strip()
+    if data.action == "approve" and campaign.get("script_provider") == "ugc" and not script_text:
+        raise HTTPException(status_code=400, detail="Add the script before approving this brief.")
+
+    set_fields = {
+        "status": status,
+        "approval_reason": data.reason,
+        "approved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if data.action == "approve" and campaign.get("script_provider") == "ugc":
+        set_fields["script_text"] = script_text
+
     await db.campaigns.update_one(
         {"id": data.item_id},
-        {"$set": {
-            "status": status,
-            "approval_reason": data.reason,
-            "approved_at": datetime.now(timezone.utc).isoformat()
-        }}
+        {"$set": set_fields}
     )
 
     is_private = campaign.get("visibility") == PRIVATE_VISIBILITY and campaign.get("selected_creator")
