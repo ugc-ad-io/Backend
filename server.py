@@ -4158,6 +4158,11 @@ async def get_business_wallet(current_user: dict = Depends(get_approved_business
     for row in payment_rows:
         if row.get("id") in ledger_transaction_ids:
             continue
+        # Only money that actually arrived. An opened-then-abandoned Razorpay
+        # popup leaves a status="created" row — listing it as a credit made the
+        # history show recharges that never happened.
+        if row.get("status") != "success":
+            continue
         tx_type = "Wallet Recharge" if row.get("purpose") == "wallet_recharge" else row.get("purpose") or "Payment"
         transactions.append(normalize_wallet_transaction(row, tx_type, "credit"))
 
