@@ -63,6 +63,12 @@ class BriefSectionsMixin(BaseModel):
     # Section 1: Campaign Basics (extra)
     target_audience: Optional[str] = None
     budget_visible: Optional[bool] = None
+    # What is being promoted, and the brand's own wording when they pick
+    # "Other". Both clients have been sending these since the brief wizard
+    # shipped, but neither model declared them, so Pydantic dropped them on
+    # every create, draft and update — the brand's answer was silently lost.
+    product_type: Optional[str] = None
+    product_type_detail: Optional[str] = None
 
     # Section 2: Deliverables. Typed (was List[Dict[str, Any]]) so `quantity` is
     # coerced to a bounded int instead of persisting whatever the client sent —
@@ -83,6 +89,10 @@ class BriefSectionsMixin(BaseModel):
     required_phrases: Optional[List[str]] = None
     required_shots: Optional[List[str]] = None
     call_to_action: Optional[str] = None
+    # Where the CTA points: a URL for "Visit website" / "Swipe up", an @handle
+    # for "Follow brand". Undeclared until now, so a brief reached the creator
+    # saying "visit the website" with no address attached.
+    cta_link: Optional[str] = None
     promo_code: Optional[str] = None
     hashtags: Optional[str] = None
     brand_handle_tag: Optional[bool] = None
