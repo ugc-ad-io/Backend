@@ -1931,13 +1931,22 @@ def strip_private_fields(user_doc: dict, requester_role: Optional[str]) -> dict:
     Username is a creator's private internal handle — only visible to the creator
     themselves and admin/staff. Brands continue to see the auto-generated nickname.
 
+    Email is stripped for EVERY non-admin viewer, not just brands. Restricting
+    it to brands left the address readable by any signed-in creator hitting
+    /api/profile/{id} with someone else's id — which defeats the social-link
+    hiding a few lines up: there is no point withholding an Instagram handle
+    from someone who can read the account's email address instead.
+
     KYC identity + payout details (PAN, Aadhaar, address, document URLs, bank
     account, UPI) are NEVER exposed to another user — only the `kyc_verified`
     boolean survives, so a viewer can see the "Verified" badge without the PII.
+
+    The only caller already excludes the user viewing their own profile, so
+    nothing here can strip a field from its owner.
     """
     if not isinstance(user_doc, dict):
         return user_doc
-    if requester_role == UserRole.BUSINESS:
+    if requester_role != UserRole.ADMIN:
         user_doc.pop("username", None)
         user_doc.pop("email", None)
     if requester_role != UserRole.ADMIN:
