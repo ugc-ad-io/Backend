@@ -373,7 +373,9 @@ class WorkSubmission(BaseModel):
     # video by the watermarker and by the brand's review screen, so the ordering is
     # load-bearing - do not sort this list.
     work_files: List[str]
-    description: str
+    # Optional: the app's quick single-file submit sends no note, and a required
+    # field 422'd it as "request failed". A caption isn't needed to submit work.
+    description: str = ""
     # The same URLs split by kind, so the brand can tell a cut from the raw footage.
     # Both default to [] so a client that has not been updated still submits fine and
     # simply carries no split - work_files remains the source of truth for "what was
