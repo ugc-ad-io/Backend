@@ -73,6 +73,12 @@ JWT_ALGORITHM = 'HS256'
 # Google Sign-In — OAuth 2.0 Web client id (must match the frontend's).
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
 
+# Sign in with Apple. For a native iOS sign-in the identity token's audience is
+# the app's bundle id, not a separate client id. PyJWKClient fetches and caches
+# Apple's rotating signing keys, so there is nothing to refresh by hand.
+APPLE_BUNDLE_ID = os.environ.get('APPLE_BUNDLE_ID', 'io.ugcad.app')
+_APPLE_JWKS = jwt.PyJWKClient('https://appleid.apple.com/auth/keys', cache_keys=True)
+
 # Anti-Cheat Content Filtering
 EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
 PHONE_PATTERN = re.compile(r'(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}|\b\d{10}\b')
@@ -243,6 +249,13 @@ class LoginRequest(BaseModel):
 class GoogleAuthRequest(BaseModel):
     credential: str                      # Google ID token (JWT) from GIS
     role: Optional[UserRole] = None      # used only when creating a new account
+
+class AppleAuthRequest(BaseModel):
+    identity_token: str                  # Apple identity token (JWT) from ASAuthorization
+    role: Optional[UserRole] = None      # used only when creating a new account
+    # Apple returns the name ONLY on the very first authorization, and never in
+    # the token — the client has to pass it through or it is lost for good.
+    full_name: Optional[str] = None
 
 class VerifyPasswordRequest(BaseModel):
     password: str
@@ -2499,7 +2512,9 @@ def normalize_wallet_transaction(source: dict, default_type: str = "Wallet Recha
         tx_type = "Escrow Refund"
         direction = "credit"
     elif tx_type in ["goodwill_credit"]:
-        tx_type = "Goodwill Credit"
+        # Stored key stays "goodwill_credit" for old rows; the label shown to
+        # brands is "Late Fee Credit" (their share of a creator's late penalty).
+        tx_type = "Late Fee Credit"
         direction = "credit"
     elif tx_type in ["refund", "wallet_refund"]:
         tx_type = "Refund"
@@ -3646,6 +3661,124 @@ def _auth_response(user: dict) -> dict:
         "team_of": user.get("team_of"),
         "team_role": user.get("team_role", "owner"),
         "is_team_member": bool(user.get("team_of")),
+    }
+
+
+@api_router.post("/auth/apple")
+async def apple_auth(data: AppleAuthRequest):
+    """Sign in / sign up with Apple. Required by App Store guideline 4.8 wherever
+    we offer Google sign-in. Mirrors /auth/google: verify the identity token,
+    find-or-create the user, issue our own JWT.
+
+    Two Apple-specific wrinkles the Google path does not have:
+      * The email is only in the token the FIRST time, and may be a private
+        relay address (@privaterelay.appleid.com). We therefore key on `sub`
+        (stable and always present) and treat email as a bonus.
+      * The name never appears in the token at all — Apple hands it to the
+        client once, at first authorization, so it arrives in `full_name`.
+    """
+    try:
+        # PyJWT fetches and caches Apple's rotating public keys itself.
+        signing_key = await asyncio.to_thread(
+            _APPLE_JWKS.get_signing_key_from_jwt, data.identity_token
+        )
+        info = jwt.decode(
+            data.identity_token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=APPLE_BUNDLE_ID,
+            issuer="https://appleid.apple.com",
+        )
+    except Exception:
+        # Covers a bad signature, the wrong audience, and an expired token.
+        # The reason is deliberately not echoed back to the client.
+        raise HTTPException(status_code=401, detail="Invalid or expired Apple credential")
+
+    apple_sub = info.get("sub")
+    if not apple_sub:
+        raise HTTPException(status_code=401, detail="Apple credential has no subject")
+
+    email = (info.get("email") or "").lower()
+
+    # Returning users are matched on the Apple subject first: a relay address can
+    # change, and on later sign-ins there is no email in the token at all.
+    user = await db.users.find_one({"apple_id": apple_sub}, {"_id": 0})
+    if not user and email:
+        # First Apple sign-in for someone who already has a password account.
+        user = await db.users.find_one({"email": email}, {"_id": 0})
+
+    if not user:
+        if not email:
+            # Nothing to create an account with: no prior link and Apple has
+            # already spent its one-time email disclosure on an earlier attempt.
+            raise HTTPException(
+                status_code=401,
+                detail="Apple did not return an email. Remove this app under Settings > Apple ID > Sign in with Apple, then try again.",
+            )
+        role = data.role.value if data.role else UserRole.CREATOR.value
+        if role not in [UserRole.CREATOR.value, UserRole.BUSINESS.value, UserRole.ADMIN.value]:
+            role = UserRole.CREATOR.value
+
+        user_id = str(uuid.uuid4())
+        nickname = await generate_nickname()
+        display_name = (data.full_name or "").strip()
+        user_doc = {
+            "id": user_id,
+            "email": email,
+            "role": role,
+            "nickname": display_name or nickname,
+            "full_name": display_name,
+            "apple_id": apple_sub,
+            "auth_provider": "apple",
+            # Apple verifies the address before it ever reaches us, including
+            # for relay addresses.
+            "email_verified": True,
+            "profile_completed": False,
+            "curated_brand_visible": False,
+            "creator_directory_visible": False,
+            "approval_status": ApprovalStatus.PENDING if role in [UserRole.CREATOR.value, UserRole.BUSINESS.value] else ApprovalStatus.APPROVED,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "balance": 0.0,
+        }
+        if role == UserRole.CREATOR.value:
+            user_doc["creator_code"] = await generate_creator_code()
+            user_doc["level"] = cf.DEFAULT_CREATOR_LEVEL
+            user_doc["handle_locked"] = False
+
+        await db.users.insert_one(user_doc)
+        user = user_doc
+    else:
+        # Same gates /auth/login and /auth/google apply.
+        if user.get("banned", False):
+            raise HTTPException(status_code=403, detail=f"Account banned: {user.get('ban_reason', 'Account suspended')}")
+        await enforce_suspension(user)
+
+        if user.get('active') is False:
+            await db.users.update_one({"id": user["id"]}, {"$set": {"active": True}})
+            user["active"] = True
+
+        link = {}
+        if not user.get("id"):
+            link["id"] = str(uuid.uuid4())
+        if not user.get("apple_id"):
+            link["apple_id"] = apple_sub
+        # Only fill a name we do not already have: Apple sends it once, and an
+        # empty later value must not wipe what the user has since set.
+        if data.full_name and not user.get("full_name"):
+            link["full_name"] = data.full_name.strip()
+        if link:
+            await db.users.update_one({"id": user.get("id") or link.get("id")}, {"$set": link})
+            user.update(link)
+
+    token = create_token(user["id"], user.get("email", email), user.get("role"))
+    return {
+        "token": token,
+        "user_id": user["id"],
+        "role": user.get("role"),
+        "nickname": user.get("nickname"),
+        "creator_code": user.get("creator_code"),
+        "profile_completed": user.get("profile_completed", False),
+        "approval_status": user.get("approval_status"),
     }
 
 
@@ -9098,10 +9231,10 @@ async def release_scheduled_payout(escrow: dict) -> bool:
             "id": str(uuid.uuid4()), "user_id": campaign['business_id'], "transaction_id": str(uuid.uuid4()),
             "campaign_id": campaign['id'],
             "type": "goodwill_credit", "direction": "credit", "amount": round(brand_credit, 2),
-            "status": "success", "note": "Late-delivery penalty goodwill credit",
+            "status": "success", "note": "Late-delivery fee credit",
             "created_at": now, "date": now,
         })
-        await notify_user(campaign['business_id'], "Goodwill credit applied", f"₹{int(brand_credit)} was credited to your wallet from a late-delivery penalty.", link="/dashboard/business/wallet")
+        await notify_user(campaign['business_id'], "Late fee credited", f"₹{int(brand_credit)} was credited to your wallet from the creator's late-delivery fee.", link="/dashboard/business/wallet")
 
     await create_payout_receipt(
         creator_id=creator_id, receipt_type="earning", gross_amount=gross,
