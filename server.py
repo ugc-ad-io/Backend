@@ -52,7 +52,6 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # Import routers (after load_dotenv)
-from applications import applications_router
 from categories import categories_router, seed_categories
 from gigs import gigs_router
 import creator_features as cf
@@ -4457,11 +4456,30 @@ async def recharge_business_wallet(
 # the creator's rate card and the admin's commission setting.
 # ---------------------------------------------------------------------------
 def creator_plan_price(creator: dict) -> float:
-    """The creator's per-video rate, as set on their profile → rate_card."""
-    rate_card = (creator.get("profile") or {}).get("rate_card") or {}
+    """The creator's per-video rate for a direct booking.
+
+    Prefers the flat rate_card (set by the app onboarding + Settings). Falls back to
+    the cheapest published portfolio-card price, because the WEB onboarding form
+    (CreatorProfileSetup.js) only stores per-card prices under portfolio[].price and
+    never writes rate_card — without this fallback those creators read as ₹0 and
+    can't be direct-booked at all.
+    """
+    profile = creator.get("profile") or {}
+    rate_card = profile.get("rate_card") or {}
     raw = str(rate_card.get("expected_payout") or rate_card.get("last_salary") or "")
     digits = re.sub(r"[^0-9]", "", raw)
-    return float(digits) if digits else 0.0
+    if digits:
+        return float(digits)
+    # cheapest positive portfolio-card price, across every place a card can live
+    cards = creator.get("portfolio") or profile.get("portfolio_items") or profile.get("portfolio") or []
+    prices = []
+    for c in cards if isinstance(cards, list) else []:
+        if not isinstance(c, dict):
+            continue
+        d = re.sub(r"[^0-9]", "", str(c.get("price") or c.get("price_per_video") or ""))
+        if d and float(d) > 0:
+            prices.append(float(d))
+    return min(prices) if prices else 0.0
 
 
 def quote_brief(creator: dict, video_count) -> dict:
@@ -16251,7 +16269,6 @@ async def payout_overview(current_user: dict = Depends(get_current_user)):
 
 
 app.include_router(categories_router)
-app.include_router(applications_router)
 app.include_router(gigs_router)
 app.include_router(api_router)
 
