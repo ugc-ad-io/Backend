@@ -7204,6 +7204,23 @@ async def get_campaign(campaign_id: str, current_user: dict = Depends(get_curren
     if current_user.get('role') == UserRole.BUSINESS:
         await enrich_bids_with_creator_names([campaign])
 
+    # Enrich the SELECTED (hired) creator's details onto the campaign so the
+    # brand's campaign page can render the "Creator" card after hiring. Without
+    # this the app read creator_name/creator_photo/… fields that were never set,
+    # so the hired creator never appeared on the brand side.
+    sel_ids = selected_creator_ids(campaign)
+    if sel_ids:
+        sel = await db.users.find_one({"id": sel_ids[0]}, {"_id": 0}) or {}
+        prof = sel.get("profile") or {}
+        campaign.setdefault("selected_creator_name", person_display_name(sel, "Creator"))
+        campaign.setdefault("creator_name", campaign["selected_creator_name"])
+        campaign.setdefault("creator_photo", sel.get("profile_photo") or prof.get("profile_photo") or prof.get("profile_picture") or "")
+        campaign.setdefault("creator_location", prof.get("city") or prof.get("location") or "")
+        campaign.setdefault("creator_language", ", ".join(prof.get("languages") or []) if isinstance(prof.get("languages"), list) else (prof.get("languages") or ""))
+        campaign.setdefault("creator_level", sel.get("level_label") or sel.get("level") or "")
+        campaign.setdefault("creator_primary_category", prof.get("primary_category") or prof.get("niche") or "")
+        campaign.setdefault("creator_platform", "Instagram")
+
     return campaign
 
 @api_router.post("/campaigns/{campaign_id}/bid")
