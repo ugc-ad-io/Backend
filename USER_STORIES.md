@@ -4,7 +4,8 @@ The complete story catalog for the UGCad platform — shared by the **website** 
 
 > **Status legend** · ✅ **Live** = verified working · 🟡 **Test mode** = deliberately simulated during the testing phase · ⛔ **Stub** = UI/data exists, flow not wired
 >
-> 3 roles · 57 stories · as of 29 Sep 2026 · source: `server.py`, Frontend, ugcapp
+> 3 roles · 59 stories · as of 29 Sep 2026 · source: `server.py`, Frontend, ugcapp
+> Full journey maps live in [USER_FLOWS.md](USER_FLOWS.md)
 
 ---
 
@@ -229,6 +230,15 @@ As a brand, I want to save a half-finished brief, so that I can resume on any de
 **US-B13 · Pass admin review before going live** ✅
 As a platform, we want every published brief reviewed, so that creators only ever see legitimate campaigns.
 - Publish → `pending_approval`; approve → live; reject → refund of the reservation
+- **UGC.ad-scripted briefs don't go live on admin approval** — they park at `awaiting_brand_confirmation` for the brand's sign-off first (US-B21)
+
+**US-B21 · Confirm the UGC.ad script before creators see the brief** ✅
+As a brand that ordered a UGC.ad-written script, I want to read and confirm it, so that nothing goes to creators in my name that I haven't approved.
+- Admin cannot approve the brief without attaching the script; approval parks it at "Script Ready — Confirm"
+- I get a "📝 Your script is ready" notification; the campaign page shows the full script with **Confirm — send to creators** and **Request changes**
+- Confirm → brief goes live (private invites deliver now, not earlier); admins are told I confirmed
+- Request changes (with my note) → back to the admin queue; the team revises and re-approves
+- Creators — including a privately invited one — can never see the brief before my confirmation
 
 ### Running the deal
 
@@ -325,6 +335,13 @@ As an admin, I want an append-only audit log of admin actions with before/after,
 **US-A14 · Act as a brand when support needs to** ✅
 As support, I want short-lived delegated access to a brand account, so that I can reproduce and fix their issue.
 - 2-hour token stamped with the admin's identity; delegated actions are attributable
+
+**US-A15 · Run the Editing Queue for "Edited by UGC.ad" deliverables** ✅
+As UGC.ad's editing team, I want raw creator footage to land in a dedicated queue, so that we cut the final version before the brand ever reviews.
+- Creator submission on such a deal parks at `awaiting_edit` — the brand can't approve/reject it and the 5-day auto-approval clock does NOT run
+- Admin → Editing Queue lists each job with campaign, brand, creator, raw files and the creator's note
+- Uploading the edited cut hands the submission to the brand (watermarked), restarts the review clock, and notifies brand + creator
+- Every completion is stamped into the audit log
 
 ---
 

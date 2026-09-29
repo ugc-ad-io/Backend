@@ -180,6 +180,10 @@ class ApprovalStatus(str, Enum):
 class CampaignStatus(str, Enum):
     DRAFT = "draft"
     PENDING_APPROVAL = "pending_approval"
+    # A UGC.ad-scripted brief the admin approved WITH a script attached. The
+    # BRAND must read the script and confirm (or request changes) before any
+    # creator sees the brief — admin approval alone doesn't publish these.
+    AWAITING_BRAND_CONFIRMATION = "awaiting_brand_confirmation"
     ACTIVE = "active"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
@@ -197,6 +201,11 @@ PRIVATE_VISIBILITY = "private"
 
 class WorkStatus(str, Enum):
     PENDING = "pending"
+    # Raw footage landed on a deal whose deliverables say "edited by UGC.ad":
+    # it sits with the platform's editing team, NOT the brand. Excluded from
+    # the auto-approval clock (which keys on SUBMITTED) and from brand actions
+    # until an admin attaches the edited cut, which flips it to SUBMITTED.
+    AWAITING_EDIT = "awaiting_edit"
     SUBMITTED = "submitted"
     REVISION_REQUESTED = "revision_requested"
     APPROVED = "approved"
@@ -7103,6 +7112,9 @@ async def get_campaigns(
         pre_approval = [
             CampaignStatus.DRAFT.value,
             CampaignStatus.PENDING_APPROVAL.value,
+            # Script written but the brand hasn't confirmed it — still not
+            # public, and even an invited creator must not see it yet.
+            CampaignStatus.AWAITING_BRAND_CONFIRMATION.value,
             CampaignStatus.REJECTED.value,
         ]
         query = {
@@ -8821,6 +8833,17 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
 
     uploads_dir = str(Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))))
     primary_file = data.work_files[0] if data.work_files else None
+
+    # "Edited by UGC.ad" deliverables: the creator hands over RAW footage and
+    # the platform's editing team cuts it BEFORE the brand ever reviews. Such
+    # submissions park in the admin editing queue (AWAITING_EDIT) — the brand
+    # can't approve/reject them and the 5-day auto-approval clock doesn't run
+    # until the edited cut is attached and the status flips to SUBMITTED.
+    needs_ugc_edit = any(
+        d.get('edited_required') and d.get('edited_by') == 'ugc'
+        for d in (campaign.get('deliverable_items') or [])
+    )
+
     work_doc = {
         "id": str(uuid.uuid4()),
         "campaign_id": data.campaign_id,
@@ -8829,7 +8852,8 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         "edited_files": data.edited_files,
         "raw_files": data.raw_files,
         "description": data.description,
-        "status": WorkStatus.SUBMITTED,
+        "status": WorkStatus.AWAITING_EDIT if needs_ugc_edit else WorkStatus.SUBMITTED,
+        "needs_ugc_edit": needs_ugc_edit,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
         "watermark": cf.build_watermark_record(primary_file, "video", uploads_dir),
         "revisions": []
@@ -8855,18 +8879,35 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         }}
     )
 
-    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", "Content was submitted for brand review.", creator_id=current_user['id'])
-    await insert_deal_system_message(campaign, "Content was submitted and is awaiting brand review.", creator_id=current_user['id'])
-
-    # Notify the brand that content is ready for review.
-    if campaign.get("business_id"):
-        await notify_user(
-            campaign["business_id"],
-            "Content submitted for review",
-            f"{first_name_of(current_user, fallback='The creator')} submitted content for '{campaign.get('title', 'your campaign')}'. Review it to release payment.",
-            link="/dashboard/business/work-review",
-            ntype="info",
+    if needs_ugc_edit:
+        await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", "Raw footage was submitted — with UGC.ad's editing team.", creator_id=current_user['id'])
+        await insert_deal_system_message(campaign, "Raw footage was submitted. UGC.ad's editing team is cutting the final version before brand review.", creator_id=current_user['id'])
+        await notify_admins(
+            "Editing queue: new raw footage",
+            f"{first_name_of(current_user, fallback='A creator')} submitted raw footage for '{campaign.get('title', 'a campaign')}' — it needs a UGC.ad edit before the brand can review.",
+            link="/dashboard/admin/editing",
         )
+        if campaign.get("business_id"):
+            await notify_user(
+                campaign["business_id"],
+                "Content submitted — editing in progress",
+                f"{first_name_of(current_user, fallback='The creator')} submitted footage for '{campaign.get('title', 'your campaign')}'. UGC.ad's editors are cutting your version — you'll be asked to review once it's ready.",
+                link="/dashboard/business/work-review",
+                ntype="info",
+            )
+    else:
+        await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", "Content was submitted for brand review.", creator_id=current_user['id'])
+        await insert_deal_system_message(campaign, "Content was submitted and is awaiting brand review.", creator_id=current_user['id'])
+
+        # Notify the brand that content is ready for review.
+        if campaign.get("business_id"):
+            await notify_user(
+                campaign["business_id"],
+                "Content submitted for review",
+                f"{first_name_of(current_user, fallback='The creator')} submitted content for '{campaign.get('title', 'your campaign')}'. Review it to release payment.",
+                link="/dashboard/business/work-review",
+                ntype="info",
+            )
 
     return {"message": "Work submitted successfully"}
 
@@ -8975,6 +9016,11 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
     campaign = await db.campaigns.find_one({"id": work['campaign_id']})
     if campaign['business_id'] != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="Not authorized")
+
+    # A submission still with UGC.ad's editors isn't reviewable — the brand
+    # would be approving raw footage it never asked to see.
+    if work.get('status') == WorkStatus.AWAITING_EDIT:
+        raise HTTPException(status_code=400, detail="This submission is with UGC.ad's editing team. You can review once the edited cut is ready.")
 
     # PRD 9.3: no approval while a dispute is open.
     await ensure_not_disputed(work['campaign_id'])
@@ -9487,6 +9533,10 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
     campaign = await db.campaigns.find_one({"id": work['campaign_id']})
     if campaign['business_id'] != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="Not authorized")
+
+    # Still with UGC.ad's editors — nothing for the brand to critique yet.
+    if work.get('status') == WorkStatus.AWAITING_EDIT:
+        raise HTTPException(status_code=400, detail="This submission is with UGC.ad's editing team. You can request changes once the edited cut is ready.")
 
     # PRD 9.3: no revision requests while a dispute is open.
     await ensure_not_disputed(work['campaign_id'])
@@ -12056,20 +12106,27 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
             detail="Only pending approval campaigns can be approved or rejected"
         )
 
-    status = CampaignStatus.ACTIVE if data.action == "approve" else CampaignStatus.REJECTED
-
     # A UGC-written script must exist before the brief can go live — otherwise the
     # creator sees a brief promising a script that was never written.
+    ugc_script = campaign.get("script_provider") == "ugc"
     script_text = (data.script_text or campaign.get("script_text") or "").strip()
-    if data.action == "approve" and campaign.get("script_provider") == "ugc" and not script_text:
+    if data.action == "approve" and ugc_script and not script_text:
         raise HTTPException(status_code=400, detail="Add the script before approving this brief.")
+
+    # UGC-scripted briefs do NOT go live on admin approval: the brand paid for
+    # a script it hasn't read yet, so it must confirm the script first. The
+    # /campaigns/{id}/script-confirmation endpoint below performs the release.
+    if data.action == "approve":
+        status = CampaignStatus.AWAITING_BRAND_CONFIRMATION if ugc_script else CampaignStatus.ACTIVE
+    else:
+        status = CampaignStatus.REJECTED
 
     set_fields = {
         "status": status,
         "approval_reason": data.reason,
         "approved_at": datetime.now(timezone.utc).isoformat(),
     }
-    if data.action == "approve" and campaign.get("script_provider") == "ugc":
+    if data.action == "approve" and ugc_script:
         set_fields["script_text"] = script_text
 
     await db.campaigns.update_one(
@@ -12079,7 +12136,7 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
 
     is_private = campaign.get("visibility") == PRIVATE_VISIBILITY and campaign.get("selected_creator")
 
-    if data.action == "approve":
+    if data.action == "approve" and status == CampaignStatus.ACTIVE:
         # Auto-assign to a campaign manager
         await auto_assign_campaign_manager(data.item_id)
         # THIS is where a private brief reaches its creator. Until now they had no card,
@@ -12087,7 +12144,7 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
         # "admin approves first, then it goes to the creator".
         if is_private:
             await deliver_private_invitation({**campaign, "status": status})
-    else:
+    elif data.action != "approve":
         # Rejected → refund the reserved budget back to the brand wallet.
         await refund_campaign_reservation(data.item_id, reason="campaign_rejected")
 
@@ -12098,7 +12155,15 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
     if brand_id:
         title = campaign.get("title") or "Your campaign"
         link = f"/dashboard/business/campaign/{data.item_id}"
-        if data.action == "approve":
+        if data.action == "approve" and status == CampaignStatus.AWAITING_BRAND_CONFIRMATION:
+            await notify_user(
+                brand_id,
+                "📝 Your script is ready — review and confirm",
+                (f"UGC.ad has written the script for '{title}'. Read it and confirm to send the "
+                 "brief to creators, or request changes if it misses the mark."),
+                link=link, ntype="info", email=True, category="deal_updates",
+            )
+        elif data.action == "approve":
             await notify_user(
                 brand_id,
                 "✅ Your brief is approved and live",
@@ -12119,6 +12184,164 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
             )
 
     return {"message": f"Campaign {data.action}d"}
+
+
+class ScriptConfirmationIn(BaseModel):
+    action: str                      # "confirm" | "request_changes"
+    note: Optional[str] = None       # what to change, when requesting changes
+
+
+@api_router.post("/campaigns/{campaign_id}/script-confirmation")
+async def brand_script_confirmation(campaign_id: str, data: ScriptConfirmationIn, current_user: dict = Depends(get_current_user)):
+    """The brand's gate on a UGC.ad-written script. Admin approval parks the
+    brief at AWAITING_BRAND_CONFIRMATION with the script attached; only the
+    brand's confirm here actually publishes it to creators. Request-changes
+    sends it back to the admin queue with the brand's note."""
+    if current_user.get('role') != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only the brand can confirm its script")
+    if data.action not in ("confirm", "request_changes"):
+        raise HTTPException(status_code=400, detail="action must be 'confirm' or 'request_changes'")
+
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.get('business_id') != _brand_ws_id(current_user):
+        raise HTTPException(status_code=403, detail="Not your campaign")
+    if campaign.get('status') != CampaignStatus.AWAITING_BRAND_CONFIRMATION:
+        raise HTTPException(status_code=400, detail="This campaign is not awaiting your confirmation")
+
+    now = now_iso()
+    title = campaign.get("title") or "a campaign"
+
+    if data.action == "confirm":
+        await db.campaigns.update_one(
+            {"id": campaign_id},
+            {"$set": {"status": CampaignStatus.ACTIVE, "script_confirmed_at": now, "updated_at": now}}
+        )
+        # Same go-live side effects as a plain approval — this IS the go-live.
+        await auto_assign_campaign_manager(campaign_id)
+        if campaign.get("visibility") == PRIVATE_VISIBILITY and campaign.get("selected_creator"):
+            await deliver_private_invitation({**campaign, "status": CampaignStatus.ACTIVE})
+        await notify_admins(
+            "Brand confirmed the script",
+            f"'{title}' — the brand confirmed UGC.ad's script; the brief is now live.",
+            link="/dashboard/admin/campaigns",
+        )
+        return {"message": "Script confirmed — your brief is now live", "status": CampaignStatus.ACTIVE}
+
+    note = (data.note or "").strip()
+    await db.campaigns.update_one(
+        {"id": campaign_id},
+        {"$set": {
+            "status": CampaignStatus.PENDING_APPROVAL,
+            "script_change_request": {"note": note, "requested_at": now},
+            "updated_at": now,
+        }}
+    )
+    await notify_admins(
+        "Brand requested script changes",
+        f"'{title}' — the brand wants the script revised{f': {note}' if note else ''}. "
+        "Update the script and approve again.",
+        link="/dashboard/admin/campaigns",
+    )
+    return {"message": "Change request sent to the UGC.ad team", "status": CampaignStatus.PENDING_APPROVAL}
+
+
+# -- Admin editing queue ------------------------------------------------------
+# Deliverables marked "edited by UGC.ad": the creator's raw submission parks at
+# AWAITING_EDIT until an editor attaches the final cut here, which is what
+# hands the work to the brand and starts the review/auto-approval clock.
+
+@api_router.get("/admin/editing-queue")
+async def admin_editing_queue(current_user: dict = Depends(require_cap("manage_deals"))):
+    rows = await db.work_submissions.find(
+        {"status": WorkStatus.AWAITING_EDIT}, {"_id": 0}
+    ).sort("submitted_at", 1).to_list(500)
+    out = []
+    for w in rows:
+        campaign = await db.campaigns.find_one(
+            {"id": w.get("campaign_id")},
+            {"_id": 0, "title": 1, "business_id": 1, "deliverable_items": 1}
+        ) or {}
+        creator = await db.users.find_one({"id": w.get("creator_id")}, {"_id": 0, "nickname": 1, "full_name": 1}) or {}
+        brand = await db.users.find_one({"id": campaign.get("business_id")}, {"_id": 0, "nickname": 1}) or {}
+        out.append({
+            "work_id": w.get("id"),
+            "campaign_id": w.get("campaign_id"),
+            "campaign_title": campaign.get("title") or "Untitled campaign",
+            "brand_name": brand.get("nickname") or "",
+            "creator_name": creator.get("full_name") or creator.get("nickname") or "Creator",
+            "raw_files": w.get("raw_files") or w.get("work_files") or [],
+            "description": w.get("description") or "",
+            "deliverables": campaign.get("deliverable_items") or [],
+            "submitted_at": w.get("submitted_at"),
+        })
+    return out
+
+
+class EditingCompleteIn(BaseModel):
+    edited_file_url: str      # uploaded via /upload/file first
+    note: Optional[str] = None
+
+
+@api_router.post("/admin/editing-queue/{work_id}/complete")
+async def admin_editing_complete(work_id: str, data: EditingCompleteIn, current_user: dict = Depends(require_cap("manage_deals"))):
+    work = await db.work_submissions.find_one({"id": work_id}, {"_id": 0})
+    if not work:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    if work.get("status") != WorkStatus.AWAITING_EDIT:
+        raise HTTPException(status_code=400, detail="This submission is not awaiting an edit")
+    url = (data.edited_file_url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Upload the edited file first, then pass its URL")
+
+    campaign = await db.campaigns.find_one({"id": work.get("campaign_id")}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    now = now_iso()
+    uploads_dir = str(Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))))
+    raw_files = work.get("raw_files") or work.get("work_files") or []
+    await db.work_submissions.update_one({"id": work_id}, {"$set": {
+        "work_files": [url],
+        "edited_files": [url],
+        "raw_files": raw_files,
+        "status": WorkStatus.SUBMITTED,
+        # The review clock restarts at hand-off — the brand couldn't have
+        # reviewed anything while the cut was still on our editors' desks.
+        "submitted_at": now,
+        "edited_by_admin": {"admin_id": current_user["id"], "note": (data.note or "").strip(), "completed_at": now},
+        "watermark": cf.build_watermark_record(url, "video", uploads_dir),
+    }})
+    await db.campaigns.update_one({"id": campaign["id"]}, {"$set": {"work_submission": {
+        "id": work_id,
+        "creator_id": work.get("creator_id"),
+        "work_files": [url],
+        "edited_files": [url],
+        "raw_files": raw_files,
+        "video_url": url,
+        "creator_note": work.get("description"),
+        "submitted_at": now,
+    }}})
+
+    await insert_deal_system_message(campaign, "UGC.ad finished editing — the final cut is now with the brand for review.")
+    if campaign.get("business_id"):
+        await notify_user(
+            campaign["business_id"],
+            "Content submitted for review",
+            f"UGC.ad's editors finished the cut for '{campaign.get('title', 'your campaign')}'. Review it to release payment.",
+            link="/dashboard/business/work-review", ntype="info", email=True, category="deal_updates",
+        )
+    if work.get("creator_id"):
+        await notify_user(
+            work["creator_id"],
+            "Your footage was edited and sent for review",
+            f"UGC.ad finished editing your submission for '{campaign.get('title', 'a campaign')}' — it's now with the brand.",
+            link="/my-deals", ntype="info",
+        )
+    await log_admin_action(current_user, "editing.completed", target_type="work", target_id=work_id,
+                           after={"edited_file_url": url})
+    return {"message": "Edited cut attached — the brand can now review", "work_id": work_id}
 
 
 # -- Admin campaign moderation: pause / resume / ban / delete -----------------
