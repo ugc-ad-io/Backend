@@ -11263,7 +11263,18 @@ async def get_work_by_campaign(campaign_id: str, creator_id: Optional[str] = Non
         query["creator_id"] = creator_id  # brand asking for one specific creator's work
 
     work = await db.work_submissions.find_one(query, {"_id": 0}, sort=[("submitted_at", -1)])
-    return work or {}
+    if not work:
+        return {}
+    # The owning brand only ever gets the WATERMARKED preview before approval (a
+    # playable preview_url + watermark_protected flag), and the CLEAN, downloadable
+    # original after approval — the same brand-facing shape /work/pending-review
+    # returns. Without this the endpoint handed back the raw doc (work_files, no
+    # preview_url), so the app's review screen had no video to play. The creator
+    # viewing their own submission still gets it unchanged.
+    if is_owner_brand:
+        approved = work.get("status") == WorkStatus.APPROVED
+        return cf.to_brand_facing_asset(work, approved=approved)
+    return work
 
 @api_router.get("/work/pending-review")
 async def get_work_pending_review(current_user: dict = Depends(get_current_user)):
