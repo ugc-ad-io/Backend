@@ -247,6 +247,9 @@ class SignupRequest(BaseModel):
     password: str
     role: UserRole
     name: Optional[str] = None
+    # Brand website, captured at signup so a brand isn't created with just a
+    # name and no site. Optional; stored on the business profile.
+    website: Optional[str] = None
     # Mobile number is compulsory at signup (validated, never OTP-verified).
     phone: str
     dial_code: str = "+91"
@@ -3426,6 +3429,15 @@ async def signup(data: SignupRequest):
         "created_at": datetime.now(timezone.utc).isoformat(),
         "balance": 0.0
     }
+    # Seed the brand's profile with the name + website typed at signup so the
+    # account shows the real brand identity before the full profile form.
+    if data.role == UserRole.BUSINESS:
+        site = str(data.website or "").strip()
+        user_doc["profile"] = {
+            "business_name": typed_name,
+            **({"website": site} if site else {}),
+        }
+        user_doc["business_name"] = typed_name
 
     # Creators get a permanent, unique public code + a default level used for
     # offer price-floor enforcement.
