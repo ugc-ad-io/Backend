@@ -55,6 +55,7 @@ load_dotenv(ROOT_DIR / '.env')
 from categories import categories_router, seed_categories
 from gigs import gigs_router
 import creator_features as cf
+import agreement_content as agr
 from storage import persist_file, cloudinary_enabled, CloudStorageError
 
 # MongoDB connection
@@ -3883,7 +3884,32 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         nested = (me.get("profile") or {}).get("portfolio")
         if nested:
             me["portfolio"] = nested
+    # True once the user has accepted the CURRENT agreement version — both the web
+    # and the app read this to decide whether to show the one-time consent gate, so
+    # accepting on one surface satisfies the other.
+    me["agreement_accepted"] = me.get("agreement_accepted_version") == agr.AGREEMENT_VERSION
     return me
+
+
+@api_router.get("/agreement")
+async def get_agreement(current_user: dict = Depends(get_current_user)):
+    """The current Creator & Brand Agreement + whether THIS user has accepted it."""
+    payload = agr.agreement_payload()
+    payload["accepted"] = current_user.get("agreement_accepted_version") == agr.AGREEMENT_VERSION
+    return payload
+
+
+@api_router.post("/agreement/accept")
+async def accept_agreement(current_user: dict = Depends(get_current_user)):
+    """Record acceptance of the current agreement version for this user. Idempotent."""
+    await db.users.update_one(
+        {"id": current_user["id"]},
+        {"$set": {
+            "agreement_accepted_version": agr.AGREEMENT_VERSION,
+            "agreement_accepted_at": datetime.now(timezone.utc).isoformat(),
+        }},
+    )
+    return {"accepted": True, "version": agr.AGREEMENT_VERSION}
 
 def normalize_handle(value: Optional[str]) -> str:
     handle = (value or "").strip()
@@ -16240,10 +16266,21 @@ async def admin_review_kyc(user_id: str, data: Dict[str, Any] = Body(...),
 
 
 @api_router.get("/reviews")
-async def list_reviews_stub(current_user: dict = Depends(get_current_user)):
-    """Compatibility stub (Express parity) — the creator-scoped reviews live at
-    /reviews/creator/{id}."""
-    return []
+async def list_my_reviews(current_user: dict = Depends(get_current_user)):
+    """The signed-in user's own reviews, so the Reviews page (web + app) shows a
+    real list and star breakdown. Was a stub returning [] — which is why the
+    page read 'No reviews yet' and 0% per star even when the aggregate showed a
+    rating. Creator sees reviews left for them; a brand sees reviews left for it."""
+    if current_user.get("role") == UserRole.BUSINESS:
+        ws_id = _brand_ws_id(current_user)
+        reviews = await db.reviews.find(
+            {"business_id": ws_id, "reviewee_role": "business"}, {"_id": 0}
+        ).sort("created_at", -1).to_list(1000)
+    else:
+        reviews = await db.reviews.find(
+            {"creator_id": current_user["id"], "reviewee_role": {"$ne": "business"}}, {"_id": 0}
+        ).sort("created_at", -1).to_list(1000)
+    return reviews
 
 
 @api_router.get("/payout/overview")
