@@ -3896,6 +3896,13 @@ async def get_agreement(current_user: dict = Depends(get_current_user)):
     """The current Creator & Brand Agreement + whether THIS user has accepted it."""
     payload = agr.agreement_payload()
     payload["accepted"] = current_user.get("agreement_accepted_version") == agr.AGREEMENT_VERSION
+    # Show the heading for the reader's own role only — a creator sees "Creator
+    # Agreement", a brand sees "Brand Agreement" (the body still applies to both).
+    role = current_user.get("role")
+    if role == UserRole.CREATOR:
+        payload["title"] = agr.AGREEMENT_TITLE.replace("Creator & Brand", "Creator")
+    elif role == UserRole.BUSINESS:
+        payload["title"] = agr.AGREEMENT_TITLE.replace("Creator & Brand", "Brand")
     return payload
 
 
