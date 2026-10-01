@@ -1650,7 +1650,10 @@ export default function BusinessDashboard({ page = 'overview' }) {
                         {campaign.bids.slice(0, 2).map((bid, idx) => (
                           <div key={idx} className="bid-preview-item">
                             <span className="creator-name">{bid.creator_nickname || bid.creator_name || 'Creator'}</span>
-                            <span className="bid-amount">{formatMoney(bid.amount)}</span>
+                            <span className="bid-amount">
+                              {formatMoney(bid.amount)}
+                              {bid.raw_amount != null && <small> (Raw {formatMoney(bid.raw_amount)} + Edited {formatMoney(bid.edited_amount)})</small>}
+                            </span>
                           </div>
                         ))}
                       </div>

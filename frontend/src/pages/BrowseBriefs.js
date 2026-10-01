@@ -31,6 +31,10 @@ import './BrowseBriefs.css';
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
+// The creator (not UGC.ad's team) cuts the edited file, so they quote raw + edited separately.
+const needsEditSplit = (campaign) =>
+  (campaign?.deliverable_items || []).some(d => d.edited_required && (d.edited_by || 'creator') === 'creator');
+
 const getInitial = (name) => (name || 'U').trim().charAt(0).toUpperCase();
 
 const formatMoney = (value) => {
@@ -102,8 +106,11 @@ export default function BrowseBriefs() {
   const [loading, setLoading] = useState(true);
   const [selectedCampaign, setSelectedCampaign] = useState(null);
   const [bidAmount, setBidAmount] = useState('');
+  const [rawAmount, setRawAmount] = useState('');
+  const [editedAmount, setEditedAmount] = useState('');
   const [proposal, setProposal] = useState('');
   const [deliveryDays, setDeliveryDays] = useState('');
+  const split = needsEditSplit(selectedCampaign);
 
   const displayName = user?.nickname || user?.full_name || user?.email || 'Creator';
 
@@ -144,15 +151,18 @@ export default function BrowseBriefs() {
   const handleBidSubmit = async (e) => {
     e.preventDefault();
     try {
+      const raw = parseFloat(rawAmount) || 0;
+      const edited = parseFloat(editedAmount) || 0;
       await axios.post(`${API}/campaigns/${selectedCampaign.id}/bid`, {
         campaign_id: selectedCampaign.id,
-        amount: parseFloat(bidAmount),
+        amount: split ? raw + edited : parseFloat(bidAmount),
+        ...(split ? { raw_amount: raw, edited_amount: edited } : {}),
         proposal,
         estimated_delivery_days: parseInt(deliveryDays, 10),
       });
       toast.success('Bid submitted successfully');
       setSelectedCampaign(null);
-      setBidAmount(''); setProposal(''); setDeliveryDays('');
+      setBidAmount(''); setRawAmount(''); setEditedAmount(''); setProposal(''); setDeliveryDays('');
       fetchData();
     } catch (err) {
       toast.error(err.response?.data?.detail || 'Failed to submit bid');
@@ -180,10 +190,24 @@ export default function BrowseBriefs() {
           <form className="pcd-modal" onSubmit={handleBidSubmit}>
             <h2 id="bid-modal-title">Submit Bid</h2>
             <p>{selectedCampaign.title}</p>
-            <label>
-              Bid Amount
-              <input type="number" value={bidAmount} onChange={(e) => setBidAmount(e.target.value)} required min="1" />
-            </label>
+            {split ? (
+              <>
+                <label>
+                  Payout for raw video (Rs.)
+                  <input type="number" value={rawAmount} onChange={(e) => setRawAmount(e.target.value)} required min="1" placeholder="e.g. 1000" />
+                </label>
+                <label>
+                  Payout for edited video (Rs.)
+                  <input type="number" value={editedAmount} onChange={(e) => setEditedAmount(e.target.value)} required min="1" placeholder="e.g. 1000" />
+                </label>
+                <small>This brief needs you to edit the video too. Total bid: Rs. {((parseFloat(rawAmount) || 0) + (parseFloat(editedAmount) || 0)).toLocaleString('en-IN')}</small>
+              </>
+            ) : (
+              <label>
+                Bid Amount
+                <input type="number" value={bidAmount} onChange={(e) => setBidAmount(e.target.value)} required min="1" />
+              </label>
+            )}
             <label>
               Delivery Days
               <input type="number" value={deliveryDays} onChange={(e) => setDeliveryDays(e.target.value)} required min="1" />

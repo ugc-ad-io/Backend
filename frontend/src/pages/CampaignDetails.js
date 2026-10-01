@@ -8,6 +8,10 @@ import { ArrowLeft, User, DollarSign, Calendar, MessageSquare, Package, Target, 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 
+// The creator (not UGC.ad's team) cuts the edited file, so they quote raw + edited separately.
+const needsEditSplit = (campaign) =>
+  (campaign?.deliverable_items || []).some(d => d.edited_required && (d.edited_by || 'creator') === 'creator');
+
 // Renders the structured 8-section brief. Each section only appears when it
 // has data, so older briefs (which only carried brief_text) degrade gracefully.
 function BriefSections({ campaign }) {
@@ -147,6 +151,8 @@ export default function CampaignDetails() {
   const [selectedCreator, setSelectedCreator] = useState(null);
   const [showBidModal, setShowBidModal] = useState(false);
   const [bidAmount, setBidAmount] = useState('');
+  const [rawAmount, setRawAmount] = useState('');
+  const [editedAmount, setEditedAmount] = useState('');
   const [proposal, setProposal] = useState('');
   const [deliveryDays, setDeliveryDays] = useState('');
   const [showCreatorModal, setShowCreatorModal] = useState(false);
@@ -232,16 +238,22 @@ export default function CampaignDetails() {
 
   const handleSubmitBid = async (e) => {
     e.preventDefault();
+    const split = needsEditSplit(campaign);
+    const raw = parseFloat(rawAmount) || 0;
+    const edited = parseFloat(editedAmount) || 0;
     try {
       await axios.post(`${API}/campaigns/${id}/bid`, {
         campaign_id: id,
-        amount: parseFloat(bidAmount),
+        amount: split ? raw + edited : parseFloat(bidAmount),
+        ...(split ? { raw_amount: raw, edited_amount: edited } : {}),
         proposal,
         estimated_delivery_days: parseInt(deliveryDays)
       });
       toast.success('Bid submitted successfully!');
       setShowBidModal(false);
       setBidAmount('');
+      setRawAmount('');
+      setEditedAmount('');
       setProposal('');
       setDeliveryDays('');
       // Small delay to ensure DB write completes, then refresh campaign data
@@ -391,6 +403,7 @@ export default function CampaignDetails() {
                           <div className="bid-creator-name">{bid.creator_nickname}</div>
                           <div className="bid-meta-inline">
                             <span className="bid-amount-inline">${bid.amount}</span>
+                            {bid.raw_amount != null && <small> (Raw Rs. {bid.raw_amount} + Edited Rs. {bid.edited_amount})</small>}
                             <span className="bid-separator">•</span>
                             <span className="bid-delivery"><Calendar size={14} /> {bid.estimated_delivery_days} days</span>
                           </div>
@@ -463,21 +476,38 @@ export default function CampaignDetails() {
               <button className="modal-close" onClick={() => setShowBidModal(false)}>×</button>
             </div>
             <form onSubmit={handleSubmitBid} className="bid-form">
-              <div className="form-group">
-                <label htmlFor="bidAmount">Bid Amount ($)</label>
-                <input
-                  id="bidAmount"
-                  type="number"
-                  value={bidAmount}
-                  onChange={(e) => setBidAmount(e.target.value)}
-                  placeholder="Enter your bid amount"
-                  min={campaign.budget_min}
-                  max={campaign.budget_max}
-                  required
-                  data-testid="bid-amount-input"
-                />
-                <small>Budget range: ${campaign.budget_min} - ${campaign.budget_max}</small>
-              </div>
+              {needsEditSplit(campaign) ? (
+                <>
+                  <div className="form-group">
+                    <label htmlFor="rawAmount">Payout for raw video (Rs.)</label>
+                    <input id="rawAmount" type="number" min="1" value={rawAmount} onChange={(e) => setRawAmount(e.target.value)} placeholder="e.g. 1000" required />
+                  </div>
+                  <div className="form-group">
+                    <label htmlFor="editedAmount">Payout for edited video (Rs.)</label>
+                    <input id="editedAmount" type="number" min="1" value={editedAmount} onChange={(e) => setEditedAmount(e.target.value)} placeholder="e.g. 1000" required />
+                    <small>
+                      This brief needs you to edit the video too. Total bid: Rs. {((parseFloat(rawAmount) || 0) + (parseFloat(editedAmount) || 0)).toLocaleString('en-IN')}
+                      {campaign.budget_max ? ` (max Rs. ${Number(campaign.budget_max).toLocaleString('en-IN')})` : ''}
+                    </small>
+                  </div>
+                </>
+              ) : (
+                <div className="form-group">
+                  <label htmlFor="bidAmount">Bid Amount ($)</label>
+                  <input
+                    id="bidAmount"
+                    type="number"
+                    value={bidAmount}
+                    onChange={(e) => setBidAmount(e.target.value)}
+                    placeholder="Enter your bid amount"
+                    min={campaign.budget_min}
+                    max={campaign.budget_max}
+                    required
+                    data-testid="bid-amount-input"
+                  />
+                  <small>Budget range: ${campaign.budget_min} - ${campaign.budget_max}</small>
+                </div>
+              )}
               <div className="form-group">
                 <label htmlFor="deliveryDays">Estimated Delivery (days)</label>
                 <input

@@ -61,7 +61,8 @@ const createDeliverable = () => ({
   duration: '',
   aspectRatios: ['9:16'],
   rawRequired: false,
-  editedRequired: false
+  editedRequired: false,
+  editedBy: 'creator'
 });
 
 const initialForm = {
@@ -395,7 +396,8 @@ export default function PostABrief() {
           duration: item.duration,
           aspect_ratios: item.aspectRatios,
           raw_required: item.rawRequired,
-          edited_required: item.editedRequired
+          edited_required: item.editedRequired,
+          edited_by: item.editedRequired ? (item.editedBy || 'creator') : null
         })),
 
         // Section 3: Must-Include
@@ -579,7 +581,17 @@ export default function PostABrief() {
                       <div className="form-group"><label>Raw file delivery required *</label><div className="brief-segment"><button type="button" className={item.rawRequired ? 'active' : ''} onClick={() => updateDeliverable(item.id, { rawRequired: true })}>Yes</button><button type="button" className={!item.rawRequired ? 'active' : ''} onClick={() => updateDeliverable(item.id, { rawRequired: false })}>No</button></div></div>
                     </div>
                     <div className="form-row">
-                      <div className="form-group"><label>Edited file required *</label><div className="brief-segment"><button type="button" className={item.editedRequired ? 'active' : ''} onClick={() => updateDeliverable(item.id, { editedRequired: true })}>Yes</button><button type="button" className={!item.editedRequired ? 'active' : ''} onClick={() => updateDeliverable(item.id, { editedRequired: false })}>No</button></div></div>
+                      <div className="form-group">
+                        <label>Edited file required *</label>
+                        <div className="brief-segment"><button type="button" className={item.editedRequired ? 'active' : ''} onClick={() => updateDeliverable(item.id, { editedRequired: true })}>Yes</button><button type="button" className={!item.editedRequired ? 'active' : ''} onClick={() => updateDeliverable(item.id, { editedRequired: false })}>No</button></div>
+                        {item.editedRequired && (
+                          <>
+                            <label style={{ marginTop: 10 }}>Who edits the video? *</label>
+                            <div className="brief-segment"><button type="button" className={(item.editedBy || 'creator') === 'creator' ? 'active' : ''} onClick={() => updateDeliverable(item.id, { editedBy: 'creator' })}>Creator</button><button type="button" className={item.editedBy === 'ugc' ? 'active' : ''} onClick={() => updateDeliverable(item.id, { editedBy: 'ugc' })}>UGC.ad team</button></div>
+                            {(item.editedBy || 'creator') === 'creator' && <small>Creators will quote a separate price for the raw video and the edited video.</small>}
+                          </>
+                        )}
+                      </div>
                       <div className="form-group"><label>Aspect ratio *</label><div className="brief-chip-grid compact">{ASPECTS.map(ratio => <ToggleChip key={ratio} active={item.aspectRatios.includes(ratio)} onClick={() => updateDeliverable(item.id, { aspectRatios: item.aspectRatios.includes(ratio) ? item.aspectRatios.filter(r => r !== ratio) : [...item.aspectRatios, ratio] })}>{ratio}</ToggleChip>)}</div></div>
                     </div>
                   </div>

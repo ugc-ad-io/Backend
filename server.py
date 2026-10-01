@@ -365,6 +365,11 @@ class BidCreate(BaseModel):
     amount: float
     proposal: str
     estimated_delivery_days: int
+    # Split pricing for briefs where the CREATOR (not UGC.ad) cuts the edited file.
+    # When sent, `amount` is recomputed server-side as raw + edited, so every place
+    # that reads bid['amount'] (escrow, commission, dashboards) keeps working.
+    raw_amount: Optional[float] = None
+    edited_amount: Optional[float] = None
 
 class ChatMessage(BaseModel):
     recipient_id: str
@@ -7311,6 +7316,11 @@ async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Dep
     campaign = await db.campaigns.find_one({"id": campaign_id})
     if not campaign or campaign['status'] != CampaignStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Campaign not available for bidding")
+
+    if data.raw_amount is not None or data.edited_amount is not None:
+        if not (data.raw_amount and data.raw_amount > 0 and data.edited_amount and data.edited_amount > 0):
+            raise HTTPException(status_code=400, detail="Enter a payout for both the raw video and the edited video.")
+        data.amount = round(data.raw_amount + data.edited_amount, 2)
 
     budget_ceiling = (
         to_float(campaign.get("budget_max"))
