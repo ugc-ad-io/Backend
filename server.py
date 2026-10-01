@@ -7236,6 +7236,12 @@ async def get_campaigns(
                 },
             ]
         }
+        # Honour ?status= on top of the visibility rules above (the app asks for
+        # status=active to browse and status=completed for "Deals Closed"; ignoring it
+        # listed the creator's own in-progress deals in Browse and counted every
+        # campaign as a closed deal). Without the param, behaviour is unchanged.
+        if status:
+            query = {"$and": [query, {"status": status}]}
     elif current_user['role'] == UserRole.BUSINESS:
         query['business_id'] = _brand_ws_id(current_user)  # team members see the owner's campaigns
         # Optionally filter by status
