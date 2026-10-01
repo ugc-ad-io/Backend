@@ -9,8 +9,13 @@ const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
 const DRAFT_KEY = 'ugcad-brand-brief-draft-v2';
 const DRAFT_ID_KEY = 'ugcad-brand-brief-draft-id-v2';
-const COMMISSION_RATE = 0.25;
+// Mirrors the backend's authoritative math (server.py: commission_percent(),
+// campaign_listing_fee()) so this preview never under-states what publishing will
+// actually reserve/charge — the wallet debit itself was already computed correctly
+// server-side; only this on-screen preview was wrong (25% + a flat fee, no x quantity).
+const COMMISSION_RATE = 0.20;
 const LISTING_FEE = 500;
+const LISTING_FEE_MULTI = 1500;
 
 const STEPS = [
   'Campaign Basics',
@@ -24,8 +29,8 @@ const STEPS = [
 ];
 
 const CATEGORIES = ['Beauty', 'Tech', 'Fitness', 'Fashion', 'Travel', 'Food', 'Gaming', 'Lifestyle', 'Home Decor', 'Wellness'];
-const OBJECTIVES = ['Awareness', 'Product launch', 'Seasonal push', 'Testimonial', 'Tutorial', 'Unboxing', 'Comparison', 'Sale promotion', 'Customer education', 'Other'];
-const DELIVERABLE_TYPES = ['Reel (9:16, under 30s)', 'Short-form (30-60s)', 'YouTube Short (9:16, 60s max)', 'Long-form video (2+ minutes)', 'Static post', 'Carousel post', 'Story set (3-5 frames)'];
+const OBJECTIVES = ['Awareness', 'Product launch', 'Seasonal push', 'Testimonial', 'Tutorial', 'Unboxing', 'Comparison', 'Sale promotion', 'Customer education', 'Lead generation', 'Other'];
+const DELIVERABLE_TYPES = ['Reel (9:16, under 30s)', 'Short-form (30-60s)', 'YouTube Short (9:16, 60s max)', 'Long-form video (2+ minutes)', 'Static post', 'Carousel post', 'Story set (3-5 frames)', 'Amazon listing video'];
 const ASPECTS = ['9:16', '1:1', '16:9', '4:5'];
 const CTAS = ['Visit website', 'Use code', 'Swipe up', 'Follow brand', 'None'];
 const TONES = ['Casual', 'Energetic', 'Informative', 'Humorous', 'Aspirational', 'Authentic', 'Educational', 'Trustworthy'];
@@ -55,7 +60,8 @@ const createDeliverable = () => ({
   quantity: 1,
   duration: '',
   aspectRatios: ['9:16'],
-  rawRequired: false
+  rawRequired: false,
+  editedRequired: false
 });
 
 const initialForm = {
@@ -201,9 +207,17 @@ export default function PostABrief() {
     });
   };
 
+  // `budget` is the PER-VIDEO amount — it's what gets sent as budget_max/per_video_budget
+  // below, and the backend multiplies it by deliverable quantity (and creator count,
+  // always 1 at this stage) itself. The commission/listing-fee/total preview must use
+  // the same multiplied total or it understates what publishing will actually reserve.
   const budget = Number(form.budgetMode === 'fixed' ? form.fixedBudget : form.budgetMax) || 0;
-  const commission = Math.round(budget * COMMISSION_RATE);
-  const totalDebit = budget + commission + LISTING_FEE;
+  const totalQuantity = form.deliverables.reduce((sum, item) => sum + (Number(item.quantity) || 1), 0) || 1;
+  const anyEdited = form.deliverables.some(item => item.editedRequired);
+  const budgetTotal = budget * totalQuantity;
+  const listingFee = totalQuantity > 1 ? LISTING_FEE_MULTI : LISTING_FEE;
+  const commission = Math.round(budgetTotal * COMMISSION_RATE);
+  const totalDebit = budgetTotal + commission + listingFee;
   const paidAdsSelected = form.platforms.some(platform => platform.toLowerCase().includes('paid ads'));
   const draftDeliverySuggestion = useMemo(() => addDays(form.productShippingBy, 7), [form.productShippingBy]);
   const pricingLifts = [
@@ -264,7 +278,7 @@ export default function PostABrief() {
     if (target === 4) return form.avoidText.length <= 200;
     if (target === 5) return form.tones.length > 0 && form.pacing;
     if (target === 6) return form.platforms.length > 0 && form.rightsDuration && form.exclusivity && form.modificationRights;
-    if (target === 7) return form.productShippingBy && form.draftDeliveryBy && form.finalDeliveryBy && budget > 0 && form.creatorLevel && form.qualityTier;
+    if (target === 7) return form.productShippingBy && form.draftDeliveryBy && (!anyEdited || form.finalDeliveryBy) && budget > 0 && form.creatorLevel && form.qualityTier;
     return true;
   };
 
@@ -328,7 +342,7 @@ export default function PostABrief() {
       `Creator targeting: level ${form.creatorLevel}; quality ${form.qualityTier}; gender ${form.genderPreference}; city ${form.cityFilter}; niches ${form.nicheTags.join(', ') || 'none'}`,
       `Timeline: ship by ${form.productShippingBy}; draft by ${form.draftDeliveryBy}; revisions ${form.revisions}; final by ${form.finalDeliveryBy}`,
       `Budget: ${form.budgetMode === 'fixed' ? `fixed Rs. ${form.fixedBudget}` : `range Rs. ${form.budgetMin} - Rs. ${form.budgetMax}`}`,
-      `Commission: platform 25%, total wallet debit Rs. ${totalDebit}, creator receives Rs. ${budget} pre-tax`
+      `Commission: platform 20%, total wallet debit Rs. ${totalDebit} (Rs. ${budget} per video x ${totalQuantity}), creator receives Rs. ${budgetTotal} pre-tax`
     ].join('\n');
   };
 
@@ -380,7 +394,8 @@ export default function PostABrief() {
           quantity: item.quantity,
           duration: item.duration,
           aspect_ratios: item.aspectRatios,
-          raw_required: item.rawRequired
+          raw_required: item.rawRequired,
+          edited_required: item.editedRequired
         })),
 
         // Section 3: Must-Include
@@ -563,7 +578,10 @@ export default function PostABrief() {
                       <div className="form-group"><label>Duration {isVideoDeliverable(item.type) ? '*' : ''}</label><input className="input-field" value={item.duration} onChange={e => updateDeliverable(item.id, { duration: e.target.value })} placeholder="15-20 seconds" /></div>
                       <div className="form-group"><label>Raw file delivery required *</label><div className="brief-segment"><button type="button" className={item.rawRequired ? 'active' : ''} onClick={() => updateDeliverable(item.id, { rawRequired: true })}>Yes</button><button type="button" className={!item.rawRequired ? 'active' : ''} onClick={() => updateDeliverable(item.id, { rawRequired: false })}>No</button></div></div>
                     </div>
-                    <div className="form-group"><label>Aspect ratio *</label><div className="brief-chip-grid compact">{ASPECTS.map(ratio => <ToggleChip key={ratio} active={item.aspectRatios.includes(ratio)} onClick={() => updateDeliverable(item.id, { aspectRatios: item.aspectRatios.includes(ratio) ? item.aspectRatios.filter(r => r !== ratio) : [...item.aspectRatios, ratio] })}>{ratio}</ToggleChip>)}</div></div>
+                    <div className="form-row">
+                      <div className="form-group"><label>Edited file required *</label><div className="brief-segment"><button type="button" className={item.editedRequired ? 'active' : ''} onClick={() => updateDeliverable(item.id, { editedRequired: true })}>Yes</button><button type="button" className={!item.editedRequired ? 'active' : ''} onClick={() => updateDeliverable(item.id, { editedRequired: false })}>No</button></div></div>
+                      <div className="form-group"><label>Aspect ratio *</label><div className="brief-chip-grid compact">{ASPECTS.map(ratio => <ToggleChip key={ratio} active={item.aspectRatios.includes(ratio)} onClick={() => updateDeliverable(item.id, { aspectRatios: item.aspectRatios.includes(ratio) ? item.aspectRatios.filter(r => r !== ratio) : [...item.aspectRatios, ratio] })}>{ratio}</ToggleChip>)}</div></div>
+                    </div>
                   </div>
                 ))}
                 <button type="button" className="brief-add-btn" onClick={addDeliverable}><Plus size={17} /> Add deliverable ({form.deliverables.length}/5)</button>
@@ -572,9 +590,9 @@ export default function PostABrief() {
 
             {step === 3 && (
               <>
-                <div className="brief-switch-row"><div><strong>Product visible on camera *</strong><p>If yes, specify minimum visibility duration.</p></div><button type="button" className={form.productVisible ? 'is-on' : ''} onClick={() => set('productVisible', !form.productVisible)}>{form.productVisible ? 'Yes' : 'No'}</button></div>
+                <div className="brief-switch-row"><div><strong>Product visible on camera *</strong><p>If yes, specify minimum visibility duration.</p></div><div className="brief-segment"><button type="button" className={form.productVisible ? 'active' : ''} onClick={() => set('productVisible', true)}>Yes</button><button type="button" className={!form.productVisible ? 'active' : ''} onClick={() => set('productVisible', false)}>No</button></div></div>
                 {form.productVisible && <div className="form-group"><label>Minimum visibility duration (seconds)</label><input className="input-field" value={form.visibilitySeconds} onChange={e => set('visibilitySeconds', e.target.value)} placeholder="5" /></div>}
-                <div className="brief-switch-row"><div><strong>Verbal product mention *</strong><p>List exact product names to be spoken.</p></div><button type="button" className={form.verbalMention ? 'is-on' : ''} onClick={() => set('verbalMention', !form.verbalMention)}>{form.verbalMention ? 'Yes' : 'No'}</button></div>
+                <div className="brief-switch-row"><div><strong>Verbal product mention *</strong><p>List exact product names to be spoken.</p></div><div className="brief-segment"><button type="button" className={form.verbalMention ? 'active' : ''} onClick={() => set('verbalMention', true)}>Yes</button><button type="button" className={!form.verbalMention ? 'active' : ''} onClick={() => set('verbalMention', false)}>No</button></div></div>
                 {form.verbalMention && <div className="form-group"><label>Exact product name(s)</label><input className="input-field" value={form.productNames} onChange={e => set('productNames', e.target.value)} /></div>}
                 <div className="form-row"><div className="form-group"><label>Required phrases (up to 5)</label>{renderTextList('requiredPhrases', 5, 'Perfect for oily skin')}</div><div className="form-group"><label>Required visual shots (up to 5)</label>{renderTextList('requiredShots', 5, 'Close-up of label')}</div></div>
                 <div className="form-row"><div className="form-group"><label>Call to action *</label><select className="input-field" value={form.callToAction} onChange={e => set('callToAction', e.target.value)}>{CTAS.map(item => <option key={item}>{item}</option>)}</select></div>{form.callToAction === 'Use code' && <div className="form-group"><label>Promo code *</label><input className="input-field" value={form.promoCode} onChange={e => set('promoCode', e.target.value)} /></div>}</div>
@@ -630,12 +648,24 @@ export default function PostABrief() {
                   </div>
                   <div className="form-group"><label>Creator niche tags</label><div className="brief-chip-grid">{NICHE_TAGS.map(item => <ToggleChip key={item} active={form.nicheTags.includes(item)} onClick={() => toggleArray('nicheTags', item)}>{item}</ToggleChip>)}</div></div>
                 </div>
-                <div className="form-row"><div className="form-group"><label>Product shipping by *</label><input className="input-field" type="date" value={form.productShippingBy} onChange={e => set('productShippingBy', e.target.value)} /></div><div className="form-group"><label>Content draft delivery by *</label><input className="input-field" type="date" value={form.draftDeliveryBy} onChange={e => set('draftDeliveryBy', e.target.value)} /><small>{draftDeliverySuggestion ? `Suggested from shipping date: ${draftDeliverySuggestion}` : 'Suggested as product shipping + 7 days.'}</small></div></div>
-                <div className="form-row"><div className="form-group"><label>Revisions included *</label><input className="input-field" type="number" min="0" value={form.revisions} onChange={e => set('revisions', Number(e.target.value))} /><small>Extra revisions: Rs. 500 each (Rs. 300 creator, Rs. 200 platform)</small></div><div className="form-group"><label>Final content delivery by</label><input className="input-field" type="date" value={form.finalDeliveryBy} onChange={e => set('finalDeliveryBy', e.target.value)} /></div></div>
+                <div className="form-row"><div className="form-group"><label>Product shipping by *</label><input className="input-field" type="date" value={form.productShippingBy} onChange={e => set('productShippingBy', e.target.value)} /></div><div className="form-group"><label>{anyEdited ? 'Content draft delivery by *' : 'Content delivery by *'}</label><input className="input-field" type="date" value={form.draftDeliveryBy} onChange={e => set('draftDeliveryBy', e.target.value)} /><small>{draftDeliverySuggestion ? `Suggested from shipping date: ${draftDeliverySuggestion}` : 'Suggested as product shipping + 7 days.'}</small></div></div>
+                <div className="form-row">
+                  <div className="form-group"><label>Revisions included *</label><input className="input-field" type="number" min="0" value={form.revisions} onChange={e => set('revisions', Number(e.target.value))} /><small>Extra revisions: Rs. 500 each (Rs. 300 creator, Rs. 200 platform)</small></div>
+                  {anyEdited && <div className="form-group"><label>Final content delivery by</label><input className="input-field" type="date" value={form.finalDeliveryBy} onChange={e => set('finalDeliveryBy', e.target.value)} /></div>}
+                </div>
                 <div className="form-group"><label>Budget *</label><div className="brief-segment"><button className={form.budgetMode === 'fixed' ? 'active' : ''} type="button" onClick={() => set('budgetMode', 'fixed')}>Fixed amount</button><button className={form.budgetMode === 'range' ? 'active' : ''} type="button" onClick={() => set('budgetMode', 'range')}>Range</button></div></div>
                 {form.budgetMode === 'fixed' ? <div className="form-group"><label>Fixed budget (Rs.)</label><input className="input-field" type="number" value={form.fixedBudget} onChange={e => set('fixedBudget', e.target.value)} /></div> : <div className="form-row"><div className="form-group"><label>Min budget (Rs.)</label><input className="input-field" type="number" value={form.budgetMin} onChange={e => set('budgetMin', e.target.value)} /></div><div className="form-group"><label>Max budget (Rs.)</label><input className="input-field" type="number" value={form.budgetMax} onChange={e => set('budgetMax', e.target.value)} /></div></div>}
                 <div className="brief-note"><Info size={18} /> Rush delivery is not available in V0.5.</div>
-                <div className="commission-card"><p>Your budget <strong>Rs. {budget.toLocaleString('en-IN')}</strong></p><p>Platform commission (25%) <strong>Rs. {commission.toLocaleString('en-IN')}</strong></p><p>Total wallet debit <strong>Rs. {totalDebit.toLocaleString('en-IN')}</strong></p><p>Creator receives on approval <strong>Rs. {budget.toLocaleString('en-IN')}</strong></p><small>Creator amount is pre-tax. TDS may apply.</small></div>
+                <div className="commission-card">
+                  <p>Budget per video <strong>Rs. {budget.toLocaleString('en-IN')}</strong></p>
+                  {totalQuantity > 1 && <p>Total videos <strong>{totalQuantity}</strong></p>}
+                  <p>Total budget <strong>Rs. {budgetTotal.toLocaleString('en-IN')}</strong></p>
+                  <p>Platform commission (20%) <strong>Rs. {commission.toLocaleString('en-IN')}</strong></p>
+                  <p>Listing fee (one-time) <strong>Rs. {listingFee.toLocaleString('en-IN')}</strong></p>
+                  <p>Total wallet debit <strong>Rs. {totalDebit.toLocaleString('en-IN')}</strong></p>
+                  <p>Creator receives on approval <strong>Rs. {budgetTotal.toLocaleString('en-IN')}</strong></p>
+                  <small>Creator amount is pre-tax. TDS may apply.</small>
+                </div>
               </>
             )}
 
@@ -648,7 +678,7 @@ export default function PostABrief() {
                 <Summary title="Style Guidance" rows={[['Tone', form.tones.join(', ')], ['Pacing', form.pacing], ['Mood board images', form.moodImages.join(', ') || 'None'], ['Reference videos', referenceVideos], ['Music preference', form.musicPreference], ['Note', 'Guidance only; not grounds for dispute.']]} />
                 <Summary title="Usage Rights" rows={[['Platforms', form.platforms.join(', ')], ['Rights duration', form.rightsDuration], ['Exclusivity', form.exclusivity], ['Whitelisting', form.whitelisting ? 'Yes' : 'No'], ['Modification', form.modificationRights]]} />
                 <Summary title="Creator Targeting" rows={[['Minimum level', form.creatorLevel], ['Quality tier', form.qualityTier], ['Gender preference', form.genderPreference], ['City filter', form.cityFilter], ['Niche tags', form.nicheTags.join(', ') || 'None']]} />
-                <Summary title="Timeline & Budget" rows={[['Ship by', form.productShippingBy], ['Draft by', form.draftDeliveryBy], ['Revisions included', form.revisions], ['Final by', form.finalDeliveryBy], ['Budget', form.budgetMode === 'fixed' ? `Rs. ${budget.toLocaleString('en-IN')}` : `Rs. ${Number(form.budgetMin || 0).toLocaleString('en-IN')} - Rs. ${budget.toLocaleString('en-IN')}`], ['Platform commission', `Rs. ${commission.toLocaleString('en-IN')}`], ['Listing fee', `Rs. ${LISTING_FEE.toLocaleString('en-IN')}`], ['Total wallet debit', `Rs. ${totalDebit.toLocaleString('en-IN')}`]]} />
+                <Summary title="Timeline & Budget" rows={[['Ship by', form.productShippingBy], ['Draft by', form.draftDeliveryBy], ['Revisions included', form.revisions], ...(anyEdited ? [['Final by', form.finalDeliveryBy]] : []), ['Budget per video', form.budgetMode === 'fixed' ? `Rs. ${budget.toLocaleString('en-IN')}` : `Rs. ${Number(form.budgetMin || 0).toLocaleString('en-IN')} - Rs. ${budget.toLocaleString('en-IN')}`], ...(totalQuantity > 1 ? [['Total videos', String(totalQuantity)], ['Total budget', `Rs. ${budgetTotal.toLocaleString('en-IN')}`]] : []), ['Platform commission (20%)', `Rs. ${commission.toLocaleString('en-IN')}`], ['Listing fee', `Rs. ${listingFee.toLocaleString('en-IN')}`], ['Total wallet debit', `Rs. ${totalDebit.toLocaleString('en-IN')}`]]} />
               </div>
             )}
           </div>
@@ -682,9 +712,11 @@ export default function PostABrief() {
           <div className="rail-card">
             <h3>Cost Preview</h3>
             <div className="summary-items">
-              <div className="summary-item"><span>Budget</span><strong>Rs. {budget.toLocaleString('en-IN')}</strong></div>
-              <div className="summary-item"><span>Commission</span><strong>Rs. {commission.toLocaleString('en-IN')}</strong></div>
-              <div className="summary-item"><span>Listing fee</span><strong>Rs. {LISTING_FEE.toLocaleString('en-IN')}</strong></div>
+              <div className="summary-item"><span>Budget per video</span><strong>Rs. {budget.toLocaleString('en-IN')}</strong></div>
+              {totalQuantity > 1 && <div className="summary-item"><span>Total videos</span><strong>{totalQuantity}</strong></div>}
+              <div className="summary-item"><span>Total budget</span><strong>Rs. {budgetTotal.toLocaleString('en-IN')}</strong></div>
+              <div className="summary-item"><span>Commission (20%)</span><strong>Rs. {commission.toLocaleString('en-IN')}</strong></div>
+              <div className="summary-item"><span>Listing fee</span><strong>Rs. {listingFee.toLocaleString('en-IN')}</strong></div>
               <div className="summary-item"><span>Total debit</span><strong>Rs. {totalDebit.toLocaleString('en-IN')}</strong></div>
             </div>
           </div>
@@ -695,7 +727,12 @@ export default function PostABrief() {
         <div className="brief-modal-backdrop">
           <div className="brief-modal">
             <h3>Confirm publishing</h3>
-            <p>This will debit Rs. {totalDebit.toLocaleString('en-IN')} from your wallet: Rs. {budget.toLocaleString('en-IN')} budget + Rs. {commission.toLocaleString('en-IN')} platform commission + Rs. {LISTING_FEE.toLocaleString('en-IN')} listing fee. It cannot be modified after a creator accepts. Continue?</p>
+            <p>
+              This will debit Rs. {totalDebit.toLocaleString('en-IN')} from your wallet:
+              Rs. {budget.toLocaleString('en-IN')} per video{totalQuantity > 1 ? ` x ${totalQuantity} videos = Rs. ${budgetTotal.toLocaleString('en-IN')}` : ''}
+              {' '}+ Rs. {commission.toLocaleString('en-IN')} platform commission + Rs. {listingFee.toLocaleString('en-IN')} listing fee.
+              It cannot be modified after a creator accepts. Continue?
+            </p>
             <div>
               <button type="button" className="btn-secondary" onClick={() => setShowConfirm(false)}>Cancel</button>
               <button type="button" className="btn-primary" onClick={publish} disabled={submitting}>{submitting ? 'Publishing...' : 'Continue'}</button>

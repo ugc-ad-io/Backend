@@ -553,6 +553,15 @@ export default function BrandDealRoom() {
           <div className="deal-modal" onClick={(e) => e.stopPropagation()}>
             <h2>Request Revision</h2>
             <p>{selectedDeal?.revisions_remaining ?? 0} revision(s) remaining. One change request per line.</p>
+            {(revision.free_revisions_remaining ?? 0) <= 0 ? (
+              <div className="deal-revision-fee-warning">
+                This is a paid revision — ₹{revision.next_revision_fee || 500} will be charged to your wallet (₹300 goes to the creator). Include every change you need; the free revisions are used up.
+              </div>
+            ) : (revision.free_revisions_remaining ?? 0) === 1 ? (
+              <div className="deal-revision-fee-warning">
+                This is your last free revision. Make sure it covers everything — revisions after this cost ₹{revision.next_revision_fee || 500} each (₹300 goes to the creator).
+              </div>
+            ) : null}
             <textarea value={revisionFeedback} onChange={(e) => setRevisionFeedback(e.target.value)} placeholder={'Tighten the intro hook\nAdd the discount code on screen'} rows={5} />
             <div className="deal-modal-actions">
               <button type="button" className="ghost" onClick={() => setRevisionOpen(false)}>Cancel</button>

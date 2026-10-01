@@ -244,6 +244,7 @@ def late_penalty_pct(offense_number: int, severity: str = "late") -> int:
 
 FREE_REVISION_LIMIT = 2
 PAID_REVISION_FEE = 500  # INR, charged to the brand wallet per extra revision
+REVISION_FEE_CREATOR_SHARE = 300  # INR of PAID_REVISION_FEE credited to the creator at payout
 
 
 def revision_fee_for(existing_revision_count: int) -> int:

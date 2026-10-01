@@ -32,6 +32,10 @@ def total_deliverable_quantity(campaign: Dict[str, Any]) -> int:
     `quantity`. This is the single source of truth for both the escrow hold and
     delivery completion, so escrow and payout can never disagree about the count.
 
+    NOTE: a row needing both a raw AND an edited file is still ONE asset/slot —
+    raw + edited are delivered together in a single submission (see
+    get_required_assets/submit_deal_content), not as two separate approval rounds.
+
     LEGACY SAFETY: briefs posted before structured deliverables existed have no
     `deliverable_items`, and this returns 1 for them. A quantity of 1 reproduces
     the old behaviour exactly (hold one asset's budget, one approval completes the
