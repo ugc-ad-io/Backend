@@ -4,6 +4,7 @@ import { useAuth } from '../App';
 import axios from 'axios';
 import { toast } from 'sonner';
 import { ArrowLeft, User, DollarSign, Calendar, MessageSquare, Package, Target, CheckCircle, Star } from 'lucide-react';
+import { hiredCreatorIds as hiredIds, creatorsWanted, isHiredOn } from '../lib/utils';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -178,11 +179,17 @@ export default function CampaignDetails() {
   const handleSelectCreator = async (creatorId) => {
     try {
       const response = await axios.post(`${API}/campaigns/${id}/select-creator?creator_id=${creatorId}`);
+      // Multi-creator brief with slots still open: stay here so the brand can keep hiring.
+      if (hiredIds(campaign).length + 1 < creatorsWanted(campaign)) {
+        toast.success(`${response.data.creator_nickname} hired! Payment held in escrow. You can hire ${creatorsWanted(campaign) - hiredIds(campaign).length - 1} more.`);
+        await fetchCampaign();
+        return;
+      }
       toast.success(`🎉 ${response.data.creator_nickname} selected! Payment of $${response.data.amount} held in escrow. Opening chat...`);
-      
+
       // Wait a moment for the toast to be visible
       await new Promise(resolve => setTimeout(resolve, 1500));
-      
+
       // Redirect to chat with the creator
       navigate(`/chat/${creatorId}`);
     } catch (error) {
@@ -192,6 +199,18 @@ export default function CampaignDetails() {
 
   const handleChat = (userId) => {
     navigate(`/chat/${userId}`);
+  };
+
+  const handleFinishHiring = async () => {
+    const left = creatorsWanted(campaign) - hiredIds(campaign).length;
+    if (!window.confirm(`Stop hiring with ${hiredIds(campaign).length} creator(s)? The budget for the ${left} unfilled slot(s) is refunded to your wallet.`)) return;
+    try {
+      await axios.post(`${API}/campaigns/${id}/finish-hiring`);
+      toast.success('Hiring closed. Unused budget refunded to your wallet.');
+      await fetchCampaign();
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Failed to finish hiring');
+    }
   };
 
   const handleViewCreatorProfile = async (creatorId) => {
@@ -208,14 +227,14 @@ export default function CampaignDetails() {
       const campaignsRes = await axios.get(`${API}/campaigns`);
       const pastCollaborations = campaignsRes.data.filter(
         c => c.business_id === user.id && 
-        c.selected_creator === creatorId && 
+        isHiredOn(c, creatorId) && 
         c.status === 'completed'
       );
       
       // Fetch queued orders with this creator
       const queuedOrders = campaignsRes.data.filter(
         c => c.business_id === user.id && 
-        c.selected_creator === creatorId && 
+        isHiredOn(c, creatorId) && 
         (c.status === 'in_progress' || c.status === 'active')
       );
       
@@ -387,13 +406,18 @@ export default function CampaignDetails() {
               <div className="bids-card">
                 <div className="bids-header">
                   <h3>Bids Received ({campaign.bids.length})</h3>
-                  <span className="bids-hint">Showing all bids • Scroll to view more</span>
+                  <span className="bids-hint">
+                    Hired {hiredIds(campaign).length} of {creatorsWanted(campaign)} creator{creatorsWanted(campaign) === 1 ? '' : 's'}
+                    {hiredIds(campaign).length > 0 && hiredIds(campaign).length < creatorsWanted(campaign) && campaign.status === 'active' && (
+                      <> • <button type="button" className="btn-action-small" onClick={handleFinishHiring}>Finish hiring with {hiredIds(campaign).length}</button></>
+                    )}
+                  </span>
                 </div>
               <div className="bids-list-compact">
                 {campaign.bids.map((bid, idx) => (
                   <div 
                     key={bid.id} 
-                    className={`bid-row ${campaign.selected_creator === bid.creator_id ? 'selected' : ''}`}
+                    className={`bid-row ${hiredIds(campaign).includes(bid.creator_id) ? 'selected' : ''}`}
                     data-testid={`bid-${idx}`}
                   >
                     <div className="bid-row-main">
@@ -410,7 +434,7 @@ export default function CampaignDetails() {
                         </div>
                       </div>
                       <div className="bid-row-actions">
-                        {campaign.selected_creator === bid.creator_id ? (
+                        {hiredIds(campaign).includes(bid.creator_id) ? (
                           <span className="selected-badge-inline">✓ Selected</span>
                         ) : (
                           <>
@@ -430,13 +454,15 @@ export default function CampaignDetails() {
                             >
                               <MessageSquare size={16} />
                             </button>
-                            <button
-                              className="btn-select-small"
-                              onClick={() => handleSelectCreator(bid.creator_id)}
-                              data-testid={`select-creator-${idx}`}
-                            >
-                              Select
-                            </button>
+                            {hiredIds(campaign).length < creatorsWanted(campaign) && campaign.status === 'active' && (
+                              <button
+                                className="btn-select-small"
+                                onClick={() => handleSelectCreator(bid.creator_id)}
+                                data-testid={`select-creator-${idx}`}
+                              >
+                                Select
+                              </button>
+                            )}
                           </>
                         )}
                       </div>

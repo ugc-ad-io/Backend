@@ -5,6 +5,7 @@ import axios from 'axios';
 import { toast } from 'sonner';
 import { Plus, Briefcase, LogOut, MessageSquare, CheckCircle, Eye, Package, FileCheck, TrendingUp, Users, Search, Wallet, Lock, Activity, LayoutGrid, SquarePen, UserRoundSearch, ClipboardList, Settings, Bell, Clock3, FileText, ExternalLink, Download, AlertCircle, UserCheck, Filter, MapPin, Languages, Image as ImageIcon, Send, IndianRupee, Zap } from 'lucide-react';
 import PostABrief from './PostABrief';
+import { hiredCreatorIds as hiredIds, hasOpenCreatorSlots as hasOpenSlots } from '../lib/utils';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -68,8 +69,10 @@ const monthKey = (value) => {
 };
 
 const campaignFundsAmount = (campaign = {}) => {
-  const selectedBid = (campaign.bids || []).find((bid) => bid.creator_id === campaign.selected_creator);
-  return Number(campaign.escrow_amount || campaign.held_amount || selectedBid?.amount || campaign.budget_max || campaign.budget_min || 0);
+  const hired = hiredIds(campaign);
+  const hiredBids = (campaign.bids || []).filter((bid) => hired.includes(bid.creator_id));
+  const bidsTotal = hiredBids.reduce((sum, bid) => sum + Number(bid.amount || 0), 0);
+  return Number(campaign.escrow_amount || campaign.held_amount || bidsTotal || campaign.budget_max || campaign.budget_min || 0);
 };
 
 const campaignActivityDate = (campaign = {}) => (
@@ -290,14 +293,11 @@ export default function BusinessDashboard({ page = 'overview' }) {
       const myCampaigns = allCampaigns.filter(c => c.business_id === user.id);
       setCampaigns(myCampaigns);
 
-      // Get work submissions for campaigns with work_submitted status
-      const workSubmittedCampaigns = myCampaigns.filter(c => c.status === 'work_submitted');
-      if (workSubmittedCampaigns.length > 0) {
-        const workRes = await axios.get(`${API}/work/pending-review`);
-        setWorkSubmissions(workRes.data || []);
-      } else {
-        setWorkSubmissions([]);
-      }
+      // Always load pending work: on a multi-creator brief the campaign's single status
+      // can't say "creator B submitted" once creator A has moved on, so gating this on
+      // status === 'work_submitted' could hide a submission that's waiting for review.
+      const workRes = await axios.get(`${API}/work/pending-review`);
+      setWorkSubmissions(workRes.data || []);
 
       // Categorize campaigns
       setActiveCampaigns(myCampaigns.filter(c => c.status === 'active' || c.status === 'in_progress'));
@@ -1630,16 +1630,16 @@ export default function BusinessDashboard({ page = 'overview' }) {
                   <h2>Campaigns with Pending Bids</h2>
                   <p>Review creator proposals, compare bid amounts, and open the campaign workspace.</p>
                 </div>
-                <span>{campaigns.filter(c => c.bids && c.bids.length > 0 && !c.selected_creator).length} campaigns</span>
+                <span>{campaigns.filter(c => c.bids && c.bids.length > 0 && hasOpenSlots(c)).length} campaigns</span>
               </div>
-              {campaigns.filter(c => c.bids && c.bids.length > 0 && !c.selected_creator).length === 0 ? (
+              {campaigns.filter(c => c.bids && c.bids.length > 0 && hasOpenSlots(c)).length === 0 ? (
                 <div className="empty-state">
                   <Users size={64} />
                   <p>No pending bids at the moment</p>
                 </div>
               ) : (
                 <div className="bids-grid">
-                  {campaigns.filter(c => c.bids && c.bids.length > 0 && !c.selected_creator).map(campaign => (
+                  {campaigns.filter(c => c.bids && c.bids.length > 0 && hasOpenSlots(c)).map(campaign => (
                     <div key={campaign.id} className="bid-campaign-card" data-testid={`bid-campaign-${campaign.id}`}>
                       <div className="bid-campaign-header">
                         <h3>{campaign.title}</h3>

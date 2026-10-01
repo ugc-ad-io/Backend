@@ -1661,7 +1661,9 @@ async def notify_user(user_id: str, title: str, message: str, link: Optional[str
     # Non-critical email is suppressed during quiet hours (the in-app record still shows).
     if email and (critical or not _in_quiet_hours()):
         try:
-            u = await db.users.find_one({"id": user_id}, {"_id": 0, "email": 1, "nickname": 1, "full_name": 1, "role": 1, "notification_prefs": 1})
+            # "id" is needed by _email_category_allowed (brand prefs are keyed by it);
+            # leaving it out raised KeyError and silently dropped every brand email.
+            u = await db.users.find_one({"id": user_id}, {"_id": 0, "id": 1, "email": 1, "nickname": 1, "full_name": 1, "role": 1, "notification_prefs": 1})
             # Honor the recipient's per-category email preference (critical bypasses it).
             if not critical and not await _email_category_allowed(u or {}, category):
                 return
@@ -2412,11 +2414,9 @@ def campaign_category(campaign: dict) -> str:
     )
 
 def selected_bid_amount(campaign: dict) -> float:
-    selected_creator = campaign.get("selected_creator")
-    for bid in campaign.get("bids", []):
-        if bid.get("creator_id") == selected_creator:
-            return to_float(bid.get("amount"))
-    return 0.0
+    """Total of the accepted bids — every hired creator, not just the first pick."""
+    hired = set(selected_creator_ids(campaign))
+    return sum(to_float(bid.get("amount")) for bid in campaign.get("bids", []) if bid.get("creator_id") in hired)
 
 def dashboard_stage(campaign: dict, work: Optional[dict], shipment: Optional[dict]) -> dict:
     status_value = campaign.get("status")
@@ -4986,7 +4986,15 @@ async def get_business_dashboard(current_user: dict = Depends(get_current_user))
     shipments = await db.shipments.find({"campaign_id": {"$in": campaign_ids}}, {"_id": 0}).to_list(10000) if campaign_ids else []
     reviews = await db.reviews.find({"campaign_id": {"$in": campaign_ids}}, {"_id": 0}).to_list(10000) if campaign_ids else []
 
-    escrow_by_campaign = {escrow.get("campaign_id"): escrow for escrow in escrows}
+    # A multi-creator brief has one escrow PER hired creator (plus the pre-hire
+    # "reserved" pool) — sum the hires; the pool only counts while nobody is hired.
+    escrow_by_campaign = {}
+    for escrow in escrows:
+        agg = escrow_by_campaign.setdefault(escrow.get("campaign_id"), {"amount": 0.0, "pool": 0.0})
+        amt = to_float(escrow.get("amount") or escrow.get("held_amount"))
+        agg["pool" if escrow.get("status") == "reserved" else "amount"] += amt
+    for agg in escrow_by_campaign.values():
+        agg["amount"] = agg["amount"] or agg["pool"]
     shipment_by_campaign = {shipment.get("campaign_id"): shipment for shipment in shipments}
     work_by_campaign = {}
     for work in sorted(work_submissions, key=lambda item: item.get("submitted_at") or item.get("created_at") or "", reverse=True):
@@ -5066,7 +5074,7 @@ async def get_business_dashboard(current_user: dict = Depends(get_current_user))
 
     viewed_brief = await db.campaign_views.count_documents({"campaign_id": {"$in": campaign_ids}}) if campaign_ids else 0
     applications_total = sum(len(campaign.get("bids", [])) for campaign in campaigns)
-    accepted_total = len([campaign for campaign in campaigns if campaign.get("selected_creator")])
+    accepted_total = sum(len(selected_creator_ids(campaign)) for campaign in campaigns)
     live_total = len(selected_active_campaigns)
 
     top_campaigns = []
@@ -7418,10 +7426,16 @@ async def get_my_bids(current_user: dict = Depends(get_current_user)):
         if not my_bid:
             continue
 
-        selected_creator = campaign.get('selected_creator')
-        if selected_creator == current_user['id']:
+        # Multi-creator: being hired means being in selected_creators (not just the first
+        # pick), and someone else's hire only rejects this bid once hiring has closed.
+        hired = selected_creator_ids(campaign)
+        still_hiring = (campaign.get('status') == CampaignStatus.ACTIVE
+                        and len(hired) < campaign_creators_wanted(campaign))
+        if current_user['id'] in hired:
             bid_status = "approved"
-        elif selected_creator:
+        elif str(my_bid.get('status') or '').lower() in ("declined", "rejected"):
+            bid_status = "rejected"
+        elif hired and not still_hiring:
             bid_status = "rejected"
         else:
             bid_status = "pending"
@@ -8390,10 +8404,15 @@ async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_
     # ChatPopup / Messages page) never did. Surface those system notices in this 1:1
     # thread for BOTH parties. We pull only sender_type="system"; the deal room's own
     # human chat stays in the deal room.
+    # Match ANY hired creator (selected_creators), not just the first pick — the
+    # singular field left creator #2+ of a multi-creator brief with an empty thread.
+    me_ws = _brand_ws_id(current_user)
     shared_campaigns = await db.campaigns.find({
         "$or": [
-            {"business_id": current_user['id'], "selected_creator": other_user_id},
+            {"business_id": me_ws, "selected_creator": other_user_id},
+            {"business_id": me_ws, "selected_creators": other_user_id},
             {"business_id": other_user_id, "selected_creator": current_user['id']},
+            {"business_id": other_user_id, "selected_creators": current_user['id']},
         ]
     }, {"_id": 0, "id": 1}).to_list(100)
     deal_system_messages = []
@@ -8409,10 +8428,17 @@ async def get_chat_history(other_user_id: str, current_user: dict = Depends(get_
         # campaign-wide messages still reach everyone.
         thread_creator_id = (current_user['id'] if current_user.get('role') == UserRole.CREATOR
                              else other_user_id)
+        # System notices AND what the two parties typed in the web Deal Room. The web
+        # Deal Room already merges this 1:1 thread into its chat, so leaving the human
+        # deal-room messages out here meant the app never saw them — two clients, two
+        # different conversations.
         deal_system_messages = await db.deal_messages.find({
             "campaign_id": {"$in": [c["id"] for c in shared_campaigns]},
-            "sender_type": "system",
             "creator_id": {"$in": [None, thread_creator_id]},
+            "$or": [
+                {"sender_type": "system"},
+                {"sender_id": {"$in": [current_user['id'], other_user_id]}},
+            ],
         }, {"_id": 0}).sort("created_at", 1).to_list(1000)
 
     if not current_user.get("disable_read_receipts"):
@@ -8963,22 +8989,47 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         for d in (campaign.get('deliverable_items') or [])
     )
 
+    submitted_at = datetime.now(timezone.utc).isoformat()
+    watermark = cf.build_watermark_record(primary_file, "video", uploads_dir)
     work_doc = {
         "id": str(uuid.uuid4()),
         "campaign_id": data.campaign_id,
         "creator_id": current_user['id'],
+        "deliverable_index": 0,
         "work_files": data.work_files,
         "edited_files": data.edited_files,
         "raw_files": data.raw_files,
         "description": data.description,
         "status": WorkStatus.AWAITING_EDIT if needs_ugc_edit else WorkStatus.SUBMITTED,
         "needs_ugc_edit": needs_ugc_edit,
-        "submitted_at": datetime.now(timezone.utc).isoformat(),
-        "watermark": cf.build_watermark_record(primary_file, "video", uploads_dir),
+        "submitted_at": submitted_at,
+        "watermark": watermark,
         "revisions": []
     }
 
     await db.work_submissions.insert_one(work_doc)
+
+    # Same per-version record /deals/{id}/content writes. approve_work's payout gate
+    # (deliverables_progress), the version history and revision tracking all read
+    # deal_content_submissions — without this row, work submitted from the app could
+    # be approved but the creator was never paid.
+    version = await db.deal_content_submissions.count_documents(
+        {"campaign_id": data.campaign_id, "creator_id": current_user['id'], "deliverable_index": 0}) + 1
+    await db.deal_content_submissions.insert_one({
+        "id": str(uuid.uuid4()),
+        "deal_id": person_deal_id(campaign, current_user['id']),
+        "campaign_id": data.campaign_id,
+        "creator_id": current_user['id'],
+        "deliverable_index": 0,
+        "version": version,
+        "video_url": (data.edited_files or data.work_files or [None])[0],
+        "raw_footage_url": (data.raw_files or [None])[0],
+        "original_url": primary_file,
+        "watermark": watermark,
+        "creator_note": data.description,
+        "submitted_at": submitted_at,
+        "status": "submitted",
+    })
 
     # Update campaign status + surface the submission for the brand's Work Review.
     await db.campaigns.update_one(
@@ -8994,6 +9045,7 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
                 "video_url": primary_file,
                 "creator_note": data.description,
                 "submitted_at": work_doc["submitted_at"],
+                "version": version,
             },
         }}
     )
@@ -9222,9 +9274,12 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
     # brief ONE creator's approval satisfied the gate for every hired creator at once.
     progress = await deliverables_progress(campaign, work['creator_id'])
     if not progress["complete"]:
+        # Another hired creator may still have work awaiting review — don't hide it.
+        pending = await db.work_submissions.count_documents(
+            {"campaign_id": work['campaign_id'], "status": WorkStatus.SUBMITTED})
         await db.campaigns.update_one(
             {"id": work['campaign_id']},
-            {"$set": {"status": "in_progress", "updated_at": now}}
+            {"$set": {"status": "work_submitted" if pending else "in_progress", "updated_at": now}}
         )
         await insert_deal_activity(
             campaign, "brand", current_user.get('nickname', 'Brand'), "content_approved",
@@ -9329,6 +9384,22 @@ async def schedule_payout_for_deal(campaign: dict, work: dict, source: str = "ap
         "source": source,
     })
     return {"payout_scheduled_at": scheduled_at, "net_payable": net, "tds_amount": tds, "penalty_amount": penalty, "late": late}
+
+
+async def campaign_rollup_status(campaign: dict) -> str:
+    """One status for the whole brief, derived from every hired creator's deal:
+    completed once ALL of them are paid, work_submitted while any submission awaits
+    review (the brand's Work Review keys off this), otherwise in_progress."""
+    hired = selected_creator_ids(campaign) or [campaign.get('selected_creator')]
+    if len(hired) <= 1:
+        return CampaignStatus.COMPLETED  # only called after a payout; legacy escrows may lack creator_id
+    paid = {e.get('creator_id') for e in await db.escrow.find(
+        {"campaign_id": campaign['id'], "status": "released"}, {"_id": 0, "creator_id": 1}).to_list(None)}
+    if all(cid in paid for cid in hired if cid):
+        return CampaignStatus.COMPLETED
+    pending = await db.work_submissions.count_documents(
+        {"campaign_id": campaign['id'], "status": WorkStatus.SUBMITTED})
+    return "work_submitted" if pending else CampaignStatus.IN_PROGRESS
 
 
 async def deliverables_progress(campaign: dict, creator_id: str) -> dict:
@@ -9437,7 +9508,13 @@ async def release_scheduled_payout(escrow: dict) -> bool:
         brand_fee=float(escrow.get('brand_commission_amount') or brand_commission(gross)),
         creator_fee=commission,
     )
-    await db.campaigns.update_one({"id": campaign['id']}, {"$set": {"status": CampaignStatus.COMPLETED, "payout_status": "released", "updated_at": now}})
+    # Only the LAST hired creator's payout completes the campaign — marking it complete
+    # on the first payout hid every other hired creator's pending work from the brand.
+    status = await campaign_rollup_status(campaign)
+    await db.campaigns.update_one({"id": campaign['id']}, {"$set": {
+        "status": status, "updated_at": now,
+        **({"payout_status": "released"} if status == CampaignStatus.COMPLETED else {}),
+    }})
     await insert_deal_activity(campaign, "system", "UGCAD.IO", "payment_released", f"Payout of ₹{int(net)} released to the creator.", creator_id=creator_id)
     if creator_id:
         await notify_user(creator_id, "Payment released", f"₹{int(net)} has been released to your wallet.", link="/withdrawal", ntype="success", email=True, category="payments")
@@ -10215,6 +10292,8 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
 async def submit_revision_response(deal_id: str, data: DealRevisionResponseSubmit, current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
         raise HTTPException(status_code=403, detail="Only creators can respond to revisions")
+    if data.response == "flagged":  # the app's "Flag scope creep" button sends this
+        data.response = "scope_creep"
     if data.response not in ["accepted", "scope_creep", "partial_dispute"]:
         raise HTTPException(status_code=400, detail="Invalid revision response")
     context = await get_deal_context(deal_id, current_user)

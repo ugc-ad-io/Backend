@@ -16,6 +16,8 @@ const DRAFT_ID_KEY = 'ugcad-brand-brief-draft-id-v2';
 const COMMISSION_RATE = 0.20;
 const LISTING_FEE = 500;
 const LISTING_FEE_MULTI = 1500;
+const LISTING_FEE_LARGE = 3000;   // 11+ creators (server.py LARGE_CAMPAIGN_MIN_CREATORS)
+const MAX_CREATORS = 20;          // same cap as the app's stepper
 
 const STEPS = [
   'Campaign Basics',
@@ -111,6 +113,7 @@ const initialForm = {
   finalDeliveryBy: '',
   budgetMode: 'fixed',
   fixedBudget: '',
+  creatorsWanted: 1,
   budgetMin: '',
   budgetMax: '',
   creatorLevel: '',
@@ -215,8 +218,11 @@ export default function PostABrief() {
   const budget = Number(form.budgetMode === 'fixed' ? form.fixedBudget : form.budgetMax) || 0;
   const totalQuantity = form.deliverables.reduce((sum, item) => sum + (Number(item.quantity) || 1), 0) || 1;
   const anyEdited = form.deliverables.some(item => item.editedRequired);
-  const budgetTotal = budget * totalQuantity;
-  const listingFee = totalQuantity > 1 ? LISTING_FEE_MULTI : LISTING_FEE;
+  const creatorsCount = Math.min(MAX_CREATORS, Math.max(1, Number(form.creatorsWanted) || 1));
+  const totalVideos = totalQuantity * creatorsCount;
+  const budgetTotal = budget * totalVideos;
+  const listingFee = creatorsCount >= 11 ? LISTING_FEE_LARGE
+    : (creatorsCount > 1 || totalQuantity > 1) ? LISTING_FEE_MULTI : LISTING_FEE;
   const commission = Math.round(budgetTotal * COMMISSION_RATE);
   const totalDebit = budgetTotal + commission + listingFee;
   const paidAdsSelected = form.platforms.some(platform => platform.toLowerCase().includes('paid ads'));
@@ -343,7 +349,7 @@ export default function PostABrief() {
       `Creator targeting: level ${form.creatorLevel}; quality ${form.qualityTier}; gender ${form.genderPreference}; city ${form.cityFilter}; niches ${form.nicheTags.join(', ') || 'none'}`,
       `Timeline: ship by ${form.productShippingBy}; draft by ${form.draftDeliveryBy}; revisions ${form.revisions}; final by ${form.finalDeliveryBy}`,
       `Budget: ${form.budgetMode === 'fixed' ? `fixed Rs. ${form.fixedBudget}` : `range Rs. ${form.budgetMin} - Rs. ${form.budgetMax}`}`,
-      `Commission: platform 20%, total wallet debit Rs. ${totalDebit} (Rs. ${budget} per video x ${totalQuantity}), creator receives Rs. ${budgetTotal} pre-tax`
+      `Commission: platform 20%, total wallet debit Rs. ${totalDebit} (Rs. ${budget} per video x ${totalVideos} videos, ${creatorsCount} creator(s)), each creator receives Rs. ${budget * totalQuantity} pre-tax`
     ].join('\n');
   };
 
@@ -381,6 +387,9 @@ export default function PostABrief() {
         city_filter: form.cityFilter,
         creator_niche_tags: form.nicheTags,
         per_video_budget: budget,
+        // How many creators this brief hires; the backend reserves budget for each and
+        // keeps the brief open until all are hired. Without it every web brief was 1-creator.
+        creators_wanted: creatorsCount,
         total_budget: budget,
         currency: 'INR',
 
@@ -667,15 +676,20 @@ export default function PostABrief() {
                 </div>
                 <div className="form-group"><label>Budget *</label><div className="brief-segment"><button className={form.budgetMode === 'fixed' ? 'active' : ''} type="button" onClick={() => set('budgetMode', 'fixed')}>Fixed amount</button><button className={form.budgetMode === 'range' ? 'active' : ''} type="button" onClick={() => set('budgetMode', 'range')}>Range</button></div></div>
                 {form.budgetMode === 'fixed' ? <div className="form-group"><label>Fixed budget (Rs.)</label><input className="input-field" type="number" value={form.fixedBudget} onChange={e => set('fixedBudget', e.target.value)} /></div> : <div className="form-row"><div className="form-group"><label>Min budget (Rs.)</label><input className="input-field" type="number" value={form.budgetMin} onChange={e => set('budgetMin', e.target.value)} /></div><div className="form-group"><label>Max budget (Rs.)</label><input className="input-field" type="number" value={form.budgetMax} onChange={e => set('budgetMax', e.target.value)} /></div></div>}
+                <div className="form-group">
+                  <label>Number of creators *</label>
+                  <input className="input-field" type="number" min="1" max={MAX_CREATORS} value={form.creatorsWanted} onChange={e => set('creatorsWanted', e.target.value)} onBlur={() => set('creatorsWanted', creatorsCount)} />
+                  <small>How many creators you want to hire for this brief. Each creator delivers every deliverable above. Max {MAX_CREATORS}.</small>
+                </div>
                 <div className="brief-note"><Info size={18} /> Rush delivery is not available in V0.5.</div>
                 <div className="commission-card">
                   <p>Budget per video <strong>Rs. {budget.toLocaleString('en-IN')}</strong></p>
-                  {totalQuantity > 1 && <p>Total videos <strong>{totalQuantity}</strong></p>}
+                  {totalVideos > 1 && <p>Total videos ({totalQuantity} x {creatorsCount} creator{creatorsCount === 1 ? '' : 's'}) <strong>{totalVideos}</strong></p>}
                   <p>Total budget <strong>Rs. {budgetTotal.toLocaleString('en-IN')}</strong></p>
                   <p>Platform commission (20%) <strong>Rs. {commission.toLocaleString('en-IN')}</strong></p>
                   <p>Listing fee (one-time) <strong>Rs. {listingFee.toLocaleString('en-IN')}</strong></p>
                   <p>Total wallet debit <strong>Rs. {totalDebit.toLocaleString('en-IN')}</strong></p>
-                  <p>Creator receives on approval <strong>Rs. {budgetTotal.toLocaleString('en-IN')}</strong></p>
+                  <p>Each creator receives on approval <strong>Rs. {(budget * totalQuantity).toLocaleString('en-IN')}</strong></p>
                   <small>Creator amount is pre-tax. TDS may apply.</small>
                 </div>
               </>
@@ -690,7 +704,7 @@ export default function PostABrief() {
                 <Summary title="Style Guidance" rows={[['Tone', form.tones.join(', ')], ['Pacing', form.pacing], ['Mood board images', form.moodImages.join(', ') || 'None'], ['Reference videos', referenceVideos], ['Music preference', form.musicPreference], ['Note', 'Guidance only; not grounds for dispute.']]} />
                 <Summary title="Usage Rights" rows={[['Platforms', form.platforms.join(', ')], ['Rights duration', form.rightsDuration], ['Exclusivity', form.exclusivity], ['Whitelisting', form.whitelisting ? 'Yes' : 'No'], ['Modification', form.modificationRights]]} />
                 <Summary title="Creator Targeting" rows={[['Minimum level', form.creatorLevel], ['Quality tier', form.qualityTier], ['Gender preference', form.genderPreference], ['City filter', form.cityFilter], ['Niche tags', form.nicheTags.join(', ') || 'None']]} />
-                <Summary title="Timeline & Budget" rows={[['Ship by', form.productShippingBy], ['Draft by', form.draftDeliveryBy], ['Revisions included', form.revisions], ...(anyEdited ? [['Final by', form.finalDeliveryBy]] : []), ['Budget per video', form.budgetMode === 'fixed' ? `Rs. ${budget.toLocaleString('en-IN')}` : `Rs. ${Number(form.budgetMin || 0).toLocaleString('en-IN')} - Rs. ${budget.toLocaleString('en-IN')}`], ...(totalQuantity > 1 ? [['Total videos', String(totalQuantity)], ['Total budget', `Rs. ${budgetTotal.toLocaleString('en-IN')}`]] : []), ['Platform commission (20%)', `Rs. ${commission.toLocaleString('en-IN')}`], ['Listing fee', `Rs. ${listingFee.toLocaleString('en-IN')}`], ['Total wallet debit', `Rs. ${totalDebit.toLocaleString('en-IN')}`]]} />
+                <Summary title="Timeline & Budget" rows={[['Ship by', form.productShippingBy], ['Draft by', form.draftDeliveryBy], ['Revisions included', form.revisions], ...(anyEdited ? [['Final by', form.finalDeliveryBy]] : []), ['Budget per video', form.budgetMode === 'fixed' ? `Rs. ${budget.toLocaleString('en-IN')}` : `Rs. ${Number(form.budgetMin || 0).toLocaleString('en-IN')} - Rs. ${budget.toLocaleString('en-IN')}`], ...(creatorsCount > 1 ? [['Creators', String(creatorsCount)]] : []), ...(totalVideos > 1 ? [['Total videos', String(totalVideos)], ['Total budget', `Rs. ${budgetTotal.toLocaleString('en-IN')}`]] : []), ['Platform commission (20%)', `Rs. ${commission.toLocaleString('en-IN')}`], ['Listing fee', `Rs. ${listingFee.toLocaleString('en-IN')}`], ['Total wallet debit', `Rs. ${totalDebit.toLocaleString('en-IN')}`]]} />
               </div>
             )}
           </div>
@@ -725,7 +739,8 @@ export default function PostABrief() {
             <h3>Cost Preview</h3>
             <div className="summary-items">
               <div className="summary-item"><span>Budget per video</span><strong>Rs. {budget.toLocaleString('en-IN')}</strong></div>
-              {totalQuantity > 1 && <div className="summary-item"><span>Total videos</span><strong>{totalQuantity}</strong></div>}
+              {creatorsCount > 1 && <div className="summary-item"><span>Creators</span><strong>{creatorsCount}</strong></div>}
+              {totalVideos > 1 && <div className="summary-item"><span>Total videos</span><strong>{totalVideos}</strong></div>}
               <div className="summary-item"><span>Total budget</span><strong>Rs. {budgetTotal.toLocaleString('en-IN')}</strong></div>
               <div className="summary-item"><span>Commission (20%)</span><strong>Rs. {commission.toLocaleString('en-IN')}</strong></div>
               <div className="summary-item"><span>Listing fee</span><strong>Rs. {listingFee.toLocaleString('en-IN')}</strong></div>
@@ -741,7 +756,7 @@ export default function PostABrief() {
             <h3>Confirm publishing</h3>
             <p>
               This will debit Rs. {totalDebit.toLocaleString('en-IN')} from your wallet:
-              Rs. {budget.toLocaleString('en-IN')} per video{totalQuantity > 1 ? ` x ${totalQuantity} videos = Rs. ${budgetTotal.toLocaleString('en-IN')}` : ''}
+              Rs. {budget.toLocaleString('en-IN')} per video{totalVideos > 1 ? ` x ${totalVideos} videos = Rs. ${budgetTotal.toLocaleString('en-IN')}` : ''}
               {' '}+ Rs. {commission.toLocaleString('en-IN')} platform commission + Rs. {listingFee.toLocaleString('en-IN')} listing fee.
               It cannot be modified after a creator accepts. Continue?
             </p>

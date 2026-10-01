@@ -38,6 +38,7 @@ import {
   Zap
 } from 'lucide-react';
 import './CreatorDashboard.css';
+import { isHiredOn } from '../lib/utils';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -212,10 +213,12 @@ export default function CreatorDashboard() {
       const completedCampaigns = worksRes.data || [];
 
       setActiveCampaigns(allCampaigns.filter((campaign) =>
-        campaign.selected_creator === user.id &&
-        (campaign.status === 'in_progress' || campaign.status === 'active')
+        isHiredOn(campaign, user.id) &&
+        (campaign.status === 'in_progress' || campaign.status === 'active' || campaign.status === 'work_submitted')
       ));
-      setAvailableCampaigns(allCampaigns.filter((campaign) => campaign.status === 'active' && !campaign.selected_creator));
+      // A multi-creator brief stays 'active' while it still has open slots, so a first
+      // hire mustn't hide it — only hide briefs this creator is already hired on.
+      setAvailableCampaigns(allCampaigns.filter((campaign) => campaign.status === 'active' && !isHiredOn(campaign, user?.id)));
       setMyBids(
         allCampaigns
           .filter((campaign) => campaign.bids?.some((bid) => bid.creator_id === user.id))

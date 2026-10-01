@@ -22,6 +22,7 @@ import {
 import { getInitial, CampaignGrid } from '../components/CreatorComponents';
 import DashboardLayout from '../components/DashboardLayout';
 import './CreatorDashboard.css';
+import { isHiredOn } from '../lib/utils';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -125,7 +126,7 @@ export default function MyActiveWorkPage() {
       ]);
       const allCampaigns = campaignRes.data;
       setActiveCampaigns(allCampaigns.filter((campaign) =>
-        campaign.selected_creator === user.id &&
+        isHiredOn(campaign, user.id) &&
         (campaign.status === 'in_progress' || campaign.status === 'active' || campaign.status === 'work_submitted')
       ));
       setDealsByCampaign((dealsRes.data || []).reduce((result, deal) => {

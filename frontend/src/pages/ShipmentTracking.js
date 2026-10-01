@@ -4,6 +4,7 @@ import { useAuth } from '../App';
 import axios from 'axios';
 import { toast } from 'sonner';
 import { ArrowLeft, Package, Truck, Upload, AlertTriangle } from 'lucide-react';
+import { isHiredOn } from '../lib/utils';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -116,7 +117,7 @@ export default function ShipmentTracking() {
   if (!campaign) return <div className="error-page">Campaign not found</div>;
 
   const isBusiness = user?.role === 'business' && campaign.business_id === user.id;
-  const isCreator = user?.role === 'creator' && campaign.selected_creator === user.id;
+  const isCreator = user?.role === 'creator' && isHiredOn(campaign, user.id);
 
   return (
     <div className="shipment-page">

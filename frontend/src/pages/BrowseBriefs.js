@@ -27,6 +27,7 @@ import {
 import DashboardLayout from '../components/DashboardLayout';
 import './CreatorDashboard.css';
 import './BrowseBriefs.css';
+import { isHiredOn } from '../lib/utils';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -137,7 +138,9 @@ export default function BrowseBriefs() {
     try {
       const res = await axios.get(`${API}/campaigns?t=${Date.now()}`);
       const allCampaigns = res.data;
-      setAvailableCampaigns(allCampaigns.filter((c) => c.status === 'active' && !c.selected_creator));
+      // A multi-creator brief stays 'active' while it still has open slots, so a first
+      // hire mustn't hide it — only hide briefs this creator is already hired on.
+      setAvailableCampaigns(allCampaigns.filter((c) => c.status === 'active' && !isHiredOn(c, user?.id)));
       setMyBids(
         allCampaigns.filter((c) => c.bids?.some((b) => b.creator_id === user?.id))
       );

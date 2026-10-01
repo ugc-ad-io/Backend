@@ -20,6 +20,7 @@ import {
 import { EmptyPanel, formatMoney, getCampaignBudget } from '../components/CreatorComponents';
 import DashboardLayout from '../components/DashboardLayout';
 import './CreatorDashboard.css';
+import { hasOpenCreatorSlots } from '../lib/utils';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -34,7 +35,8 @@ const getBidStatus = (item) => (
 
 const isVisiblePendingBid = (item) => {
   const campaign = item?.campaign || {};
-  const isCampaignAssigned = Boolean(campaign.selected_creator || item?.selected_creator);
+  // A multi-creator brief with open slots is still hiring — keep the bid visible as pending.
+  const isCampaignAssigned = Boolean(campaign.selected_creator || item?.selected_creator) && !hasOpenCreatorSlots(campaign);
   return !isCampaignAssigned && VISIBLE_BID_STATUSES.has(getBidStatus(item));
 };
 
