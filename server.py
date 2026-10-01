@@ -2943,6 +2943,7 @@ def normalize_content_submission(campaign: dict, content_versions: List[dict], w
     for version in content_versions:
         versions.append({
             "version": version.get('version'),
+            "stage": version.get('stage'),  # 'raw' / 'edited' in the raw → edited flow
             "video_url": version.get('video_url'),
             "caption_url": version.get('caption_url'),
             "thumbnail_url": version.get('thumbnail_url'),
@@ -3039,6 +3040,12 @@ def compute_deal_state(campaign: dict, shipment: Optional[dict], receipt: dict, 
     elif disputed:
         state, party, action = "Disputed", "admin", "Await admin resolution"
         started = now_iso()
+    elif work_status == WorkStatus.AWAITING_EDIT:
+        state, party, action = "Raw Approved — UGC.ad Editing", "admin", "UGC.ad is editing the video"
+        started = (work or {}).get('submitted_at')
+    elif work_status == WorkStatus.APPROVED and (work or {}).get('stage') == 'raw' and edit_mode(campaign) == 'creator':
+        state, party, action = "Raw Approved — Edited Video Due", "creator", "Submit edited video"
+        started = (work or {}).get('approved_at')
     elif escrow_status == "released" and (work_status == WorkStatus.APPROVED or (single_creator and campaign.get('status') == CampaignStatus.COMPLETED)):
         state, party, action = "Paid — Complete", "system", "Deal complete"
         started = (escrow or {}).get('released_at') or (work or {}).get('approved_at')
@@ -3174,7 +3181,9 @@ async def settle_deal_lazily(campaign: dict) -> None:
         if submitted and (now - submitted).days >= int(platform_setting("auto_approval_days", AUTO_APPROVE_DAYS)):
             cards = await db.deal_action_cards.find({"campaign_id": cid}, {"_id": 0}).to_list(100)
             disputed = any(c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open' for c in cards)
-            if not disputed:
+            if not disputed and (work.get('stage') or work.get('needs_ugc_edit')):
+                await auto_approve_staged(work, campaign)
+            elif not disputed:
                 await db.work_submissions.update_one({"id": work['id']}, {"$set": {"status": WorkStatus.APPROVED, "approved_at": now_iso(), "auto_approved": True}})
                 await release_payout_now(campaign, work, source="auto_approval")
                 await notify_user(work['creator_id'], "Your content was auto-approved", "The brand didn't review in time, so your content was auto-approved and you've been paid.", link="/my-deals")
@@ -3236,7 +3245,7 @@ async def get_deal_context(deal_id: str, current_user: dict) -> dict:
     content_versions = await db.deal_content_submissions.find(
         {"campaign_id": campaign['id'], "creator_id": creator['id']},
         {"_id": 0}
-    ).sort("version", 1).to_list(100)
+    ).sort([("submitted_at", 1), ("version", 1)]).to_list(100)  # raw and edited each count from v1
     revision_response = await db.deal_revision_responses.find_one(
         {"campaign_id": campaign['id'], "creator_id": creator['id']},
         {"_id": 0},
@@ -3278,6 +3287,9 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
     # approved; before that, versions are stripped to watermark-protected
     # previews (PRD Section 8). Creators and admins always see their own assets.
     work_approved = (context['work'] or {}).get('status') == WorkStatus.APPROVED or campaign.get('status') == CampaignStatus.COMPLETED
+    # Creator-edits flow: an approved RAW isn't paid for yet — keep it watermarked.
+    if state['current_state'] == "Raw Approved — Edited Video Due":
+        work_approved = False
     if viewer.get('id') == brand.get('id') and viewer.get('role') == UserRole.BUSINESS:
         content_submission["versions"] = [
             cf.to_brand_facing_asset(version, approved=work_approved)
@@ -3376,8 +3388,17 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
     can_mark_received = _has_shipment_record and normalized_shipment.get('courier_status') in ['delivered', 'shipped', 'in_transit'] and not normalized_receipt.get('received_at')
     can_submit_content = viewer.get('role') == UserRole.CREATOR and creator['id'] == viewer['id'] and state['active_party'] == 'creator' and state['current_state'] in [
         "Received — Content in Progress",
-        "Revision Requested"
+        "Revision Requested",
+        "Raw Approved — Edited Video Due",
     ]
+    # Raw → edited flow: which file the creator uploads next and when each is due.
+    mode = edit_mode(campaign)
+    edit_flow = {
+        "mode": mode,
+        "stage": await edit_stage(campaign, creator['id']),
+        "raw_due": campaign.get('draft_delivery_by'),
+        "edited_due": campaign.get('final_delivery_by') if mode == 'creator' else None,
+    } if mode else None
 
     return {
         "deal_id": person_deal_id(campaign, creator['id']),
@@ -3412,6 +3433,7 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
         "action_cards": context['action_cards'],
         "unread_count": unread_count,
         "can_submit_content": can_submit_content,
+        "edit_flow": edit_flow,
         "can_mark_received": can_mark_received,
         "can_raise_dispute": viewer.get('role') in [UserRole.CREATOR, UserRole.BUSINESS],
         "can_report_damage": viewer.get('role') == UserRole.CREATOR and bool(campaign.get('requires_shipment')) and not normalized_receipt.get('items_damaged')
@@ -8985,15 +9007,20 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
     uploads_dir = str(Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))))
     primary_file = data.work_files[0] if data.work_files else None
 
-    # "Edited by UGC.ad" deliverables: the creator hands over RAW footage and
-    # the platform's editing team cuts it BEFORE the brand ever reviews. Such
-    # submissions park in the admin editing queue (AWAITING_EDIT) — the brand
-    # can't approve/reject them and the 5-day auto-approval clock doesn't run
-    # until the edited cut is attached and the status flips to SUBMITTED.
-    needs_ugc_edit = any(
-        d.get('edited_required') and d.get('edited_by') == 'ugc'
-        for d in (campaign.get('deliverable_items') or [])
-    )
+    # Raw → edited flow (brief needs an edited file): the RAW video is submitted and
+    # approved first; then the creator submits the edited cut (creator edits), or
+    # UGC.ad's editors cut it (UGC edits — the creator's part ends at the raw).
+    await ensure_not_delivered(data.campaign_id, current_user['id'], 0)
+    stage = await edit_stage(campaign, current_user['id'], 0)
+    if stage == 'ugc_editing':
+        raise HTTPException(status_code=400, detail="Your raw video is approved — UGC.ad's team is editing it. There's nothing more to submit.")
+    files = [f for f in (data.work_files or []) if f]
+    if stage == 'raw':
+        raw_files, edited_files = (data.raw_files or files), []
+    elif stage == 'edited':
+        raw_files, edited_files = await approved_raw_files(data.campaign_id, current_user['id'], 0), (data.edited_files or files)
+    else:
+        raw_files, edited_files = data.raw_files, data.edited_files
 
     submitted_at = datetime.now(timezone.utc).isoformat()
     watermark = cf.build_watermark_record(primary_file, "video", uploads_dir)
@@ -9002,17 +9029,16 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         "campaign_id": data.campaign_id,
         "creator_id": current_user['id'],
         "deliverable_index": 0,
+        "stage": stage,
         "work_files": data.work_files,
-        "edited_files": data.edited_files,
-        "raw_files": data.raw_files,
+        "edited_files": edited_files,
+        "raw_files": raw_files,
         "description": data.description,
-        "status": WorkStatus.AWAITING_EDIT if needs_ugc_edit else WorkStatus.SUBMITTED,
-        "needs_ugc_edit": needs_ugc_edit,
+        "status": WorkStatus.SUBMITTED,
         "submitted_at": submitted_at,
         "watermark": watermark,
         "revisions": []
     }
-
     await db.work_submissions.insert_one(work_doc)
 
     # Same per-version record /deals/{id}/content writes. approve_work's payout gate
@@ -9020,16 +9046,17 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
     # deal_content_submissions — without this row, work submitted from the app could
     # be approved but the creator was never paid.
     version = await db.deal_content_submissions.count_documents(
-        {"campaign_id": data.campaign_id, "creator_id": current_user['id'], "deliverable_index": 0}) + 1
+        {"campaign_id": data.campaign_id, "creator_id": current_user['id'], "deliverable_index": 0, "stage": stage}) + 1
     await db.deal_content_submissions.insert_one({
         "id": str(uuid.uuid4()),
         "deal_id": person_deal_id(campaign, current_user['id']),
         "campaign_id": data.campaign_id,
         "creator_id": current_user['id'],
         "deliverable_index": 0,
+        "stage": stage,
         "version": version,
-        "video_url": (data.edited_files or data.work_files or [None])[0],
-        "raw_footage_url": (data.raw_files or [None])[0],
+        "video_url": (edited_files or files or [None])[0],
+        "raw_footage_url": (raw_files or [None])[0],
         "original_url": primary_file,
         "watermark": watermark,
         "creator_note": data.description,
@@ -9046,8 +9073,9 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
                 "id": work_doc["id"],
                 "creator_id": current_user['id'],
                 "work_files": data.work_files,
-                "edited_files": data.edited_files,
-                "raw_files": data.raw_files,
+                "edited_files": edited_files,
+                "raw_files": raw_files,
+                "stage": stage,
                 "video_url": primary_file,
                 "creator_note": data.description,
                 "submitted_at": work_doc["submitted_at"],
@@ -9055,47 +9083,37 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
             },
         }}
     )
+    await announce_submission(campaign, current_user, stage)
+    return {"message": "Work submitted successfully", "stage": stage}
 
-    if needs_ugc_edit:
-        await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", "Raw footage was submitted — with UGC.ad's editing team.", creator_id=current_user['id'])
-        await insert_deal_system_message(campaign, "Raw footage was submitted. UGC.ad's editing team is cutting the final version before brand review.", creator_id=current_user['id'])
-        await notify_admins(
-            "Editing queue: new raw footage",
-            f"{first_name_of(current_user, fallback='A creator')} submitted raw footage for '{campaign.get('title', 'a campaign')}' — it needs a UGC.ad edit before the brand can review.",
-            link="/dashboard/admin/editing",
+
+async def announce_submission(campaign: dict, creator: dict, stage: Optional[str]):
+    """Timeline + brand notification for a new submission (shared by app and website)."""
+    what = {"raw": "Raw video", "edited": "Edited video"}.get(stage, "Content")
+    after = {"raw": "Approve the raw so the edit can start.", "edited": "Review it to release payment."}.get(stage, "Review it to release payment.")
+    await insert_deal_activity(campaign, "creator", creator.get('nickname', 'Creator'), "content_submitted", f"{what} was submitted for brand review.", creator_id=creator['id'])
+    await insert_deal_system_message(campaign, f"{what} was submitted and is awaiting brand review.", creator_id=creator['id'])
+    if campaign.get("business_id"):
+        await notify_user(
+            campaign["business_id"],
+            f"{what} submitted for review",
+            f"{first_name_of(creator, fallback='The creator')} submitted {what.lower()} for '{campaign.get('title', 'your campaign')}'. {after}",
+            link="/dashboard/business/work-review",
+            ntype="info",
+            email=True,  # payment / the next stage waits on their review
         )
-        if campaign.get("business_id"):
-            await notify_user(
-                campaign["business_id"],
-                "Content submitted — editing in progress",
-                f"{first_name_of(current_user, fallback='The creator')} submitted footage for '{campaign.get('title', 'your campaign')}'. UGC.ad's editors are cutting your version — you'll be asked to review once it's ready.",
-                link="/dashboard/business/work-review",
-                ntype="info",
-            )
-    else:
-        await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", "Content was submitted for brand review.", creator_id=current_user['id'])
-        await insert_deal_system_message(campaign, "Content was submitted and is awaiting brand review.", creator_id=current_user['id'])
 
-        # Notify the brand that content is ready for review.
-        if campaign.get("business_id"):
-            await notify_user(
-                campaign["business_id"],
-                "Content submitted for review",
-                f"{first_name_of(current_user, fallback='The creator')} submitted content for '{campaign.get('title', 'your campaign')}'. Review it to release payment.",
-                link="/dashboard/business/work-review",
-                ntype="info",
-            )
-
-    return {"message": "Work submitted successfully"}
-
-def deal_deadline_iso(campaign: dict) -> Optional[str]:
+def deal_deadline_iso(campaign: dict, stage: Optional[str] = None) -> Optional[str]:
+    # Raw-stage work is due on the raw date; everything else on the final date.
+    if stage == 'raw' and campaign.get('draft_delivery_by'):
+        return campaign['draft_delivery_by']
     return campaign.get('final_delivery_by') or campaign.get('due_date') or campaign.get('deadline')
 
 
 async def assess_late_delivery(creator_id: str, campaign: dict, work: dict) -> dict:
     """PRD 8.8: compare submission time to the brief deadline, record the offense
     (rolling 6-month window) and return the penalty for this deal's payout."""
-    deadline = parse_iso(deal_deadline_iso(campaign))
+    deadline = parse_iso(deal_deadline_iso(campaign, work.get('stage')))
     submitted = parse_iso(work.get('submitted_at') or work.get('created_at'))
     result = {"is_late": False, "severity": "on_time", "penalty_pct": 0, "offense_number": 0}
     if not deadline or not submitted or submitted <= deadline:
@@ -9254,8 +9272,9 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
     # Scoped by creator_id too: on a multi-creator brief every hired creator has their
     # own deliverable_index starting at 0, so without this filter approving Creator A's
     # work could stamp Creator B's same-index submission as approved instead.
+    stage = work.get('stage')
     approved_version = await db.deal_content_submissions.find_one(
-        {"campaign_id": work['campaign_id'], "creator_id": work['creator_id'],
+        {"campaign_id": work['campaign_id'], "creator_id": work['creator_id'], "stage": stage,
          "$or": [{"deliverable_index": work_idx},
                  # legacy rows predate the field; only index 0 may claim them
                  *([{"deliverable_index": {"$exists": False}}] if work_idx == 0 else [])]},
@@ -9268,17 +9287,72 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
         )
         # Anything older for THIS asset that never got a verdict is superseded.
         await db.deal_content_submissions.update_many(
-            {"campaign_id": work['campaign_id'], "creator_id": work['creator_id'],
+            {"campaign_id": work['campaign_id'], "creator_id": work['creator_id'], "stage": stage,
              "deliverable_index": approved_version.get('deliverable_index') or 0,
              "version": {"$lt": approved_version.get('version', 1)},
              "status": {"$nin": ["approved", "revision_requested"]}},
             {"$set": {"status": "superseded"}}
         )
 
+    brand_name = current_user.get('nickname', 'Brand')
+    mode = edit_mode(campaign)
+    if stage == 'raw' and mode == 'creator':
+        # Raw approved → the creator now edits it. No payout until the edited cut is approved.
+        await set_campaign_rollup(campaign, now)
+        await db.campaigns.update_one({"id": campaign['id'], "work_submission.id": work_id},
+                                      {"$set": {"work_submission.status": "awaiting_edited"}})
+        due = campaign.get('final_delivery_by')
+        await insert_deal_activity(campaign, "brand", brand_name, "content_approved",
+                                   "Raw video approved. The creator is editing it next.", creator_id=work['creator_id'])
+        await insert_deal_system_message(campaign, "Raw video approved — the creator can now submit the edited video.", creator_id=work['creator_id'])
+        await notify_user(
+            work['creator_id'], "Raw video approved — submit the edited video",
+            f"Your raw video for '{campaign.get('title', 'the campaign')}' was approved. Edit it and submit the edited video"
+            + (f" by {due[:10]}." if due else "."),
+            link="/my-deals", ntype="success", email=True, category="deal_updates",
+        )
+        return {"message": "Raw video approved. The creator will submit the edited video next.", "payout_status": "awaiting_edited"}
+
+    if stage == 'raw' and mode == 'ugc':
+        # Raw approved → creator is paid now; UGC.ad's editors cut the final video.
+        raw_progress = await deliverables_progress(campaign, work['creator_id'], stage='raw')
+        if raw_progress["complete"]:
+            # Insert the editing job BEFORE paying, so the payout's campaign roll-up sees
+            # it and keeps the campaign in progress instead of completing it.
+            await db.work_submissions.insert_one({
+                "id": str(uuid.uuid4()), "campaign_id": work['campaign_id'], "creator_id": work['creator_id'],
+                "deliverable_index": work_idx, "stage": "edited", "needs_ugc_edit": True,
+                "raw_files": work.get('raw_files') or work.get('work_files') or [],
+                "work_files": [], "edited_files": [],
+                "description": "Edited by UGC.ad", "status": WorkStatus.AWAITING_EDIT,
+                "submitted_at": now, "revisions": [],
+            })
+            await db.campaigns.update_one({"id": campaign['id'], "work_submission.id": work_id},
+                                          {"$set": {"work_submission.status": "awaiting_edit"}})
+            await notify_admins(
+                "Editing queue: raw video approved",
+                f"The brand approved the raw video for '{campaign.get('title', 'a campaign')}' — it's ready for UGC.ad's edit.",
+                link="/dashboard/admin/editing",
+            )
+            await notify_user(
+                campaign['business_id'], "UGC.ad is editing your video",
+                f"You approved the raw video for '{campaign.get('title', 'your campaign')}'. UGC.ad's editors are cutting the final version — you'll be asked to review it.",
+                link="/dashboard/business/work-review", ntype="info",
+            )
+        # Fall through to the normal payout gate, counting raw approvals.
+
+    if work.get('needs_ugc_edit'):
+        # UGC.ad's edit approved — the creator was already paid when the raw was approved.
+        await set_campaign_rollup(campaign, now)
+        await insert_deal_activity(campaign, "brand", brand_name, "content_approved",
+                                   "Edited video (by UGC.ad) approved.", creator_id=work['creator_id'])
+        await insert_deal_system_message(campaign, "The edited video was approved.", creator_id=work['creator_id'])
+        return {"message": "Edited video approved.", "payout_status": "released"}
+
     # PAYOUT GATE: only fund once EVERY required asset has an approved submission FROM
     # THIS CREATOR. Previously this counted approvals campaign-wide, so on a multi-creator
     # brief ONE creator's approval satisfied the gate for every hired creator at once.
-    progress = await deliverables_progress(campaign, work['creator_id'])
+    progress = await deliverables_progress(campaign, work['creator_id'], stage='raw' if stage == 'raw' else None)
     if not progress["complete"]:
         # Another hired creator may still have work awaiting review — don't hide it.
         pending = await db.work_submissions.count_documents(
@@ -9397,18 +9471,80 @@ async def campaign_rollup_status(campaign: dict) -> str:
     completed once ALL of them are paid, work_submitted while any submission awaits
     review (the brand's Work Review keys off this), otherwise in_progress."""
     hired = selected_creator_ids(campaign) or [campaign.get('selected_creator')]
-    if len(hired) <= 1:
-        return CampaignStatus.COMPLETED  # only called after a payout; legacy escrows may lack creator_id
+    # The creator can be paid while UGC.ad's editors still have the cut (UGC-edits
+    # flow) — the brief isn't finished until that edited video is delivered.
+    if await db.work_submissions.count_documents(
+            {"campaign_id": campaign['id'], "status": WorkStatus.AWAITING_EDIT}):
+        return CampaignStatus.IN_PROGRESS
     paid = {e.get('creator_id') for e in await db.escrow.find(
         {"campaign_id": campaign['id'], "status": "released"}, {"_id": 0, "creator_id": 1}).to_list(None)}
-    if all(cid in paid for cid in hired if cid):
+    if len(hired) <= 1 and paid:
+        return CampaignStatus.COMPLETED  # legacy escrows may lack creator_id
+    if len(hired) > 1 and all(cid in paid for cid in hired if cid):
         return CampaignStatus.COMPLETED
     pending = await db.work_submissions.count_documents(
         {"campaign_id": campaign['id'], "status": WorkStatus.SUBMITTED})
     return "work_submitted" if pending else CampaignStatus.IN_PROGRESS
 
 
-async def deliverables_progress(campaign: dict, creator_id: str) -> dict:
+async def set_campaign_rollup(campaign: dict, now: str):
+    status = await campaign_rollup_status(campaign)
+    await db.campaigns.update_one({"id": campaign['id']}, {"$set": {
+        "status": status, "updated_at": now,
+        **({"payout_status": "released"} if status == CampaignStatus.COMPLETED else {}),
+    }})
+
+
+def edit_mode(campaign: dict) -> Optional[str]:
+    """Who cuts the edited video on this brief: 'creator', 'ugc' (UGC.ad's editors),
+    or None when no edited file is required (one plain submission)."""
+    items = campaign.get('deliverable_items') or []
+    get = lambda d, k: d.get(k) if isinstance(d, dict) else getattr(d, k, None)
+    if any(get(d, 'edited_required') and (get(d, 'edited_by') or 'creator') == 'creator' for d in items):
+        return 'creator'
+    if any(get(d, 'edited_required') and get(d, 'edited_by') == 'ugc' for d in items):
+        return 'ugc'
+    return None
+
+
+async def edit_stage(campaign: dict, creator_id: str, deliverable_index: int = 0) -> Optional[str]:
+    """Where this creator's deliverable is in the raw → edited flow:
+    'raw'         — raw video still to be submitted/approved (step 1, raw due date);
+    'edited'      — raw approved, the creator now submits the edited cut (step 2);
+    'ugc_editing' — raw approved, UGC.ad's editors cut it (creator's part is done);
+    None          — no edited file on this brief: a single ordinary submission."""
+    mode = edit_mode(campaign)
+    if not mode:
+        return None
+    raw_ok = await db.work_submissions.find_one({
+        "campaign_id": campaign['id'], "creator_id": creator_id,
+        "deliverable_index": deliverable_index, "stage": "raw", "status": WorkStatus.APPROVED,
+    }, {"_id": 0, "id": 1})
+    if not raw_ok:
+        return 'raw'
+    return 'edited' if mode == 'creator' else 'ugc_editing'
+
+
+async def ensure_not_delivered(campaign_id: str, creator_id: str, deliverable_index: int = 0):
+    """No new uploads once this deliverable's final (non-raw) video is approved."""
+    if await db.work_submissions.find_one({
+        "campaign_id": campaign_id, "creator_id": creator_id, "deliverable_index": deliverable_index,
+        "stage": {"$ne": "raw"}, "status": WorkStatus.APPROVED,
+    }, {"_id": 0, "id": 1}):
+        raise HTTPException(status_code=400, detail="This deliverable is already approved — there's nothing more to submit.")
+
+
+async def approved_raw_files(campaign_id: str, creator_id: str, deliverable_index: int = 0) -> List[str]:
+    """The approved raw video(s) for this deliverable — shown to the brand next to the
+    edited cut so they can compare both (approved content is no longer watermark-gated)."""
+    raw = await db.work_submissions.find_one({
+        "campaign_id": campaign_id, "creator_id": creator_id, "deliverable_index": deliverable_index,
+        "stage": "raw", "status": WorkStatus.APPROVED,
+    }, {"_id": 0, "raw_files": 1, "work_files": 1}, sort=[("submitted_at", -1)])
+    return (raw or {}).get("raw_files") or (raw or {}).get("work_files") or []
+
+
+async def deliverables_progress(campaign: dict, creator_id: str, stage: Optional[str] = None) -> dict:
     """How many of a brief's required assets currently have an APPROVED submission
     FROM THIS CREATOR. Every hired creator on a multi-creator brief must independently
     deliver the full required set — this must never be counted campaign-wide, or one
@@ -9420,9 +9556,13 @@ async def deliverables_progress(campaign: dict, creator_id: str) -> dict:
     deal reads as 1-of-1 complete exactly as it did before.
     """
     required = total_deliverable_quantity(campaign)
+    # In a raw → edited flow an approved RAW is only step 1 and must not count toward
+    # the final payout gate; pass stage='raw' to count raw approvals instead (the
+    # UGC-edits flow pays the creator once every raw is approved).
+    query = {"campaign_id": campaign['id'], "creator_id": creator_id, "status": "approved"}
+    query["stage"] = "raw" if stage == "raw" else {"$ne": "raw"}
     rows = await db.deal_content_submissions.find(
-        {"campaign_id": campaign['id'], "creator_id": creator_id, "status": "approved"},
-        {"_id": 0, "deliverable_index": 1},
+        query, {"_id": 0, "deliverable_index": 1},
     ).to_list(length=None)
     approved_idx = set()
     for row in rows:
@@ -9516,11 +9656,7 @@ async def release_scheduled_payout(escrow: dict) -> bool:
     )
     # Only the LAST hired creator's payout completes the campaign — marking it complete
     # on the first payout hid every other hired creator's pending work from the brand.
-    status = await campaign_rollup_status(campaign)
-    await db.campaigns.update_one({"id": campaign['id']}, {"$set": {
-        "status": status, "updated_at": now,
-        **({"payout_status": "released"} if status == CampaignStatus.COMPLETED else {}),
-    }})
+    await set_campaign_rollup(campaign, now)
     await insert_deal_activity(campaign, "system", "UGCAD.IO", "payment_released", f"Payout of ₹{int(net)} released to the creator.", creator_id=creator_id)
     if creator_id:
         await notify_user(creator_id, "Payment released", f"₹{int(net)} has been released to your wallet.", link="/withdrawal", ntype="success", email=True, category="payments")
@@ -9548,6 +9684,13 @@ async def release_due_payouts() -> int:
 AUTO_APPROVE_DAYS = 5  # PRD 8.4
 
 
+async def auto_approve_staged(work: dict, campaign: dict):
+    """Raw/edited-stage work auto-approves through approve_work, so a raw approval
+    starts the edit (and only pays when the flow says so) instead of paying out."""
+    await db.work_submissions.update_one({"id": work['id']}, {"$set": {"auto_approved": True}})
+    await approve_work(work['id'], current_user={"id": campaign['business_id'], "nickname": "Auto-approval"})
+
+
 async def auto_approve_stale_submissions() -> int:
     """PRD 8.4: content auto-approves 5 days after submission if the brand never
     acts, protecting creators from ghosting brands."""
@@ -9564,6 +9707,10 @@ async def auto_approve_stale_submissions() -> int:
         # Don't auto-approve a deal that's under dispute.
         cards = await db.deal_action_cards.find({"campaign_id": campaign['id']}, {"_id": 0}).to_list(100)
         if any(c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open' for c in cards):
+            continue
+        if work.get('stage') or work.get('needs_ugc_edit'):
+            await auto_approve_staged(work, campaign)
+            approved += 1
             continue
         await db.work_submissions.update_one({"id": work['id']}, {"$set": {"status": WorkStatus.APPROVED, "approved_at": now_iso(), "auto_approved": True}})
         await release_payout_now(campaign, work, source="auto_approval")
@@ -9798,6 +9945,25 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
             status_code=400,
             detail="Revision requests can't include phone numbers or email addresses. Please keep all communication on-platform.",
         )
+
+    if work.get('needs_ugc_edit'):
+        # UGC.ad cut this video (creator already paid) — changes go back to the
+        # editing queue, free of charge and without involving the creator.
+        claim = await db.work_submissions.update_one(
+            {"id": work_id, "status": WorkStatus.SUBMITTED},
+            {"$set": {"status": WorkStatus.AWAITING_EDIT},
+             "$push": {"revisions": {"feedback": feedback, "items": items, "requested_at": now_iso()}}})
+        if claim.modified_count == 0:
+            raise HTTPException(status_code=409, detail="This submission is no longer awaiting review. Refresh to see the latest state.")
+        await db.campaigns.update_one({"id": campaign['id'], "work_submission.id": work_id},
+                                      {"$set": {"work_submission.status": "awaiting_edit"}})
+        await set_campaign_rollup(campaign, now_iso())
+        await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "revision_requested",
+                                   "Brand asked UGC.ad's editors for changes to the edited video.", creator_id=work['creator_id'])
+        await notify_admins("Editing queue: brand requested changes",
+                            f"The brand requested changes to the UGC.ad edit for '{campaign.get('title', 'a campaign')}':\n{feedback}",
+                            link="/dashboard/admin/editing")
+        return {"message": "Changes sent to UGC.ad's editing team.", "fee": 0}
 
     # PRD 8.5: hard maximum of 5 revisions per deliverable, then admin must step in.
     # Counted across the whole deal — every resubmission creates a new work doc, so
@@ -10173,6 +10339,18 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
     # PRD 8.3/9.3: must have received the product (if required) and no open dispute.
     await ensure_ready_for_content(campaign, creator_id=current_user['id'])
 
+    deliverable_index = data.deliverable_index if data.deliverable_index is not None else 0
+    # Raw → edited flow: one file per stage (see submit_work).
+    await ensure_not_delivered(campaign['id'], current_user['id'], deliverable_index)
+    stage = await edit_stage(campaign, current_user['id'], deliverable_index)
+    if stage == 'ugc_editing':
+        raise HTTPException(status_code=400, detail="Your raw video is approved — UGC.ad's team is editing it. There's nothing more to submit.")
+    if stage == 'raw':
+        data.raw_footage_url = data.raw_footage_url or data.video_url
+        data.video_url = data.raw_footage_url
+    elif stage == 'edited':
+        data.raw_footage_url = (await approved_raw_files(campaign['id'], current_user['id'], deliverable_index) or [None])[0]
+
     required = get_required_assets(campaign)
     missing = []
     if required['final_video'] and not data.video_url:
@@ -10181,7 +10359,7 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         missing.append('caption_url')
     if required['thumbnail'] and not data.thumbnail_url:
         missing.append('thumbnail_url')
-    if required['raw_footage'] and not data.raw_footage_url:
+    if required['raw_footage'] and not data.raw_footage_url and not stage:
         missing.append('raw_footage_url')
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing required assets: {', '.join(missing)}")
@@ -10189,7 +10367,6 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
     # Which of the brief's required assets this upload is for. Single-asset briefs (and
     # older clients that don't send the field) fall through to 0 and behave as before.
     required_total = total_deliverable_quantity(campaign)
-    deliverable_index = data.deliverable_index if data.deliverable_index is not None else 0
     if not 0 <= deliverable_index < required_total:
         raise HTTPException(
             status_code=400,
@@ -10202,6 +10379,7 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         # Versions are revisions OF ONE ASSET, so they're counted per deliverable —
         # otherwise asset #2 would arrive as "v2" and look like a revision of asset #1.
         "deliverable_index": deliverable_index,
+        "stage": stage,
     })
     version = existing_versions + 1
     uploads_dir = str(Path(os.environ.get("UPLOAD_DIR", str(ROOT_DIR / "uploads"))))
@@ -10211,6 +10389,7 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         "campaign_id": campaign['id'],
         "creator_id": current_user['id'],
         "deliverable_index": deliverable_index,
+        "stage": stage,
         "version": version,
         "video_url": data.video_url,
         "caption_url": data.caption_url,
@@ -10231,17 +10410,6 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         if not moderation.get("safe"):
             raise HTTPException(status_code=400, detail={"message": "Your note to the brand contains contact information, which cannot be shared.", "violations": moderation.get("violations", [])})
     await db.deal_content_submissions.insert_one(submission)
-    # "Edited by UGC.ad" deliverables: the creator hands over RAW footage and the
-    # platform's editing team cuts it before the brand ever reviews — mirrors the
-    # same gate in /work/submit. Without this, a web submission for such a
-    # deliverable went straight to the brand as if it were the finished cut, and
-    # approving the raw footage completed/paid out the deal with no edited file
-    # ever produced.
-    needs_ugc_edit = any(
-        (d.get('edited_required') if isinstance(d, dict) else getattr(d, 'edited_required', False))
-        and (d.get('edited_by') if isinstance(d, dict) else getattr(d, 'edited_by', None)) == 'ugc'
-        for d in (campaign.get('deliverable_items') or [])
-    )
     work_doc = {
         "id": str(uuid.uuid4()),
         "campaign_id": campaign['id'],
@@ -10249,10 +10417,12 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         # Carried through so approve_work() marks the right asset approved rather than
         # whichever submission happens to have the highest version number.
         "deliverable_index": deliverable_index,
-        "work_files": [url for url in [data.video_url, data.caption_url, data.thumbnail_url, data.raw_footage_url] if url],
+        "stage": stage,
+        "work_files": list(dict.fromkeys(url for url in [data.video_url, data.caption_url, data.thumbnail_url, data.raw_footage_url] if url)),
+        "raw_files": [data.raw_footage_url] if data.raw_footage_url else [],
+        "edited_files": [data.video_url] if stage == 'edited' and data.video_url else [],
         "description": data.creator_note or f"Deal content submission v{version}",
-        "status": WorkStatus.AWAITING_EDIT if needs_ugc_edit else WorkStatus.SUBMITTED,
-        "needs_ugc_edit": needs_ugc_edit,
+        "status": WorkStatus.SUBMITTED,
         "submitted_at": submission['submitted_at'],
         "watermark": submission['watermark'],
         "revisions": []
@@ -10267,6 +10437,9 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
             "id": work_doc["id"],
             "creator_id": current_user['id'],
             "work_files": work_doc["work_files"],
+            "raw_files": work_doc["raw_files"],
+            "edited_files": work_doc["edited_files"],
+            "stage": stage,
             "video_url": data.video_url,
             "thumbnail_url": data.thumbnail_url,
             "creator_note": data.creator_note,
@@ -10275,24 +10448,8 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         },
         "updated_at": now_iso(),
     }})
-    await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "content_submitted", f"Content version {version} submitted for review.", creator_id=current_user['id'])
-    await insert_deal_system_message(campaign, f"Content version {version} was submitted and is awaiting brand review.", creator_id=current_user['id'])
-
-    # Notify the brand that content is ready for review. The sibling /work/submit
-    # path did this; this deal-room path (the one the Deal Room actually uses) did
-    # not, so a brand got no bell/email when a creator submitted their final video.
-    # email=True: payment is waiting on their review, so it warrants an email too.
-    if campaign.get("business_id"):
-        await notify_user(
-            campaign["business_id"],
-            "Content submitted for review",
-            f"{first_name_of(current_user, fallback='The creator')} submitted content for '{campaign.get('title', 'your campaign')}'. Review it to release payment.",
-            link="/dashboard/business/work-review",
-            ntype="info",
-            email=True,
-        )
-
-    return {"message": "Content submitted", "version": version}
+    await announce_submission(campaign, current_user, stage)
+    return {"message": "Content submitted", "version": version, "stage": stage}
 
 @api_router.post("/deals/{deal_id}/revision-response")
 async def submit_revision_response(deal_id: str, data: DealRevisionResponseSubmit, current_user: dict = Depends(get_current_user)):
@@ -11513,6 +11670,11 @@ async def get_work_pending_review(current_user: dict = Depends(get_current_user)
         {"campaign_id": {"$in": campaign_ids}, "status": WorkStatus.SUBMITTED},
         {"_id": 0}
     ).to_list(1000)
+    # What approving does next (raw → edited flow), so the review UI can word the button.
+    modes = {c['id']: edit_mode(c) for c in await db.campaigns.find(
+        {"id": {"$in": list({w['campaign_id'] for w in work_submissions})}}, {"_id": 0, "id": 1, "deliverable_items": 1}).to_list(1000)}
+    for w in work_submissions:
+        w['edit_mode'] = modes.get(w['campaign_id'])
 
     # Attach each creator's real name so the brand sees it (not the @handle).
     creator_ids = {w.get('creator_id') for w in work_submissions if w.get('creator_id')}
@@ -11546,7 +11708,7 @@ async def get_business_work_review(current_user: dict = Depends(get_current_user
     ws_id = _brand_ws_id(current_user)
     campaigns = await db.campaigns.find(
         {"business_id": ws_id},
-        {"_id": 0, "id": 1, "title": 1, "status": 1, "deal_id": 1, "selected_creator": 1, "selected_creators": 1},
+        {"_id": 0, "id": 1, "title": 1, "status": 1, "deal_id": 1, "selected_creator": 1, "selected_creators": 1, "deliverable_items": 1},
     ).to_list(10000)
     campaign_by_id = {c['id']: c for c in campaigns}
     campaign_ids = list(campaign_by_id.keys())
@@ -11576,7 +11738,11 @@ async def get_business_work_review(current_user: dict = Depends(get_current_user
         if not campaign:
             continue
         work_status = work.get('status') or WorkStatus.SUBMITTED
-        if work_status == WorkStatus.APPROVED or campaign.get('status') == 'completed':
+        if work_status == WorkStatus.AWAITING_EDIT:
+            status = 'awaiting_edit'  # UGC.ad's editors have it
+        elif work_status == WorkStatus.APPROVED and work.get('stage') == 'raw' and edit_mode(campaign) == 'creator':
+            status = 'awaiting_edited'  # raw approved, creator is editing
+        elif work_status == WorkStatus.APPROVED or campaign.get('status') == 'completed':
             status = 'approved'
         elif work_status == WorkStatus.REVISION_REQUESTED:
             status = 'revision_requested'
@@ -11595,7 +11761,10 @@ async def get_business_work_review(current_user: dict = Depends(get_current_user
             "creatorId": creator_id,
             "creator": person_display_name(creator, 'Creator'),
             "photo": (creator.get('profile') or {}).get('profile_photo') or creator.get('profile_photo') or '',
-            "files": asset.get('work_files') or work.get('work_files') or [],
+            "files": asset.get('work_files') or [f['url'] for f in asset.get('files') or []],
+            "labeledFiles": asset.get('files') or [],
+            "stage": work.get('stage'),
+            "editMode": edit_mode(campaign),
             "submittedAt": work.get('submitted_at'),
             "status": status,
         })
@@ -12589,14 +12758,26 @@ async def admin_editing_complete(work_id: str, data: EditingCompleteIn, current_
         "video_url": url,
         "creator_note": work.get("description"),
         "submitted_at": now,
-    }}})
+        "stage": work.get("stage"),
+    }, "status": "work_submitted", "updated_at": now}})
+    # Version row so the deal room's history shows the edited cut next to the raw.
+    stage = work.get("stage")
+    idx = work.get("deliverable_index") or 0
+    version = await db.deal_content_submissions.count_documents(
+        {"campaign_id": campaign["id"], "creator_id": work.get("creator_id"), "deliverable_index": idx, "stage": stage}) + 1
+    await db.deal_content_submissions.insert_one({
+        "id": str(uuid.uuid4()), "deal_id": person_deal_id(campaign, work.get("creator_id")),
+        "campaign_id": campaign["id"], "creator_id": work.get("creator_id"), "deliverable_index": idx,
+        "stage": stage, "version": version, "video_url": url, "raw_footage_url": (raw_files or [None])[0],
+        "original_url": url, "creator_note": "Edited by UGC.ad", "submitted_at": now, "status": "submitted",
+    })
 
-    await insert_deal_system_message(campaign, "UGC.ad finished editing — the final cut is now with the brand for review.")
+    await insert_deal_system_message(campaign, "UGC.ad finished editing — the edited video is now with the brand for review.", creator_id=work.get("creator_id"))
     if campaign.get("business_id"):
         await notify_user(
             campaign["business_id"],
-            "Content submitted for review",
-            f"UGC.ad's editors finished the cut for '{campaign.get('title', 'your campaign')}'. Review it to release payment.",
+            "Edited video ready for review",
+            f"UGC.ad's editors finished the edited video for '{campaign.get('title', 'your campaign')}'. Review and approve it.",
             link="/dashboard/business/work-review", ntype="info", email=True, category="deal_updates",
         )
     if work.get("creator_id"):

@@ -397,8 +397,20 @@ def to_brand_facing_asset(asset: Dict[str, Any], approved: bool = False) -> Dict
     clean original is released and the asset is explicitly flagged so the
     frontend stops overlaying the sample mark.
     """
+    import os
+    uploads_dir = os.environ.get("UPLOAD_DIR")
+    gate = (lambda fs: list(fs or [])) if approved else (lambda fs: brand_safe_preview_files(fs, uploads_dir))
+    # Every submitted file, labelled — so the brand sees the raw AND the edited video
+    # (the review screens used to play only work_files[0]).
+    edited, raw = asset.get("edited_files") or [], asset.get("raw_files") or []
+    files = ([{"kind": "edited", "label": "Edited video", "url": u} for u in gate(edited)]
+             + [{"kind": "raw", "label": "Raw video", "url": u} for u in gate(raw)])
+    if not files:  # older work docs and deal-room version rows
+        plain = asset.get("work_files") or [u for u in dict.fromkeys([asset.get("video_url"), asset.get("raw_footage_url")]) if u]
+        files = [{"kind": "file", "label": f"File {i + 1}", "url": u} for i, u in enumerate(gate(plain))]
     if approved:
         released = dict(asset)
+        released["files"] = files
         original = released.get("original_url") or released.get("video_url")
         # The clean, watermark-free file the brand now owns.
         released["video_url"] = original
@@ -419,11 +431,14 @@ def to_brand_facing_asset(asset: Dict[str, Any], approved: bool = False) -> Dict
         if key in safe:
             safe.pop(key, None)
     safe["preview_url"] = preview
+    safe["files"] = files
+    for key in ("raw_files", "edited_files"):
+        if key in safe:
+            safe[key] = gate(safe[key])
     # Re-expose every deliverable as a brand-safe, watermark-flagged preview so
     # the review UI can list/play all submitted files (raw originals stay gated).
     if isinstance(raw_files, list) and raw_files:
-        import os
-        safe["work_files"] = brand_safe_preview_files(raw_files, os.environ.get("UPLOAD_DIR"))
+        safe["work_files"] = gate(raw_files)
         if not preview:
             safe["preview_url"] = safe["work_files"][0]
     safe["watermark"] = {

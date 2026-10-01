@@ -33,8 +33,8 @@ def total_deliverable_quantity(campaign: Dict[str, Any]) -> int:
     delivery completion, so escrow and payout can never disagree about the count.
 
     NOTE: a row needing both a raw AND an edited file is still ONE asset/slot —
-    raw + edited are delivered together in a single submission (see
-    get_required_assets/submit_deal_content), not as two separate approval rounds.
+    the raw and edited cuts are two STAGES of that slot (work `stage` field, see
+    server.edit_stage), not two slots.
 
     LEGACY SAFETY: briefs posted before structured deliverables existed have no
     `deliverable_items`, and this returns 1 for them. A quantity of 1 reproduces
