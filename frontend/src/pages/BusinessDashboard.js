@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../App';
 import axios from 'axios';
@@ -168,16 +169,32 @@ const walletPresetAmounts = [10000, 25000, 50000];
 
 function normalizeCreatorDirectoryItem(item = {}) {
   const profile = item.profile || {};
-  const tags = item.tags || profile.tags || [];
+  const rawTags = item.tags || profile.tags || [];
   const portfolio = item.portfolio || profile.portfolio || [];
   const languages = item.languages || profile.languages || item.content_languages || [];
   const cityTier = item.city_tier || profile.city_tier || item.location_region || 'Curated';
+  const categories = Array.from(new Set(
+    [
+      item.primary_category,
+      profile.primary_category,
+      item.category,
+      profile.category,
+      ...(Array.isArray(rawTags) ? rawTags : [rawTags]),
+      ...(Array.isArray(item.categories) ? item.categories : []),
+      ...(Array.isArray(profile.categories) ? profile.categories : []),
+    ]
+      .filter(Boolean)
+      .map(String)
+      .map(value => value.trim())
+      .filter(Boolean)
+  ));
 
   return {
     id: item.id || item.creator_id,
     handle: item.handle || item.public_creator_id || (item.nickname ? `@${String(item.nickname).replace(/^@/, '')}` : '@creator'),
     avatar: item.profile_photo || item.profile_picture || profile.profile_picture || profile.avatar_url || '',
-    category: item.primary_category || profile.primary_category || tags[0] || 'Creator',
+    categories,
+    category: categories[0] || 'Creator',
     languages: Array.isArray(languages) ? languages : [languages].filter(Boolean),
     cityTier,
     deliverablesCompleted: Number(item.deliverables_completed || item.completed_deliverables || item.completed_campaigns || 0),
@@ -1751,9 +1768,13 @@ export default function BusinessDashboard({ page = 'overview' }) {
                           )}
                           <b>{creator.handle.replace('@', '').charAt(0).toUpperCase()}</b>
                         </div>
-                        <div>
+                        <div className="creator-card-header-copy">
                           <h3>{creator.handle}</h3>
-                          <span>{creator.category}</span>
+                          <div className="creator-category-row">
+                            {(creator.categories && creator.categories.length ? creator.categories : [creator.category]).slice(0, 3).map((category) => (
+                              <span key={`${creator.id || creator.handle}-${category}`}>{category}</span>
+                            ))}
+                          </div>
                         </div>
                       </div>
 
@@ -1779,7 +1800,10 @@ export default function BusinessDashboard({ page = 'overview' }) {
 
                       <div className="creator-card-actions">
                         <button type="button" className="btn-secondary" onClick={() => setSelectedCreatorProfile(creator)}>
-                          <Eye size={15} /> <span>View Profile</span>
+                          <Eye size={15} /> <span>View</span>
+                        </button>
+                        <button type="button" className="btn-secondary" onClick={() => navigate(`/messages?conv=${encodeURIComponent(creator.id)}`)}>
+                          <MessageSquare size={15} /> <span>Message</span>
                         </button>
                         <button type="button" className="btn-primary" onClick={() => handleInviteCreator(creator)}>
                           <Send size={15} /> <span>Invite</span>
@@ -2236,9 +2260,13 @@ export default function BusinessDashboard({ page = 'overview' }) {
                   <span>{selectedCreatorProfile.handle.replace('@', '').charAt(0).toUpperCase()}</span>
                 )}
               </div>
-              <div>
+              <div className="creator-profile-modal-copy">
                 <h2>{selectedCreatorProfile.handle}</h2>
-                <p>{selectedCreatorProfile.category}</p>
+                <div className="creator-category-row modal">
+                  {(selectedCreatorProfile.categories && selectedCreatorProfile.categories.length ? selectedCreatorProfile.categories : [selectedCreatorProfile.category]).slice(0, 4).map((category) => (
+                    <span key={`${selectedCreatorProfile.id || selectedCreatorProfile.handle}-${category}`}>{category}</span>
+                  ))}
+                </div>
               </div>
             </div>
             <div className="creator-profile-modal-grid">
@@ -5040,6 +5068,38 @@ export default function BusinessDashboard({ page = 'overview' }) {
           gap: 12px;
         }
 
+        .creator-card-header-copy {
+          min-width: 0;
+          flex: 1;
+        }
+
+        .creator-card-header-copy h3 {
+          margin: 0 0 8px;
+        }
+
+        .creator-category-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+
+        .creator-category-row span {
+          display: inline-flex;
+          align-items: center;
+          max-width: 100%;
+          padding: 5px 8px;
+          border-radius: 999px;
+          background: #EEF0FF;
+          color: #7387FF;
+          font-size: 11px;
+          font-weight: 800;
+          line-height: 1.2;
+        }
+
+        .creator-category-row.modal {
+          margin-top: 8px;
+        }
+
         .creator-card-avatar {
           position: relative;
           width: 54px;
@@ -5084,16 +5144,6 @@ export default function BusinessDashboard({ page = 'overview' }) {
           font-size: 18px;
           line-height: 1.25;
           word-break: break-word;
-        }
-
-        .creator-card-top span {
-          display: inline-flex;
-          padding: 6px 10px;
-          border-radius: 999px;
-          background: #EEF0FF;
-          color: #7387FF;
-          font-size: 12px;
-          font-weight: 850;
         }
 
         .creator-portfolio-preview {
@@ -5142,7 +5192,7 @@ export default function BusinessDashboard({ page = 'overview' }) {
 
         .creator-card-actions {
           display: grid;
-          grid-template-columns: 1fr 1fr;
+          grid-template-columns: 1fr 1fr 1fr;
           gap: 8px;
           margin-top: auto;
         }
