@@ -1,3 +1,4 @@
+import { useCreatorVideo } from "./useCreatorVideo";
 import { useState, useRef, useEffect } from "react";
 import {
   Star,
@@ -313,21 +314,7 @@ function VideoCreatorCard({
   const [muted, setMuted]   = useState(true);
   const [hovered, setHovered] = useState(false);
 
-  // Intersection observer — play when in view, pause when not
-  useEffect(() => {
-    const el  = videoRef.current;
-    const con = containerRef.current;
-    if (!el || !con) return;
-    const obs = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting) { el.play().catch(() => {}); }
-        else                      { el.pause(); }
-      },
-      { threshold: 0.25 }
-    );
-    obs.observe(con);
-    return () => obs.disconnect();
-  }, []);
+  useCreatorVideo(videoRef, containerRef, creator.videoUrl);
 
   // Sync muted state to video element
   useEffect(() => {
@@ -369,12 +356,11 @@ function VideoCreatorCard({
         {/* Video element */}
         <video
           ref={videoRef}
-          autoPlay
-          muted
+          muted={muted}
           loop
           playsInline
-          preload="auto"
-          onCanPlay={() => setLoaded(true)}
+          preload="metadata"
+          onLoadedData={() => setLoaded(true)}
           className="absolute inset-0 w-full h-full"
           style={{
             objectFit: "cover",
@@ -383,7 +369,6 @@ function VideoCreatorCard({
             transform: hovered ? "scale(1.06)" : "scale(1)",
           }}
         >
-          <source src={creator.videoUrl} type="video/mp4" />
         </video>
 
         {/* Gradient overlays */}
