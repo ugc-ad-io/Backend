@@ -181,6 +181,7 @@ function normalizeCreatorDirectoryItem(item = {}) {
     languages: Array.isArray(languages) ? languages : [languages].filter(Boolean),
     cityTier,
     deliverablesCompleted: Number(item.deliverables_completed || item.completed_deliverables || item.completed_campaigns || 0),
+    portfolioVideo: item.portfolio_video || '',
     portfolioPreview: item.portfolio_preview || item.top_portfolio_sample || portfolio[0] || '',
     style: item.content_style || profile.content_style || '',
     budgetRange: item.budget_range || profile.budget_range || '',
@@ -192,6 +193,20 @@ function getAssetUrl(url) {
   if (/^https?:\/\//i.test(url)) return url;
   const baseUrl = BACKEND_URL || window.location.origin;
   return `${baseUrl.replace(/\/$/, '')}/${String(url).replace(/^\//, '')}`;
+}
+
+function isVideoPortfolioPreview(url) {
+  return /\.(mp4|mov|webm|m4v|avi|mkv|3gp)(?:[?#]|$)/i.test(url || '') ||
+    /\/video\/upload\//i.test(url || '');
+}
+
+function getVideoPreviewUrl(url) {
+  if (!/^https?:\/\/res\.cloudinary\.com\//i.test(url || '') ||
+      !/\/video\/upload\//i.test(url) ||
+      /\/video\/upload\/f_mp4,vc_h264\//i.test(url)) {
+    return getAssetUrl(url);
+  }
+  return getAssetUrl(url.replace('/video/upload/', '/video/upload/f_mp4,vc_h264/'));
 }
 
 function formatWalletDate(value) {
@@ -1743,12 +1758,17 @@ export default function BusinessDashboard({ page = 'overview' }) {
                       </div>
 
                       <div className="creator-portfolio-preview">
-                        {creator.portfolioPreview ? (
-                          <img src={getAssetUrl(creator.portfolioPreview)} alt={`${creator.handle} portfolio preview`} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
+                        {creator.portfolioVideo ? (
+                          <video src={getVideoPreviewUrl(creator.portfolioVideo)} aria-label={`${creator.handle} portfolio video`} muted autoPlay loop playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
+                        ) : creator.portfolioPreview ? (
+                          isVideoPortfolioPreview(creator.portfolioPreview) ? (
+                            <video src={getVideoPreviewUrl(creator.portfolioPreview)} aria-label={`${creator.handle} portfolio preview`} muted autoPlay loop playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
+                          ) : (
+                            <img src={getAssetUrl(creator.portfolioPreview)} alt={`${creator.handle} portfolio preview`} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
+                          )
                         ) : (
                           <div><ImageIcon size={26} /> Portfolio preview</div>
                         )}
-                        <div><ImageIcon size={24} /> Portfolio preview</div>
                       </div>
 
                       <div className="creator-quick-stats">
@@ -2228,8 +2248,14 @@ export default function BusinessDashboard({ page = 'overview' }) {
               <div><small>Budget</small><strong>{selectedCreatorProfile.budgetRange || 'Not set'}</strong></div>
             </div>
             <div className="creator-profile-modal-preview">
-              {selectedCreatorProfile.portfolioPreview ? (
-                <img src={getAssetUrl(selectedCreatorProfile.portfolioPreview)} alt={`${selectedCreatorProfile.handle} portfolio preview`} />
+              {selectedCreatorProfile.portfolioVideo ? (
+                <video src={getVideoPreviewUrl(selectedCreatorProfile.portfolioVideo)} aria-label={`${selectedCreatorProfile.handle} portfolio video`} controls playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+              ) : selectedCreatorProfile.portfolioPreview ? (
+                isVideoPortfolioPreview(selectedCreatorProfile.portfolioPreview) ? (
+                  <video src={getVideoPreviewUrl(selectedCreatorProfile.portfolioPreview)} aria-label={`${selectedCreatorProfile.handle} portfolio preview`} controls playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                ) : (
+                  <img src={getAssetUrl(selectedCreatorProfile.portfolioPreview)} alt={`${selectedCreatorProfile.handle} portfolio preview`} />
+                )
               ) : (
                 <span><ImageIcon size={24} /> Portfolio preview pending</span>
               )}

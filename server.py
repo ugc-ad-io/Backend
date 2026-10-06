@@ -4071,11 +4071,57 @@ def _portfolio_preview_url(item: Any) -> str:
                 return item.get(key)
     return ""
 
+def _portfolio_video_url(item: Any) -> str:
+    """Get an uploaded portfolio video, preferring it over image thumbnails."""
+    def usable_video(url: Any, explicit_video: bool = False) -> bool:
+        if not isinstance(url, str) or not (url.startswith("http") or url.startswith("/")):
+            return False
+        path = url.split("?", 1)[0].split("#", 1)[0].lower()
+        return explicit_video or "/video/upload/" in path or path.endswith(
+            (".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv", ".3gp")
+        )
+
+    if usable_video(item):
+        return item
+    if not isinstance(item, dict):
+        return ""
+
+    for key in ("video_url", "videoUrl", "video"):
+        url = item.get(key)
+        if usable_video(url, explicit_video=True):
+            return url
+
+    urls = item.get("urls")
+    if isinstance(urls, list):
+        for url in urls:
+            if usable_video(url):
+                return url
+
+    for key in ("original_url", "url", "link"):
+        url = item.get(key)
+        if usable_video(url):
+            return url
+    return ""
+
 def creator_directory_public_view(creator: dict, deliverables_completed: int) -> dict:
     profile = creator.get("profile") or {}
-    portfolio = first_non_empty(creator.get("portfolio"), profile.get("portfolio")) or []
-    preview_source = portfolio[0] if isinstance(portfolio, list) and portfolio else portfolio
-    portfolio_preview = _portfolio_preview_url(preview_source)
+    portfolio_preview = ""
+    portfolio_video = ""
+    for portfolio in (
+        creator.get("portfolio"),
+        profile.get("portfolio_items"),
+        profile.get("portfolio"),
+    ):
+        items = portfolio if isinstance(portfolio, list) else [portfolio]
+        for item in items:
+            if not portfolio_preview:
+                portfolio_preview = _portfolio_preview_url(item)
+            if not portfolio_video:
+                portfolio_video = _portfolio_video_url(item)
+            if portfolio_preview and portfolio_video:
+                break
+        if portfolio_preview and portfolio_video:
+            break
     primary_category = first_non_empty(
         creator.get("primary_category"),
         creator.get("category"),
@@ -4115,6 +4161,7 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
         "city_tier": first_non_empty(creator.get("city_tier"), creator.get("location_region"), profile.get("city_tier"), profile.get("location_region")) or "",
         "deliverables_completed": deliverables_completed,
         "portfolio_preview": portfolio_preview or "",
+        "portfolio_video": portfolio_video or "",
         "content_style": first_non_empty(creator.get("content_style"), profile.get("content_style")) or "",
         "budget_range": first_non_empty(
             creator.get("budget_range"),

@@ -58,6 +58,45 @@ def creator(user_id, **overrides):
     return data
 
 
+def test_directory_preview_reads_structured_profile_portfolio_items():
+    item = {
+        "title": "Product demo",
+        "videoUrl": "https://res.cloudinary.com/example/video/upload/sample.mp4",
+    }
+    result = server.creator_directory_public_view(
+        creator("structured-portfolio", portfolio=[], profile={"portfolio_items": [item]}),
+        deliverables_completed=0,
+    )
+    assert result["portfolio_preview"] == item["videoUrl"]
+    assert result["portfolio_video"] == item["videoUrl"]
+
+
+def test_directory_separates_uploaded_video_from_its_thumbnail():
+    video_url = "https://res.cloudinary.com/example/video/upload/sample.mp4"
+    thumbnail_url = "https://cdn.example.com/sample.jpg"
+    result = server.creator_directory_public_view(
+        creator(
+            "video-with-thumbnail",
+            portfolio=[{"thumbnail_url": thumbnail_url, "videoUrl": video_url}],
+        ),
+        deliverables_completed=0,
+    )
+    assert result["portfolio_preview"] == thumbnail_url
+    assert result["portfolio_video"] == video_url
+
+
+def test_directory_preview_skips_empty_items_and_uses_later_video():
+    video_url = "https://res.cloudinary.com/example/video/upload/sample.mp4"
+    result = server.creator_directory_public_view(
+        creator(
+            "later-video",
+            portfolio=[{"title": "Missing asset"}, {"title": "Video", "videoUrl": video_url}],
+        ),
+        deliverables_completed=0,
+    )
+    assert result["portfolio_preview"] == video_url
+
+
 async def cleanup(test_ids):
     user_ids = [test_ids["brand_id"], test_ids["creator_a"], test_ids["creator_b"], test_ids["creator_hidden"]]
     await server.db.users.delete_many({"id": {"$in": user_ids}})
