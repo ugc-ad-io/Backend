@@ -1780,10 +1780,10 @@ export default function BusinessDashboard({ page = 'overview' }) {
 
                       <div className="creator-portfolio-preview">
                         {creator.portfolioVideo ? (
-                          <video src={getVideoPreviewUrl(creator.portfolioVideo)} aria-label={`${creator.handle} portfolio video`} muted autoPlay loop playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
+                          <video src={getVideoPreviewUrl(creator.portfolioVideo)} aria-label={`${creator.handle} portfolio video`} muted loop playsInline preload="none" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onMouseEnter={(event) => { if (window.matchMedia('(hover: hover)').matches) event.currentTarget.play().catch(() => {}); }} onMouseLeave={(event) => event.currentTarget.pause()} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
                         ) : creator.portfolioPreview ? (
                           isVideoPortfolioPreview(creator.portfolioPreview) ? (
-                            <video src={getVideoPreviewUrl(creator.portfolioPreview)} aria-label={`${creator.handle} portfolio preview`} muted autoPlay loop playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
+                            <video src={getVideoPreviewUrl(creator.portfolioPreview)} aria-label={`${creator.handle} portfolio preview`} muted loop playsInline preload="none" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onMouseEnter={(event) => { if (window.matchMedia('(hover: hover)').matches) event.currentTarget.play().catch(() => {}); }} onMouseLeave={(event) => event.currentTarget.pause()} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
                           ) : (
                             <img src={getAssetUrl(creator.portfolioPreview)} alt={`${creator.handle} portfolio preview`} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
                           )
