@@ -16944,6 +16944,12 @@ app.add_middleware(UploadsCORSMiddleware)
 # browsers accept. Override/extend via the CORS_ORIGINS env var (comma-separated).
 _DEFAULT_CORS_ORIGINS = "https://www.ugcad.io,https://ugcad.io,http://localhost:3000,http://10.0.2.2:3000"
 _cors_origins = [o.strip() for o in os.environ.get('CORS_ORIGINS', _DEFAULT_CORS_ORIGINS).split(',') if o.strip()]
+# A literal "*" is never usable alongside allow_credentials=True below (browsers
+# reject Access-Control-Allow-Origin: * once Access-Control-Allow-Credentials is
+# present), so treat it as "use the real defaults" instead of silently breaking
+# every request from every origin.
+if '*' in _cors_origins:
+    _cors_origins = [o.strip() for o in _DEFAULT_CORS_ORIGINS.split(',') if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
