@@ -8,7 +8,9 @@
 # of -dev headers. Building them here and copying only the finished wheels into
 # the runtime stage keeps the compiler toolchain out of the shipped image.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.12-slim AS build
+# 3.11 to match runtime.txt / .python-version: the pinned pydantic 1.10.15 crashes
+# at import on Python 3.12.4+ (ForwardRef._evaluate signature change).
+FROM python:3.11-slim AS build
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -34,7 +36,7 @@ RUN pip wheel --wheel-dir /wheels -r requirements.txt
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2 — runtime
 # ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.12-slim AS runtime
+FROM python:3.11-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
