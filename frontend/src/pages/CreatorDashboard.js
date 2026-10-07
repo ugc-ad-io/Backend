@@ -161,7 +161,7 @@ const getLevelInfo = (completedWorks) => {
 };
 
 export default function CreatorDashboard() {
-  const { user, logout, setUser } = useAuth();
+  const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [activeCampaigns, setActiveCampaigns] = useState([]);
   const [availableCampaigns, setAvailableCampaigns] = useState([]);
@@ -175,6 +175,16 @@ export default function CreatorDashboard() {
   const [portfolio, setPortfolio] = useState([]);
   const [uploadingPortfolio, setUploadingPortfolio] = useState(false);
   const [completedWorks, setCompletedWorks] = useState(0);
+  // A private brief that just went live for this creator. Shown once per brief:
+  // declining only closes the chat card, the brief itself stays active.
+  const [privateBrief, setPrivateBrief] = useState(null);
+  const seenKey = (id) => `privateBriefSeen:${id}`;
+  const isSeen = (id) => { try { return Boolean(localStorage.getItem(seenKey(id))); } catch { return false; } };
+  const closePrivateBrief = (goToMessages) => {
+    try { localStorage.setItem(seenKey(privateBrief.id), '1'); } catch { /* storage blocked */ }
+    setPrivateBrief(null);
+    if (goToMessages) navigate('/messages');
+  };
 
   useEffect(() => {
     // Only skip if approval_status is explicitly set and not 'approved'
@@ -189,17 +199,7 @@ export default function CreatorDashboard() {
     }
   }, [user?.approval_status, user?.id]);
 
-  useEffect(() => {
-    const refreshUserData = async () => {
-      try {
-        const response = await axios.get(`${API}/auth/me`);
-        setUser(response.data);
-      } catch (error) {
-        console.error('Failed to refresh user data');
-      }
-    };
-    refreshUserData();
-  }, [setUser]);
+
 
   const fetchAllData = async () => {
     try {
@@ -227,6 +227,11 @@ export default function CreatorDashboard() {
             myBid: campaign.bids.find((bid) => bid.creator_id === user.id)
           }))
       );
+      const newPrivate = allCampaigns.find((campaign) =>
+        campaign.visibility === 'private' && campaign.status === 'active' &&
+        isHiredOn(campaign, user.id) && !isSeen(campaign.id)
+      );
+      if (newPrivate) setPrivateBrief((current) => current || newPrivate);
       setReviews(reviewsRes.data);
       setPortfolio(user?.portfolio || []);
       setCompletedWorks(completedCampaigns.length);
@@ -629,6 +634,23 @@ export default function CreatorDashboard() {
               <button type="submit" className="pcd-primary">Submit Bid</button>
             </div>
           </form>
+        </div>
+      )}
+
+      {privateBrief && (
+        <div className="pcd-modal-overlay" role="dialog" aria-modal="true" aria-labelledby="private-brief-title">
+          <div className="pcd-modal">
+            <h2 id="private-brief-title">You've received a private brief</h2>
+            <p>
+              <strong>{privateBrief.brand_name || 'A brand'}</strong> sent <strong>{privateBrief.title || 'a brief'}</strong> to you only.
+            </p>
+            <p>Budget: {formatMoney(privateBrief.budget_max || privateBrief.budget_min)} per video</p>
+            <p>Open Messages to accept or decline. The invitation expires in 72 hours.</p>
+            <div>
+              <button type="button" onClick={() => closePrivateBrief(false)}>Later</button>
+              <button type="button" className="pcd-primary" onClick={() => closePrivateBrief(true)}>View &amp; respond</button>
+            </div>
+          </div>
         </div>
       )}
     </DashboardLayout>

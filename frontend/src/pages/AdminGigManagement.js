@@ -1,3 +1,4 @@
+import { useLiveEffect } from "../lib/liveUpdates";
 import { useState, useEffect } from 'react';
 import { useAuth } from '../App';
 import axios from 'axios';
@@ -31,7 +32,7 @@ export default function AdminGigManagement() {
   const [showRejectForm, setShowRejectForm] = useState(null);
   const [processingId, setProcessingId] = useState(null);
 
-  useEffect(() => {
+  useLiveEffect(() => {
     fetchGigs();
   }, []);
 

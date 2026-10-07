@@ -1,7 +1,7 @@
 """
 Extended Campaign Models for 5-step "Post a Brief" flow
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 from typing import List, Optional, Dict, Any
 from enum import Enum
 
@@ -51,6 +51,15 @@ class DeliverableItem(BaseModel):
     # covered by their bid) or UGC.ad's own team. 'ugc' triggers an admin notification
     # on submission and the creator is not notified to deliver a cut themselves.
     edited_by: Optional[str] = "creator"
+
+    @root_validator(pre=True)
+    def accept_native_field_names(cls, values):
+        values = dict(values)
+        for native, canonical in (("rawRequired", "raw_required"), ("editedRequired", "edited_required"),
+                                  ("editedBy", "edited_by"), ("aspectRatios", "aspect_ratios")):
+            if canonical not in values and native in values:
+                values[canonical] = values[native]
+        return values
 
 
 class BriefSectionsMixin(BaseModel):
@@ -125,6 +134,7 @@ class BriefSectionsMixin(BaseModel):
     draft_delivery_by: Optional[str] = None
     final_delivery_by: Optional[str] = None
     budget_mode: Optional[str] = None
+    editing_fee_per_video: float = Field(default=0, ge=0)
 
 
 # Step 1: Product Info
@@ -268,6 +278,10 @@ class CampaignCreateExtended(BriefSectionsMixin):
 
 class CampaignDraftCreate(BriefSectionsMixin):
     """Model for creating draft campaigns - allows partial data"""
+    # Same as CampaignCreateExtended: the app saves a private brief through
+    # /campaigns/draft, and undeclared fields are dropped, so the draft went live public.
+    visibility: Optional[str] = None
+    selected_creator: Optional[str] = None
     # Any field can be optional for drafts
     title: Optional[str] = None
     objectives: Optional[List[str]] = None

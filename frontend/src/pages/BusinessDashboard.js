@@ -1,4 +1,6 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { openWalletCheckout } from "../lib/walletCheckout";
+import { useState, useMemo, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../App';
 import axios from 'axios';
@@ -168,16 +170,32 @@ const walletPresetAmounts = [10000, 25000, 50000];
 
 function normalizeCreatorDirectoryItem(item = {}) {
   const profile = item.profile || {};
-  const tags = item.tags || profile.tags || [];
+  const rawTags = item.tags || profile.tags || [];
   const portfolio = item.portfolio || profile.portfolio || [];
   const languages = item.languages || profile.languages || item.content_languages || [];
   const cityTier = item.city_tier || profile.city_tier || item.location_region || 'Curated';
+  const categories = Array.from(new Set(
+    [
+      item.primary_category,
+      profile.primary_category,
+      item.category,
+      profile.category,
+      ...(Array.isArray(rawTags) ? rawTags : [rawTags]),
+      ...(Array.isArray(item.categories) ? item.categories : []),
+      ...(Array.isArray(profile.categories) ? profile.categories : []),
+    ]
+      .filter(Boolean)
+      .map(String)
+      .map(value => value.trim())
+      .filter(Boolean)
+  ));
 
   return {
     id: item.id || item.creator_id,
     handle: item.handle || item.public_creator_id || (item.nickname ? `@${String(item.nickname).replace(/^@/, '')}` : '@creator'),
     avatar: item.profile_photo || item.profile_picture || profile.profile_picture || profile.avatar_url || '',
-    category: item.primary_category || profile.primary_category || tags[0] || 'Creator',
+    categories,
+    category: categories[0] || 'Creator',
     languages: Array.isArray(languages) ? languages : [languages].filter(Boolean),
     cityTier,
     deliverablesCompleted: Number(item.deliverables_completed || item.completed_deliverables || item.completed_campaigns || 0),
@@ -207,6 +225,12 @@ function getVideoPreviewUrl(url) {
     return getAssetUrl(url);
   }
   return getAssetUrl(url.replace('/video/upload/', '/video/upload/f_mp4,vc_h264/'));
+
+function getWorkPreviewUrl(url) {
+  const resolved = getAssetUrl(url);
+  const token = localStorage.getItem('token');
+  if (!token || !String(url).startsWith('/uploads/')) return resolved;
+  return `${resolved}${resolved.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
 }
 
 function formatWalletDate(value) {
@@ -252,6 +276,7 @@ export default function BusinessDashboard({ page = 'overview' }) {
   const [walletLoading, setWalletLoading] = useState(false);
   const [walletError, setWalletError] = useState('');
   const [walletAmount, setWalletAmount] = useState('');
+  const walletCheckoutPending = useRef(false);
   const [walletFilter, setWalletFilter] = useState('all');
   const [rechargingWallet, setRechargingWallet] = useState(false);
   const [performancePeriod, setPerformancePeriod] = useState('Monthly');
@@ -269,27 +294,19 @@ export default function BusinessDashboard({ page = 'overview' }) {
   });
   const [objectiveInput, setObjectiveInput] = useState('');
 
-  useEffect(() => {
+  useLiveEffect(() => {
     if (user?.approval_status === 'approved') {
       fetchCampaigns();
     }
   }, [user?.id]);
 
-  // Consolidation: the legacy "Work Review" tab is superseded by the full Deal
-  // Room (shipment → review → approval → scheduled payout). Redirect there.
-  useEffect(() => {
-    if (page === 'work-review') {
-      navigate('/dashboard/business/deal-room', { replace: true });
-    }
-  }, [page, navigate]);
-
-  useEffect(() => {
+  useLiveEffect(() => {
     if (user?.approval_status === 'approved' && page === 'browse-creator') {
       fetchCreatorDirectory();
     }
   }, [user?.id, page, creatorFilters, creatorSort]);
 
-  useEffect(() => {
+  useLiveEffect(() => {
     if (user?.approval_status === 'approved' && page === 'wallet') {
       fetchWallet();
     }
@@ -297,9 +314,10 @@ export default function BusinessDashboard({ page = 'overview' }) {
 
   const fetchCampaigns = async () => {
     try {
-      const [response, dashboardRes] = await Promise.all([
+      const [response, dashboardRes, workRes] = await Promise.all([
         axios.get(`${API}/campaigns`),
-        axios.get(`${API}/business/dashboard`)
+        axios.get(`${API}/business/dashboard`),
+        axios.get(`${API}/work/pending-review`)
       ]);
       const allCampaigns = response.data;
       setDashboardData(dashboardRes.data || null);
@@ -311,7 +329,6 @@ export default function BusinessDashboard({ page = 'overview' }) {
       // Always load pending work: on a multi-creator brief the campaign's single status
       // can't say "creator B submitted" once creator A has moved on, so gating this on
       // status === 'work_submitted' could hide a submission that's waiting for review.
-      const workRes = await axios.get(`${API}/work/pending-review`);
       setWorkSubmissions(workRes.data || []);
 
       // Categorize campaigns
@@ -409,13 +426,7 @@ export default function BusinessDashboard({ page = 'overview' }) {
   };
 
   const handleInviteCreator = (creator) => {
-    setSelectedCreatorInvite(creator);
-    setInviteForm({
-      ...emptyInviteForm,
-      campaign_name: campaigns[0]?.title || '',
-      budget: campaigns[0] ? formatMoney(campaigns[0].budget_max || campaigns[0].budget_min || 0) : creator.budgetRange || '',
-      message: `Hi ${creator.handle}, we think your content style could be a strong fit for our brand.`,
-    });
+    navigate(`/dashboard/business/post-brief?creator=${encodeURIComponent(creator.id)}`);
   };
 
   const handleInviteCampaignChange = (campaignId) => {
@@ -456,11 +467,11 @@ export default function BusinessDashboard({ page = 'overview' }) {
     setSendingInvite(true);
     try {
       await axios.post(`${API}/business/creator-directory/${selectedCreatorInvite.id}/invite`, payload);
-      toast.success(`Invitation sent to ${selectedCreatorInvite.handle}`);
+      toast.success(`Brief sent to ${selectedCreatorInvite.handle}`);
       closeInviteModal();
       setSelectedCreatorProfile(null);
     } catch (error) {
-      toast.error(error.response?.data?.detail || 'Failed to send invitation');
+      toast.error(error.response?.data?.detail || 'Failed to send brief');
     } finally {
       setSendingInvite(false);
     }
@@ -482,19 +493,27 @@ export default function BusinessDashboard({ page = 'overview' }) {
   const handleWalletRecharge = async (amountOverride) => {
     const amount = Number(amountOverride || walletAmount);
     const minRecharge = Number(walletData.minimum_chat_balance) || 2500;
-    if (!amount || amount < minRecharge) {
+    if (!Number.isFinite(amount) || amount < minRecharge) {
       toast.error(`Minimum recharge amount is Rs. ${minRecharge.toLocaleString('en-IN')}`);
       return;
     }
+    if (walletCheckoutPending.current) return;
+    walletCheckoutPending.current = true;
     setRechargingWallet(true);
     try {
       const response = await axios.post(`${API}/business/wallet/recharge`, { amount, gateway: 'razorpay' });
-      toast.success(`Payment order created for ${formatMoney(response.data.amount)}. Complete payment to credit your wallet.`);
+      const payment = await openWalletCheckout(response.data);
+      if (!payment) return;
+      if (payment.razorpay_order_id !== response.data.order_id) throw new Error('Payment order mismatch');
+      const verified = await axios.post(`${API}/payments/verify`, payment);
+      if (!verified.data.success) throw new Error('Payment verification pending');
+      toast.success('Payment verified. Your wallet has been updated.');
       setWalletAmount(String(amount));
       await fetchWallet();
     } catch (error) {
-      toast.error(error.response?.data?.detail || 'Failed to start wallet recharge');
+      toast.error(error.response?.data?.detail || error.message || 'Failed to start wallet recharge');
     } finally {
+      walletCheckoutPending.current = false;
       setRechargingWallet(false);
     }
   };
@@ -530,7 +549,7 @@ export default function BusinessDashboard({ page = 'overview' }) {
     overview: `Welcome back, ${user?.nickname}!`,
     'post-brief': 'Create a new campaign and attract top creators',
     'pending-bids': 'Review creator proposals and select the best fit for each campaign',
-    'browse-creator': 'Discover vetted creators and send private invitations',
+    'browse-creator': 'Discover vetted creators and send a brief',
     'all-campaigns': 'Track every brief from draft to delivery',
     'work-review': 'Review submitted creator work and approve deliverables',
     shipments: 'Manage product shipments and creator selection for delivery campaigns',
@@ -1600,7 +1619,7 @@ export default function BusinessDashboard({ page = 'overview' }) {
                           onClick={() => handleViewCampaign(campaign.id)}
                           data-testid={`view-campaign-${campaign.id}`}
                         >
-                          <Eye size={18} /> View Details
+                          <Eye size={18} /> {campaign.status === 'draft' ? 'Review & Publish' : 'View Details'}
                         </button>
                         {campaign.match_status === 'shortlisted' && (
                           <button
@@ -1692,7 +1711,7 @@ export default function BusinessDashboard({ page = 'overview' }) {
                 <div>
                   <span className="creator-directory-kicker"><UserRoundSearch size={16} /> Curated creator pool</span>
                   <h2>Creator Browse / Directory</h2>
-                  <p>Browse creators admitted by ops for private invitations. This view is scoped to the curated pool, not the full platform roster.</p>
+                  <p>Browse vetted creators and send them a campaign brief.</p>
                 </div>
                 <div className="creator-directory-sort">
                   <label htmlFor="creator-sort">Sort</label>
@@ -1741,7 +1760,15 @@ export default function BusinessDashboard({ page = 'overview' }) {
               ) : (
                 <div className="creator-directory-grid">
                   {creatorDirectory.map(creator => (
-                    <article key={creator.id || creator.handle} className="creator-directory-card">
+                    <article
+                      key={creator.id || creator.handle}
+                      className="creator-directory-card"
+                      onMouseEnter={(event) => {
+                        if (!window.matchMedia('(hover: hover)').matches) return;
+                        event.currentTarget.querySelector('video')?.play().catch(() => {});
+                      }}
+                      onMouseLeave={(event) => event.currentTarget.querySelector('video')?.pause()}
+                    >
                       <div className="creator-card-top">
                         <div className="creator-card-avatar">
                           {creator.avatar ? (
@@ -1751,18 +1778,22 @@ export default function BusinessDashboard({ page = 'overview' }) {
                           )}
                           <b>{creator.handle.replace('@', '').charAt(0).toUpperCase()}</b>
                         </div>
-                        <div>
+                        <div className="creator-card-header-copy">
                           <h3>{creator.handle}</h3>
-                          <span>{creator.category}</span>
+                          <div className="creator-category-row">
+                            {(creator.categories && creator.categories.length ? creator.categories : [creator.category]).slice(0, 3).map((category) => (
+                              <span key={`${creator.id || creator.handle}-${category}`}>{category}</span>
+                            ))}
+                          </div>
                         </div>
                       </div>
 
                       <div className="creator-portfolio-preview">
                         {creator.portfolioVideo ? (
-                          <video src={getVideoPreviewUrl(creator.portfolioVideo)} aria-label={`${creator.handle} portfolio video`} muted autoPlay loop playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
+                          <video src={getVideoPreviewUrl(creator.portfolioVideo)} poster={creator.portfolioPreview && !isVideoPortfolioPreview(creator.portfolioPreview) ? getAssetUrl(creator.portfolioPreview) : undefined} aria-label={`${creator.handle} portfolio video`} muted loop playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
                         ) : creator.portfolioPreview ? (
                           isVideoPortfolioPreview(creator.portfolioPreview) ? (
-                            <video src={getVideoPreviewUrl(creator.portfolioPreview)} aria-label={`${creator.handle} portfolio preview`} muted autoPlay loop playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
+                            <video src={getVideoPreviewUrl(creator.portfolioPreview)} aria-label={`${creator.handle} portfolio preview`} muted loop playsInline preload="metadata" style={{ width: '100%', height: '100%', objectFit: 'cover' }} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
                           ) : (
                             <img src={getAssetUrl(creator.portfolioPreview)} alt={`${creator.handle} portfolio preview`} onError={(event) => { event.currentTarget.style.display = 'none'; }} />
                           )
@@ -1779,7 +1810,10 @@ export default function BusinessDashboard({ page = 'overview' }) {
 
                       <div className="creator-card-actions">
                         <button type="button" className="btn-secondary" onClick={() => setSelectedCreatorProfile(creator)}>
-                          <Eye size={15} /> <span>View Profile</span>
+                          <Eye size={15} /> <span>View</span>
+                        </button>
+                        <button type="button" className="btn-secondary" onClick={() => navigate(`/messages?conv=${encodeURIComponent(creator.id)}`)}>
+                          <MessageSquare size={15} /> <span>Message</span>
                         </button>
                         <button type="button" className="btn-primary" onClick={() => handleInviteCreator(creator)}>
                           <Send size={15} /> <span>Invite</span>
@@ -1796,97 +1830,38 @@ export default function BusinessDashboard({ page = 'overview' }) {
             <div className="work-review-section">
               <div className="work-review-hero">
                 <div>
-                  <span className="work-review-kicker"><FileCheck size={16} /> Creator Deliverables</span>
-                  <h2>Work Review Queue</h2>
-                  <p>Review submitted content, open files, and release approvals from one focused workspace.</p>
+                  <h2>Submitted Video Gallery</h2>
+                  <p>Watch creator submissions and open a video for review.</p>
                 </div>
                 <button type="button" className="work-review-refresh" onClick={fetchCampaigns}>
-                  <Activity size={18} /> Refresh Queue
+                  <Activity size={18} /> Refresh
                 </button>
               </div>
-
-              <div className="work-review-stats">
-                <div>
-                  <span><Clock3 size={20} /></span>
-                  <p>Pending Review</p>
-                  <strong>{workSubmissions.length}</strong>
-                </div>
-                <div>
-                  <span><FileText size={20} /></span>
-                  <p>Submitted Files</p>
-                  <strong>{workSubmissions.reduce((sum, work) => sum + (work.work_files?.length || 0), 0)}</strong>
-                </div>
-                <div>
-                  <span><UserCheck size={20} /></span>
-                  <p>Creators Waiting</p>
-                  <strong>{new Set(workSubmissions.map(work => work.creator_id)).size}</strong>
-                </div>
-              </div>
-
               {workSubmissions.length === 0 ? (
                 <div className="work-review-empty">
                   <span><CheckCircle size={44} /></span>
-                  <h3>All caught up</h3>
-                  <p>No creator work is pending review right now. New submissions will appear here automatically.</p>
+                  <h3>No videos pending review</h3>
+                  <p>Creator submissions will appear here when they are ready.</p>
                 </div>
               ) : (
-                <div className="work-review-list">
+                <div className="work-video-gallery">
                   {workSubmissions.map(work => {
-                    const campaign = campaigns.find(c => c.id === work.campaign_id);
-                    const files = work.work_files || [];
-                    const submittedAt = work.submitted_at || work.created_at;
+                    const files = [...new Set([work.preview_url || work.video_url, ...(work.files || []).map(file => file.url), ...(work.work_files || [])].filter(Boolean))];
+                    const videos = files.filter(file => file === work.preview_url || file === work.video_url || /\.(mp4|mov|webm|m4v)(?:[?#]|$)/i.test(file));
                     return (
-                      <article key={work.id} className="work-review-card" data-testid={`work-${work.id}`}>
-                        <div className="work-review-card-main">
-                          <div className="work-review-card-top">
-                            <div className="work-campaign-mark">
-                              {(campaign?.title || 'C').trim().charAt(0).toUpperCase()}
-                            </div>
-                            <div>
-                              <h3>{campaign?.title || work.campaign_title || 'Untitled Campaign'}</h3>
-                              <p>
-                                <span>Creator</span>
-                                <strong>{work.creator_nickname || work.creator_name || work.creator_id}</strong>
-                                <span>Submitted</span>
-                                <strong>{formatDate(submittedAt)}</strong>
-                              </p>
-                            </div>
-                            <span className="work-review-status"><AlertCircle size={15} /> Pending Review</span>
+                      <article key={work.id} className="work-video-card" data-testid={`work-${work.id}`}>
+                        {videos.length ? videos.map((file, index) => (
+                          <div key={file} className="work-video-player">
+                            <video src={getWorkPreviewUrl(file)} controls playsInline preload="metadata" aria-label={`${work.campaign_title || 'Submitted video'} ${index + 1}`} />
+                            {work.watermark_protected && <span className="work-video-watermark">{work.watermark?.text || 'UGCAD.IO Preview'}</span>}
                           </div>
-
-                          <p className="work-review-description">
-                            {work.description || 'Creator submitted deliverables for review. Open the files and approve or request revisions.'}
-                          </p>
-
-                          <div className="work-review-files">
-                            {files.length ? files.slice(0, 4).map((file, idx) => {
-                              const fileUrl = file.startsWith('http') ? file : `${BACKEND_URL}${file}`;
-                              const fileName = decodeURIComponent(String(file).split('/').pop() || `File ${idx + 1}`);
-                              return (
-                                <a key={`${file}-${idx}`} href={fileUrl} target="_blank" rel="noopener noreferrer">
-                                  <FileText size={16} />
-                                  <span>{fileName}</span>
-                                  <Download size={15} />
-                                </a>
-                              );
-                            }) : (
-                              <span className="work-review-no-files">No files attached</span>
-                            )}
-                            {files.length > 4 && <span className="work-review-more">+{files.length - 4} more</span>}
-                          </div>
-                        </div>
-
-                        <div className="work-review-card-side">
-                          <div>
-                            <small>Campaign Budget</small>
-                            <strong>{formatMoney(campaign?.budget_max || campaign?.budget_min || 0)}</strong>
-                          </div>
-                          <div>
-                            <small>Files</small>
-                            <strong>{files.length}</strong>
-                          </div>
-                          <button className="work-review-primary" onClick={() => navigate(`/work-review/${work.id}`)}>
-                            Review Work <ExternalLink size={17} />
+                        )) : <div className="work-review-empty">Video preview unavailable</div>}
+                        <div className="work-video-caption">
+                          <h3>{work.campaign_title || campaigns.find(c => c.id === work.campaign_id)?.title || 'Submitted video'}</h3>
+                          <p>{work.creator_name || work.creator_nickname || 'Creator'} ? {formatDate(work.submitted_at || work.created_at)}</p>
+                          {work.watermark_protected && <small>Watermarked preview until approval</small>}
+                          <button type="button" className="work-review-primary" onClick={() => navigate(`/work-review/${work.id}`)}>
+                            Review Video <ExternalLink size={17} />
                           </button>
                         </div>
                       </article>
@@ -2236,9 +2211,13 @@ export default function BusinessDashboard({ page = 'overview' }) {
                   <span>{selectedCreatorProfile.handle.replace('@', '').charAt(0).toUpperCase()}</span>
                 )}
               </div>
-              <div>
+              <div className="creator-profile-modal-copy">
                 <h2>{selectedCreatorProfile.handle}</h2>
-                <p>{selectedCreatorProfile.category}</p>
+                <div className="creator-category-row modal">
+                  {(selectedCreatorProfile.categories && selectedCreatorProfile.categories.length ? selectedCreatorProfile.categories : [selectedCreatorProfile.category]).slice(0, 4).map((category) => (
+                    <span key={`${selectedCreatorProfile.id || selectedCreatorProfile.handle}-${category}`}>{category}</span>
+                  ))}
+                </div>
               </div>
             </div>
             <div className="creator-profile-modal-grid">
@@ -2262,6 +2241,9 @@ export default function BusinessDashboard({ page = 'overview' }) {
             </div>
             <div className="modal-actions">
               <button type="button" className="btn-secondary" onClick={() => setSelectedCreatorProfile(null)}>Close</button>
+              <button type="button" className="btn-secondary" onClick={() => navigate(`/messages?conv=${encodeURIComponent(selectedCreatorProfile.id)}`)}>
+                <MessageSquare size={16} /> Message
+              </button>
               <button type="button" className="btn-primary" onClick={() => handleInviteCreator(selectedCreatorProfile)}>
                 <Send size={16} /> Invite
               </button>
@@ -2275,9 +2257,9 @@ export default function BusinessDashboard({ page = 'overview' }) {
           <div className="modal-content creator-invite-modal" onClick={(event) => event.stopPropagation()}>
             <div className="creator-invite-head">
               <div>
-                <span className="creator-directory-kicker"><Send size={16} /> Private invitation</span>
+                <span className="creator-directory-kicker"><Send size={16} /> Send a Brief</span>
                 <h2>Invite {selectedCreatorInvite.handle}</h2>
-                <p>Send a structured invitation card. The creator can accept, reject, or counter from chat.</p>
+                <p>Send a campaign brief. The creator can accept, decline, or counter from Messages.</p>
               </div>
             </div>
 
@@ -2376,7 +2358,7 @@ export default function BusinessDashboard({ page = 'overview' }) {
                   Cancel
                 </button>
                 <button type="submit" className="btn-primary" disabled={sendingInvite}>
-                  <Send size={16} /> {sendingInvite ? 'Sending...' : 'Send Invite'}
+                  <Send size={16} /> {sendingInvite ? 'Sending...' : 'Send a Brief'}
                 </button>
               </div>
             </form>
@@ -5040,6 +5022,38 @@ export default function BusinessDashboard({ page = 'overview' }) {
           gap: 12px;
         }
 
+        .creator-card-header-copy {
+          min-width: 0;
+          flex: 1;
+        }
+
+        .creator-card-header-copy h3 {
+          margin: 0 0 8px;
+        }
+
+        .creator-category-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+
+        .creator-category-row span {
+          display: inline-flex;
+          align-items: center;
+          max-width: 100%;
+          padding: 5px 8px;
+          border-radius: 999px;
+          background: #EEF0FF;
+          color: #7387FF;
+          font-size: 11px;
+          font-weight: 800;
+          line-height: 1.2;
+        }
+
+        .creator-category-row.modal {
+          margin-top: 8px;
+        }
+
         .creator-card-avatar {
           position: relative;
           width: 54px;
@@ -5069,7 +5083,8 @@ export default function BusinessDashboard({ page = 'overview' }) {
         }
 
         .creator-card-avatar img,
-        .creator-portfolio-preview img {
+        .creator-portfolio-preview img,
+        .creator-portfolio-preview video {
           position: relative;
           z-index: 1;
           width: 100%;
@@ -5084,16 +5099,6 @@ export default function BusinessDashboard({ page = 'overview' }) {
           font-size: 18px;
           line-height: 1.25;
           word-break: break-word;
-        }
-
-        .creator-card-top span {
-          display: inline-flex;
-          padding: 6px 10px;
-          border-radius: 999px;
-          background: #EEF0FF;
-          color: #7387FF;
-          font-size: 12px;
-          font-weight: 850;
         }
 
         .creator-portfolio-preview {
@@ -5142,7 +5147,7 @@ export default function BusinessDashboard({ page = 'overview' }) {
 
         .creator-card-actions {
           display: grid;
-          grid-template-columns: 1fr 1fr;
+          grid-template-columns: 1fr 1fr 1fr;
           gap: 8px;
           margin-top: auto;
         }
@@ -5303,7 +5308,8 @@ export default function BusinessDashboard({ page = 'overview' }) {
           font-weight: 850;
         }
 
-        .creator-profile-modal-preview img {
+        .creator-profile-modal-preview img,
+        .creator-profile-modal-preview video {
           width: 100%;
           height: 100%;
           object-fit: cover;
@@ -5728,6 +5734,63 @@ export default function BusinessDashboard({ page = 'overview' }) {
           height: 100%;
           border-radius: inherit;
           background: #9F9FD1;
+        }
+
+        .work-video-gallery {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+          gap: 24px;
+        }
+
+        .work-video-card {
+          min-width: 0;
+          overflow: hidden;
+          border: 1px solid #E9EBFF;
+          border-radius: 20px;
+          background: white;
+        }
+
+        .work-video-player {
+          position: relative;
+        }
+
+        .work-video-watermark {
+          position: absolute;
+          top: 45%;
+          left: 0;
+          width: 100%;
+          text-align: center;
+          color: rgba(255, 255, 255, 0.7);
+          font-size: 22px;
+          font-weight: 800;
+          text-shadow: 0 1px 4px #07074E;
+          pointer-events: none;
+        }
+
+        .work-video-card video {
+          display: block;
+          width: 100%;
+          height: 300px;
+          object-fit: contain;
+          background: #07074E;
+        }
+
+        .work-video-caption {
+          padding: 20px;
+        }
+
+        .work-video-caption h3 {
+          margin: 0 0 8px;
+          color: #07074E;
+        }
+
+        .work-video-caption p,
+        .work-video-caption small {
+          color: #6F72A8;
+        }
+
+        .work-video-caption button {
+          margin-top: 16px;
         }
 
         .work-review-section {

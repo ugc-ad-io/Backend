@@ -119,7 +119,7 @@ export default function ChatPage() {
             <ArrowLeft size={20} />
           </button>
           <div className="chat-user-info">
-            <h2>{otherUser?.nickname || 'Loading...'}</h2>
+            <h2><button type="button" onClick={() => navigate(`/profile/${userId}`)} style={{ border: 0, padding: 0, background: 'transparent', color: 'inherit', font: 'inherit', cursor: 'pointer' }} aria-label="View profile">{otherUser?.nickname || 'Loading...'}</button></h2>
             <span className="user-role">{otherUser?.role}</span>
           </div>
         </div>

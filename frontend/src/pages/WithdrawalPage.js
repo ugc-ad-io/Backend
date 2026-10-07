@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../App';
 import axios from 'axios';
@@ -133,7 +134,7 @@ export default function WithdrawalPage() {
   const [showDateDrop, setShowDateDrop] = useState(false);
   const [savingBank, setSavingBank] = useState(false);
 
-  useEffect(() => {
+  useLiveEffect(() => {
     fetchData();
   }, []);
 

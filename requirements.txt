@@ -70,5 +70,7 @@ Pillow==11.0.0
 cashfree-pg==4.2.0
 cloudinary==1.41.0
 razorpay==1.4.1
-setuptools
+# razorpay 1.4.1 imports pkg_resources, which setuptools 81+ no longer ships.
+# Unpinned, a fresh install gets the latest and the server crashes at import.
+setuptools<81
 twilio==9.8.6

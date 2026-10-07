@@ -1,3 +1,4 @@
+import { useCreatorVideo } from "./useCreatorVideo";
 // Browsing page
 import { useState, useRef, useEffect } from "react";
 import { Link, useNavigate } from "react-router";
@@ -118,16 +119,7 @@ function CreatorCard({
   const [muted,  setMuted]    = useState(true);
   const [hovered,setHovered]  = useState(false);
 
-  useEffect(() => {
-    const el=videoRef.current, con=cardRef.current;
-    if (!el||!con) return;
-    const obs=new IntersectionObserver(
-      ([e])=>{ e.isIntersecting ? el.play().catch(()=>{}) : el.pause(); },
-      {threshold:0.2}
-    );
-    obs.observe(con);
-    return ()=>obs.disconnect();
-  },[]);
+  useCreatorVideo(videoRef, cardRef, creator.videoUrl);
 
   useEffect(()=>{ if(videoRef.current) videoRef.current.muted=muted; },[muted]);
 
@@ -158,8 +150,8 @@ function CreatorCard({
           background:`linear-gradient(135deg,${c1},${c2})`,
         }}/>
         {/* Video */}
-        <video ref={videoRef} autoPlay muted loop playsInline preload="auto"
-          onCanPlay={()=>setLoaded(true)}
+        <video ref={videoRef} muted={muted} loop playsInline preload="metadata"
+          onLoadedData={()=>setLoaded(true)}
           style={{
             position:"absolute",inset:0,width:"100%",height:"100%",
             objectFit:"cover",
@@ -167,7 +159,7 @@ function CreatorCard({
             transform: hovered?"scale(1.05)":"scale(1)",
             transition:"opacity .6s ease, transform .45s ease",
           }}
-        ><source src={creator.videoUrl} type="video/mp4"/></video>
+        ></video>
 
         {/* Gradient overlay */}
         <div style={{position:"absolute",inset:0,background:"linear-gradient(to top,rgba(0,0,0,0.55) 0%,rgba(0,0,0,0.05) 50%,rgba(0,0,0,0.18) 100%)"}}/>

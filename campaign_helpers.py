@@ -4,6 +4,47 @@ Campaign Helper Functions for validation and backward compatibility
 from typing import Dict, Any, List, Optional
 from fastapi import HTTPException
 import urllib.parse
+import re
+
+
+def work_review_metadata(campaign: Dict[str, Any], work: Dict[str, Any]) -> Dict[str, Any]:
+    """Public brief details and requested duration for the submitted asset slot."""
+    keys = (
+        'id', 'title', 'campaign_name', 'brand_name', 'brief_text', 'product_name',
+        'product_description', 'product_category', 'category', 'objectives',
+        'deliverable_items', 'video_format', 'aspect_ratio', 'duration_seconds',
+        'due_date', 'deadline', 'draft_delivery_by', 'final_delivery_by',
+        'usage_rights', 'usage_platforms', 'rights_duration', 'revision_limit',
+    )
+    details = {key: campaign[key] for key in keys if campaign.get(key) is not None}
+    if campaign.get('deliverable_items') and not any(item.get('edited_required') for item in campaign['deliverable_items']):
+        details.pop('final_delivery_by', None)
+    slot = int(work.get('deliverable_index') or 0)
+    offset = 0
+    item = {}
+    for candidate in campaign.get('deliverable_items') or []:
+        quantity = max(1, int(candidate.get('quantity') or 1))
+        if offset <= slot < offset + quantity:
+            item = candidate
+            break
+        offset += quantity
+    text = str(item.get('duration') or '').strip()
+    seconds = None
+    if text:
+        # Preserve a requested range verbatim; seconds is the legacy lower bound.
+        match = re.search(r'\d+(?:\.\d+)?', text)
+        if match:
+            seconds = float(match.group()) * (60 if re.search(r'\bmin(?:ute)?s?\b', text, re.I) else 1)
+    elif campaign.get('duration_seconds'):
+        seconds = float(campaign['duration_seconds'])
+        text = f'{seconds:g} seconds'
+    if seconds is not None and seconds <= 0:
+        seconds, text = None, ''
+    details['duration_seconds'] = seconds
+    details['duration_label'] = text or None
+    if item.get('type'):
+        details['video_format'] = item['type']
+    return {'campaign_details': details, 'duration_label': text or None, 'duration_seconds': seconds}
 
 
 def is_valid_url(url: str) -> bool:
@@ -13,6 +54,19 @@ def is_valid_url(url: str) -> bool:
         return result.scheme in ('http', 'https') and bool(result.netloc)
     except Exception:
         return False
+
+
+def creator_editing_quantity(campaign: Dict[str, Any]) -> int:
+    return sum(int(item.get('quantity') or 1) for item in campaign.get('deliverable_items') or []
+               if item.get('edited_required') and (item.get('edited_by') or 'creator') == 'creator')
+
+
+def creator_editing_fee(creator: Dict[str, Any]) -> float:
+    rate = (creator.get('profile') or {}).get('rate_card') or {}
+    try:
+        return max(0, float(str(rate.get('editing_payout') or 0).replace(',', '')))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _has_value(value: Any) -> bool:
@@ -215,6 +269,11 @@ def normalize_campaign_response(campaign: Dict[str, Any]) -> Dict[str, Any]:
     campaign.setdefault('reference_videos', [])
     campaign.setdefault('mood_images', [])
     campaign.setdefault('usage_platforms', [])
+    if campaign['deliverable_items'] and not any(item.get('edited_required') for item in campaign['deliverable_items']):
+        campaign['final_delivery_by'] = None
+        if campaign.get('draft_delivery_by'):
+            campaign['due_date'] = campaign['draft_delivery_by']
+            campaign['deadline'] = campaign['draft_delivery_by']
 
     # Ensure currency default
     campaign.setdefault('currency', 'INR')
@@ -317,7 +376,9 @@ def get_campaign_completion_percentage(campaign: Dict[str, Any]) -> int:
         sections_complete += 1
 
     # Section 7: Timeline & Budget
-    if (campaign.get('per_video_budget') or campaign.get('budget_max')) and campaign.get('creator_level') and campaign.get('final_delivery_by'):
+    requires_edited = any(item.get('edited_required') for item in campaign.get('deliverable_items') or [])
+    delivery_date = campaign.get('final_delivery_by') if requires_edited else campaign.get('draft_delivery_by') or campaign.get('due_date')
+    if (campaign.get('per_video_budget') or campaign.get('budget_max')) and campaign.get('creator_level') and delivery_date:
         sections_complete += 1
 
     # Section 8: Review & Publish (complete once the brief has been submitted out of draft)

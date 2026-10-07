@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { toast } from 'sonner';
@@ -38,15 +39,15 @@ export default function BrandShortlist() {
     }
   };
 
-  useEffect(() => { fetchShortlist(); }, [id]);
+  useLiveEffect(() => { fetchShortlist(); }, [id]);
 
   const invite = async (creatorId) => {
     if (busy) return;
     setBusy(true);
     try {
       await axios.post(`${API}/campaigns/${id}/shortlist/${creatorId}/invite`, {});
-      toast.success('Private invitation sent');
-      navigate('/messages');
+      toast.success('Brief sent');
+      navigate(`/messages?conv=${encodeURIComponent(creatorId)}`);
     } catch (err) {
       const detail = err.response?.data?.detail;
       toast.error((typeof detail === 'string' ? detail : detail?.message) || 'Failed to invite');
@@ -121,7 +122,7 @@ export default function BrandShortlist() {
 
                 <div className="bsl-actions">
                   <button className="bsl-btn ghost" onClick={() => viewProfile(c.creator_id)}><User size={15} /> View Profile</button>
-                  <button className="bsl-btn primary" disabled={busy || fulfilled} onClick={() => invite(c.creator_id)}><Send size={15} /> Invite to This Brief</button>
+                  <button className="bsl-btn primary" disabled={busy || fulfilled} onClick={() => invite(c.creator_id)}><Send size={15} /> Send a Brief</button>
                   <button className="bsl-btn ghost" disabled={busy} onClick={() => setDismissed((d) => [...d, c.creator_id])}><X size={15} /> Decline</button>
                 </div>
               </div>

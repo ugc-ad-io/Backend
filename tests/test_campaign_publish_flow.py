@@ -187,3 +187,30 @@ async def test_pending_campaigns_include_pending_approval_and_exclude_drafts():
         assert approved["status"] == "active"
     finally:
         await cleanup(business_id)
+
+
+@pytest.mark.asyncio
+async def test_private_draft_stays_private_after_approval():
+    from campaign_models import CampaignDraftCreate
+    business_id = f"{TEST_PREFIX}-brand-{uuid.uuid4()}"
+    creator_id = f"{TEST_PREFIX}-creator-{uuid.uuid4()}"
+    await server.db.users.insert_one({"id": creator_id, "role": "creator", "profile": {"rate_card": {"raw_payout": "1500"}}})
+    try:
+        # The app saves a private brief through /campaigns/draft.
+        response = await server.create_draft(
+            CampaignDraftCreate(title=f"{TEST_PREFIX} private", selected_creator=creator_id, visibility="private"),
+            business_user(business_id),
+        )
+        saved = await server.db.campaigns.find_one({"id": response["campaign_id"]}, {"_id": 0})
+        assert saved["visibility"] == "private"
+        assert saved["selected_creator"] == creator_id
+        assert saved["budget_max"] == 1500  # creator's price, not the client's
+
+        await server.db.campaigns.update_one({"id": saved["id"]}, {"$set": {"status": "active"}})
+        other = {"id": f"{TEST_PREFIX}-other", "role": "creator"}
+        invited = {"id": creator_id, "role": "creator"}
+        assert saved["id"] not in [c["id"] for c in await server.get_campaigns(current_user=other)]
+        assert saved["id"] in [c["id"] for c in await server.get_campaigns(current_user=invited)]
+    finally:
+        await server.db.users.delete_one({"id": creator_id})
+        await cleanup(business_id)

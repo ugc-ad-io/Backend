@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { toast } from 'sonner';
+import * as AlertDialog from '@radix-ui/react-alert-dialog';
 import { AlertTriangle, Check, ChevronLeft, ChevronRight, FileText, Info, Plus, Save, Send, Trash2, Upload } from 'lucide-react';
 import { useAuth } from '../App';
 
@@ -20,7 +21,7 @@ const LISTING_FEE_LARGE = 3000;   // 11+ creators (server.py LARGE_CAMPAIGN_MIN_
 const MAX_CREATORS = 20;          // same cap as the app's stepper
 
 const STEPS = [
-  'Campaign Basics',
+  'Campaign Overview',
   'Deliverables',
   'Must-Include',
   'Must-Avoid',
@@ -72,6 +73,7 @@ const initialForm = {
   brandName: '',
   category: '',
   productName: '',
+  requiresShipment: false,
   productDescription: '',
   campaignHook: '',
   keyMessage: '',
@@ -113,6 +115,7 @@ const initialForm = {
   finalDeliveryBy: '',
   budgetMode: 'fixed',
   fixedBudget: '',
+  editingFee: '',
   creatorsWanted: 1,
   budgetMin: '',
   budgetMax: '',
@@ -154,18 +157,22 @@ const addDays = (dateString, days) => {
 
 export default function PostABrief() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const privateCreatorId = searchParams.get('creator');
   const { user } = useAuth();
   const [step, setStep] = useState(1);
   const [form, setForm] = useState(initialForm);
   const [submitting, setSubmitting] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
+  const [showReview, setShowReview] = useState(false);
   const [publishMode, setPublishMode] = useState('matches');
   const [draftSavedAt, setDraftSavedAt] = useState('');
-  const [campaignId, setCampaignId] = useState(() => localStorage.getItem(DRAFT_ID_KEY) || null);
+  const [campaignId, setCampaignId] = useState(() => privateCreatorId ? null : localStorage.getItem(DRAFT_ID_KEY) || null);
   const persistRef = useRef(null);
   const autosaveTimer = useRef(null);
 
   useEffect(() => {
+    if (privateCreatorId) return;
     const saved = localStorage.getItem(DRAFT_KEY);
     if (saved) {
       try {
@@ -190,8 +197,20 @@ export default function PostABrief() {
   }, [user?.id]);
 
   useEffect(() => {
-    localStorage.setItem(DRAFT_KEY, JSON.stringify(form));
-  }, [form]);
+    if (!privateCreatorId) localStorage.setItem(DRAFT_KEY, JSON.stringify(form));
+  }, [form, privateCreatorId]);
+
+  useEffect(() => {
+    if (!privateCreatorId) return;
+    let active = true;
+    axios.get(`${API}/profile/${encodeURIComponent(privateCreatorId)}`).then(({ data }) => {
+      if (!active) return;
+      const rate = data.profile?.rate_card || {};
+      const raw = Number(String(data.raw_video_payout || rate.raw_payout || rate.expected_payout || 0).replace(/[^\d.]/g, ''));
+      setForm(current => ({ ...current, creatorsWanted: 1, budgetMode: 'fixed', fixedBudget: String(raw || ''), editingFee: String(rate.editing_payout || 0) }));
+    }).catch(() => toast.error('Unable to load creator rates'));
+    return () => { active = false; };
+  }, [privateCreatorId]);
 
   // Debounced server-side autosave: persists the draft to the backend a few
   // seconds after the brand stops editing.
@@ -220,13 +239,15 @@ export default function PostABrief() {
   const anyEdited = form.deliverables.some(item => item.editedRequired);
   const creatorsCount = Math.min(MAX_CREATORS, Math.max(1, Number(form.creatorsWanted) || 1));
   const totalVideos = totalQuantity * creatorsCount;
-  const budgetTotal = budget * totalVideos;
+  const editedQuantity = form.deliverables.reduce((sum, item) => sum + (item.editedRequired && item.editedBy !== 'ugc' ? Number(item.quantity) || 1 : 0), 0);
+  const editingTotal = Math.max(0, Number(form.editingFee) || 0) * editedQuantity * creatorsCount;
+  const budgetTotal = budget * totalVideos + editingTotal;
   const listingFee = creatorsCount >= 11 ? LISTING_FEE_LARGE
     : (creatorsCount > 1 || totalQuantity > 1) ? LISTING_FEE_MULTI : LISTING_FEE;
   const commission = Math.round(budgetTotal * COMMISSION_RATE);
   const totalDebit = budgetTotal + commission + listingFee;
   const paidAdsSelected = form.platforms.some(platform => platform.toLowerCase().includes('paid ads'));
-  const draftDeliverySuggestion = useMemo(() => addDays(form.productShippingBy, 7), [form.productShippingBy]);
+  const draftDeliverySuggestion = useMemo(() => form.requiresShipment ? addDays(form.productShippingBy, 7) : '', [form.requiresShipment, form.productShippingBy]);
   const pricingLifts = [
     form.rightsDuration === 'Perpetual' ? 'Perpetual rights: +40% suggested' : '',
     form.whitelisting ? 'Whitelisting enabled: +30% suggested' : '',
@@ -235,8 +256,8 @@ export default function PostABrief() {
   ].filter(Boolean);
 
   const finalDeliverySuggestion = useMemo(() => {
-    return addDays(form.draftDeliveryBy, Math.max(1, Number(form.revisions || 0) * 2));
-  }, [form.draftDeliveryBy, form.revisions]);
+    return anyEdited ? addDays(form.draftDeliveryBy, Math.max(1, Number(form.revisions || 0) * 2)) : '';
+  }, [anyEdited, form.draftDeliveryBy, form.revisions]);
 
   useEffect(() => {
     if (!form.draftDeliveryBy && draftDeliverySuggestion) {
@@ -285,7 +306,7 @@ export default function PostABrief() {
     if (target === 4) return form.avoidText.length <= 200;
     if (target === 5) return form.tones.length > 0 && form.pacing;
     if (target === 6) return form.platforms.length > 0 && form.rightsDuration && form.exclusivity && form.modificationRights;
-    if (target === 7) return form.productShippingBy && form.draftDeliveryBy && (!anyEdited || form.finalDeliveryBy) && budget > 0 && form.creatorLevel && form.qualityTier;
+    if (target === 7) return (!form.requiresShipment || form.productShippingBy) && form.draftDeliveryBy && (!anyEdited || form.finalDeliveryBy) && budget > 0 && form.creatorLevel && form.qualityTier;
     return true;
   };
 
@@ -347,7 +368,7 @@ export default function PostABrief() {
       `Style guidance: tones ${form.tones.join(', ')}; pacing ${form.pacing}; music ${form.musicPreference}; references ${form.referenceVideos.filter(Boolean).join(', ') || 'none'}`,
       `Usage rights: platforms ${form.platforms.join(', ')}; duration ${form.rightsDuration}; exclusivity ${form.exclusivity}; whitelisting ${form.whitelisting ? 'yes' : 'no'}; modification ${form.modificationRights}`,
       `Creator targeting: level ${form.creatorLevel}; quality ${form.qualityTier}; gender ${form.genderPreference}; city ${form.cityFilter}; niches ${form.nicheTags.join(', ') || 'none'}`,
-      `Timeline: ship by ${form.productShippingBy}; draft by ${form.draftDeliveryBy}; revisions ${form.revisions}; final by ${form.finalDeliveryBy}`,
+      `Timeline: ${form.requiresShipment ? `ship by ${form.productShippingBy}` : 'no shipment required'}; ${anyEdited ? 'draft' : 'content delivery'} by ${form.draftDeliveryBy}; revisions ${form.revisions}${anyEdited ? `; final by ${form.finalDeliveryBy}` : ''}`,
       `Budget: ${form.budgetMode === 'fixed' ? `fixed Rs. ${form.fixedBudget}` : `range Rs. ${form.budgetMin} - Rs. ${form.budgetMax}`}`,
       `Commission: platform 20%, total wallet debit Rs. ${totalDebit} (Rs. ${budget} per video x ${totalVideos} videos, ${creatorsCount} creator(s)), each creator receives Rs. ${budget * totalQuantity} pre-tax`
     ].join('\n');
@@ -361,11 +382,11 @@ export default function PostABrief() {
         budget_min: form.budgetMode === 'fixed' ? budget : Number(form.budgetMin || 0),
         budget_max: budget,
         objectives: form.objectives,
-        requires_shipment: true,
-        shipment_required: true,
-        shipment_option: 'yes',
-        due_date: form.finalDeliveryBy,
-        deadline: form.finalDeliveryBy,
+        requires_shipment: form.requiresShipment,
+        shipment_required: form.requiresShipment,
+        shipment_option: form.requiresShipment ? 'yes' : 'no',
+        due_date: anyEdited ? form.finalDeliveryBy : form.draftDeliveryBy,
+        deadline: anyEdited ? form.finalDeliveryBy : form.draftDeliveryBy,
         revision_limit: Number(form.revisions || 0),
         product_name: form.productName,
         product_category: form.category,
@@ -387,14 +408,16 @@ export default function PostABrief() {
         city_filter: form.cityFilter,
         creator_niche_tags: form.nicheTags,
         per_video_budget: budget,
+        editing_fee_per_video: Math.max(0, Number(form.editingFee) || 0),
         // How many creators this brief hires; the backend reserves budget for each and
         // keeps the brief open until all are hired. Without it every web brief was 1-creator.
         creators_wanted: creatorsCount,
-        total_budget: budget,
+        total_budget: budgetTotal,
+        ...(privateCreatorId ? { selected_creator: privateCreatorId, visibility: 'private' } : {}),
         currency: 'INR',
 
         // --- Structured brief sections (full persistence, no data loss) ---
-        // Section 1: Campaign Basics (extra)
+        // Section 1: Campaign Overview (extra)
         target_audience: form.targetAudience,
         budget_visible: form.budgetVisible,
 
@@ -445,9 +468,9 @@ export default function PostABrief() {
         modification_rights: form.modificationRights,
 
         // Section 7: Timeline & Budget (extra)
-        product_shipping_by: form.productShippingBy,
+        product_shipping_by: form.requiresShipment ? form.productShippingBy : '',
         draft_delivery_by: form.draftDeliveryBy,
-        final_delivery_by: form.finalDeliveryBy,
+        final_delivery_by: anyEdited ? form.finalDeliveryBy : '',
         budget_mode: form.budgetMode
     };
   };
@@ -455,7 +478,7 @@ export default function PostABrief() {
   // Persist a draft to the backend so it survives device switches and appears
   // in the brand's dashboard. First save creates the campaign; later saves PATCH it.
   const persistDraft = async ({ silent = false } = {}) => {
-    if (submitting) return;
+    if (submitting || showReview) return;
     // Don't create empty server drafts on autosave
     if (!form.campaignName.trim() && !form.productName.trim()) return;
     try {
@@ -467,7 +490,7 @@ export default function PostABrief() {
         const newId = res.data?.campaign_id;
         if (newId) {
           setCampaignId(newId);
-          localStorage.setItem(DRAFT_ID_KEY, newId);
+          if (!privateCreatorId) localStorage.setItem(DRAFT_ID_KEY, newId);
         }
       }
       setDraftSavedAt(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
@@ -478,11 +501,12 @@ export default function PostABrief() {
   };
 
   const publish = async () => {
+    if (submitting || showReview) return;
     try {
       setSubmitting(true);
       // Path B (Request Matches) flags the brief for an ops-curated shortlist;
       // Path A (Invite Creator) is a direct private invitation, no match request.
-      const matchRequested = publishMode === 'matches';
+      const matchRequested = !privateCreatorId && publishMode === 'matches';
       const body = { ...buildPayload(), match_requested: matchRequested };
       let response;
       if (campaignId) {
@@ -494,10 +518,15 @@ export default function PostABrief() {
       }
       localStorage.removeItem(DRAFT_KEY);
       localStorage.removeItem(DRAFT_ID_KEY);
+      clearTimeout(autosaveTimer.current);
       setCampaignId(null);
       const submitted = response.data?.status === 'pending_approval';
-      toast.success(submitted ? 'Brief submitted for admin approval' : 'Brief saved as draft');
-      navigate(publishMode === 'invite' ? '/dashboard/business/pending-bids' : '/dashboard/business');
+      if (submitted) {
+        setShowReview(true);
+      } else {
+        toast.success('Brief saved as draft');
+        navigate(publishMode === 'invite' ? '/dashboard/business/pending-bids' : '/dashboard/business');
+      }
     } catch (error) {
       toast.error(extractError(error) || 'Failed to publish brief');
     } finally {
@@ -559,6 +588,14 @@ export default function PostABrief() {
 
             {step === 1 && (
               <>
+                <div className="form-group">
+                  <label htmlFor="brief-shipment">Does the creator need a product shipped?</label>
+                  <select id="brief-shipment" className="input-field" value={form.requiresShipment ? 'yes' : 'no'} onChange={e => set('requiresShipment', e.target.value === 'yes')}>
+                    <option value="no">No — digital product, service, or no shipment needed</option>
+                    <option value="yes">Yes — ship a physical product to the creator</option>
+                  </select>
+                  <small>Choose Yes only when the creator needs a physical delivery before creating content.</small>
+                </div>
                 <div className="form-group"><label>Campaign name *</label><input className="input-field" value={form.campaignName} onChange={e => set('campaignName', e.target.value.slice(0, 80))} placeholder="Summer Launch - Unboxing 2" /><small>{form.campaignName.length}/80 characters</small></div>
                 <div className="form-row">
                   <div className="form-group"><label>Brand name</label><input className="input-field" value={form.brandName} disabled /></div>
@@ -669,27 +706,30 @@ export default function PostABrief() {
                   </div>
                   <div className="form-group"><label>Creator niche tags</label><div className="brief-chip-grid">{NICHE_TAGS.map(item => <ToggleChip key={item} active={form.nicheTags.includes(item)} onClick={() => toggleArray('nicheTags', item)}>{item}</ToggleChip>)}</div></div>
                 </div>
-                <div className="form-row"><div className="form-group"><label>Product shipping by *</label><input className="input-field" type="date" value={form.productShippingBy} onChange={e => set('productShippingBy', e.target.value)} /></div><div className="form-group"><label>{anyEdited ? 'Content draft delivery by *' : 'Content delivery by *'}</label><input className="input-field" type="date" value={form.draftDeliveryBy} onChange={e => set('draftDeliveryBy', e.target.value)} /><small>{draftDeliverySuggestion ? `Suggested from shipping date: ${draftDeliverySuggestion}` : 'Suggested as product shipping + 7 days.'}</small></div></div>
+                <div className="form-row">{form.requiresShipment && <div className="form-group"><label>Product shipping by *</label><input className="input-field" type="date" value={form.productShippingBy} onChange={e => set('productShippingBy', e.target.value)} /></div>}<div className="form-group"><label>{anyEdited ? 'Content draft delivery by *' : 'Content delivery by *'}</label><input className="input-field" type="date" value={form.draftDeliveryBy} onChange={e => set('draftDeliveryBy', e.target.value)} />{form.requiresShipment && <small>{draftDeliverySuggestion ? `Suggested from shipping date: ${draftDeliverySuggestion}` : 'Suggested as product shipping + 7 days.'}</small>}</div></div>
                 <div className="form-row">
                   <div className="form-group"><label>Revisions included *</label><input className="input-field" type="number" min="0" value={form.revisions} onChange={e => set('revisions', Number(e.target.value))} /><small>Extra revisions: Rs. 500 each (Rs. 300 creator, Rs. 200 platform)</small></div>
                   {anyEdited && <div className="form-group"><label>Final content delivery by</label><input className="input-field" type="date" value={form.finalDeliveryBy} onChange={e => set('finalDeliveryBy', e.target.value)} /></div>}
                 </div>
                 <div className="form-group"><label>Budget *</label><div className="brief-segment"><button className={form.budgetMode === 'fixed' ? 'active' : ''} type="button" onClick={() => set('budgetMode', 'fixed')}>Fixed amount</button><button className={form.budgetMode === 'range' ? 'active' : ''} type="button" onClick={() => set('budgetMode', 'range')}>Range</button></div></div>
-                {form.budgetMode === 'fixed' ? <div className="form-group"><label>Fixed budget (Rs.)</label><input className="input-field" type="number" value={form.fixedBudget} onChange={e => set('fixedBudget', e.target.value)} /></div> : <div className="form-row"><div className="form-group"><label>Min budget (Rs.)</label><input className="input-field" type="number" value={form.budgetMin} onChange={e => set('budgetMin', e.target.value)} /></div><div className="form-group"><label>Max budget (Rs.)</label><input className="input-field" type="number" value={form.budgetMax} onChange={e => set('budgetMax', e.target.value)} /></div></div>}
+                {form.budgetMode === 'fixed' ? <div className="form-group"><label>Raw budget per video (₹)</label><input className="input-field" type="number" readOnly={Boolean(privateCreatorId)} value={form.fixedBudget} onChange={e => set('fixedBudget', e.target.value)} /></div> : <div className="form-row"><div className="form-group"><label>Minimum raw budget per video (₹)</label><input className="input-field" type="number" value={form.budgetMin} onChange={e => set('budgetMin', e.target.value)} /></div><div className="form-group"><label>Maximum raw budget per video (₹)</label><input className="input-field" type="number" value={form.budgetMax} onChange={e => set('budgetMax', e.target.value)} /></div></div>}
                 <div className="form-group">
                   <label>Number of creators *</label>
-                  <input className="input-field" type="number" min="1" max={MAX_CREATORS} value={form.creatorsWanted} onChange={e => set('creatorsWanted', e.target.value)} onBlur={() => set('creatorsWanted', creatorsCount)} />
+                  <input className="input-field" type="number" min="1" max={privateCreatorId ? 1 : MAX_CREATORS} disabled={Boolean(privateCreatorId)} value={form.creatorsWanted} onChange={e => set('creatorsWanted', e.target.value)} onBlur={() => set('creatorsWanted', creatorsCount)} />
                   <small>How many creators you want to hire for this brief. Each creator delivers every deliverable above. Max {MAX_CREATORS}.</small>
                 </div>
+                {editedQuantity > 0 && <div className="form-group"><label>Additional creator editing payout per video (₹)</label><input className="input-field" type="number" min="0" readOnly={Boolean(privateCreatorId)} value={form.editingFee} onChange={e => set('editingFee', e.target.value)} placeholder="1000" /><small>Added only for videos edited by the creator.</small></div>}
                 <div className="brief-note"><Info size={18} /> Rush delivery is not available in V0.5.</div>
                 <div className="commission-card">
                   <p>Budget per video <strong>Rs. {budget.toLocaleString('en-IN')}</strong></p>
                   {totalVideos > 1 && <p>Total videos ({totalQuantity} x {creatorsCount} creator{creatorsCount === 1 ? '' : 's'}) <strong>{totalVideos}</strong></p>}
+                  <p>Raw videos: Rs. {budget.toLocaleString('en-IN')} × {totalQuantity} videos × {creatorsCount} creator(s)</p>
+                  {editedQuantity > 0 && <p>Creator editing: Rs. {Number(form.editingFee || 0).toLocaleString('en-IN')} × {editedQuantity} videos × {creatorsCount} creator(s) <strong>Rs. {editingTotal.toLocaleString('en-IN')}</strong></p>}
                   <p>Total budget <strong>Rs. {budgetTotal.toLocaleString('en-IN')}</strong></p>
                   <p>Platform commission (20%) <strong>Rs. {commission.toLocaleString('en-IN')}</strong></p>
                   <p>Listing fee (one-time) <strong>Rs. {listingFee.toLocaleString('en-IN')}</strong></p>
                   <p>Total wallet debit <strong>Rs. {totalDebit.toLocaleString('en-IN')}</strong></p>
-                  <p>Each creator receives on approval <strong>Rs. {(budget * totalQuantity).toLocaleString('en-IN')}</strong></p>
+                  <p>Each creator receives on approval <strong>Rs. {(budgetTotal / creatorsCount).toLocaleString('en-IN')}</strong></p>
                   <small>Creator amount is pre-tax. TDS may apply.</small>
                 </div>
               </>
@@ -697,14 +737,14 @@ export default function PostABrief() {
 
             {step === 8 && (
               <div className="review-summary">
-                <Summary title="Campaign Basics" rows={[['Campaign', form.campaignName], ['Brand', form.brandName], ['Category', form.category], ['Product', form.productName], ['Product description', form.productDescription], ['Hook', form.campaignHook], ['Key message', form.keyMessage], ['Objectives', form.objectives.join(', ')], ['Audience', form.targetAudience], ['Budget visibility', form.budgetVisible ? 'Visible to creators' : 'Hidden from creators; flagged to admin']]} />
+                <Summary title="Campaign Overview" rows={[['Campaign', form.campaignName], ['Brand', form.brandName], ['Category', form.category], ['Product', form.productName], ['Product description', form.productDescription], ['Hook', form.campaignHook], ['Key message', form.keyMessage], ['Objectives', form.objectives.join(', ')], ['Audience', form.targetAudience], ['Budget visibility', form.budgetVisible ? 'Visible to creators' : 'Hidden from creators; flagged to admin']]} />
                 <Summary title="Deliverables" rows={form.deliverables.map((item, index) => [`Deliverable ${index + 1}`, `${item.quantity} x ${item.type}; ${item.duration || 'no duration'}; ${item.aspectRatios.join(', ')}; raw files ${item.rawRequired ? 'required' : 'not required'}`])} />
                 <Summary title="Must-Include Checklist" rows={[['Product visible', form.productVisible ? `${form.visibilitySeconds}s minimum` : 'No'], ['Verbal mention', form.verbalMention ? form.productNames : 'No'], ['Required phrases', requiredPhrases], ['Required shots', requiredShots], ['CTA', form.callToAction], ['Promo code', form.promoCode || 'None'], ['Required hashtags', form.hashtags || 'None'], ['Brand tag', form.brandHandleTag ? 'Yes' : 'No']]} />
                 <Summary title="Must-Avoid Checklist" rows={[['Restrictions', avoidRules]]} />
                 <Summary title="Style Guidance" rows={[['Tone', form.tones.join(', ')], ['Pacing', form.pacing], ['Mood board images', form.moodImages.join(', ') || 'None'], ['Reference videos', referenceVideos], ['Music preference', form.musicPreference], ['Note', 'Guidance only; not grounds for dispute.']]} />
                 <Summary title="Usage Rights" rows={[['Platforms', form.platforms.join(', ')], ['Rights duration', form.rightsDuration], ['Exclusivity', form.exclusivity], ['Whitelisting', form.whitelisting ? 'Yes' : 'No'], ['Modification', form.modificationRights]]} />
                 <Summary title="Creator Targeting" rows={[['Minimum level', form.creatorLevel], ['Quality tier', form.qualityTier], ['Gender preference', form.genderPreference], ['City filter', form.cityFilter], ['Niche tags', form.nicheTags.join(', ') || 'None']]} />
-                <Summary title="Timeline & Budget" rows={[['Ship by', form.productShippingBy], ['Draft by', form.draftDeliveryBy], ['Revisions included', form.revisions], ...(anyEdited ? [['Final by', form.finalDeliveryBy]] : []), ['Budget per video', form.budgetMode === 'fixed' ? `Rs. ${budget.toLocaleString('en-IN')}` : `Rs. ${Number(form.budgetMin || 0).toLocaleString('en-IN')} - Rs. ${budget.toLocaleString('en-IN')}`], ...(creatorsCount > 1 ? [['Creators', String(creatorsCount)]] : []), ...(totalVideos > 1 ? [['Total videos', String(totalVideos)], ['Total budget', `Rs. ${budgetTotal.toLocaleString('en-IN')}`]] : []), ['Platform commission (20%)', `Rs. ${commission.toLocaleString('en-IN')}`], ['Listing fee', `Rs. ${listingFee.toLocaleString('en-IN')}`], ['Total wallet debit', `Rs. ${totalDebit.toLocaleString('en-IN')}`]]} />
+                <Summary title="Timeline & Budget" rows={[['Shipment', form.requiresShipment ? 'Required' : 'Not required'], ...(form.requiresShipment ? [['Ship by', form.productShippingBy]] : []), [anyEdited ? 'Raw video by' : 'Content delivery by', form.draftDeliveryBy], ['Revisions included', form.revisions], ...(anyEdited ? [['Final by', form.finalDeliveryBy]] : []), ['Budget per video', form.budgetMode === 'fixed' ? `Rs. ${budget.toLocaleString('en-IN')}` : `Rs. ${Number(form.budgetMin || 0).toLocaleString('en-IN')} - Rs. ${budget.toLocaleString('en-IN')}`], ...(creatorsCount > 1 ? [['Creators', String(creatorsCount)]] : []), ...(totalVideos > 1 ? [['Total videos', String(totalVideos)], ['Total budget', `Rs. ${budgetTotal.toLocaleString('en-IN')}`]] : []), ['Raw video calculation', `Rs. ${budget} × ${totalQuantity} videos × ${creatorsCount} creator(s)`], ...(editedQuantity > 0 ? [['Creator editing', `Rs. ${Number(form.editingFee || 0)} × ${editedQuantity} videos × ${creatorsCount} creator(s) = Rs. ${editingTotal}`]] : []), ['Platform commission (20%)', `Rs. ${commission.toLocaleString('en-IN')}`], ['Listing fee', `Rs. ${listingFee.toLocaleString('en-IN')}`], ['Total wallet debit', `Rs. ${totalDebit.toLocaleString('en-IN')}`]]} />
               </div>
             )}
           </div>
@@ -741,6 +781,7 @@ export default function PostABrief() {
               <div className="summary-item"><span>Budget per video</span><strong>Rs. {budget.toLocaleString('en-IN')}</strong></div>
               {creatorsCount > 1 && <div className="summary-item"><span>Creators</span><strong>{creatorsCount}</strong></div>}
               {totalVideos > 1 && <div className="summary-item"><span>Total videos</span><strong>{totalVideos}</strong></div>}
+              {editedQuantity > 0 && <div className="summary-item"><span>Creator editing</span><strong>Rs. {editingTotal.toLocaleString('en-IN')}</strong></div>}
               <div className="summary-item"><span>Total budget</span><strong>Rs. {budgetTotal.toLocaleString('en-IN')}</strong></div>
               <div className="summary-item"><span>Commission (20%)</span><strong>Rs. {commission.toLocaleString('en-IN')}</strong></div>
               <div className="summary-item"><span>Listing fee</span><strong>Rs. {listingFee.toLocaleString('en-IN')}</strong></div>
@@ -767,6 +808,24 @@ export default function PostABrief() {
           </div>
         </div>
       )}
+
+      <AlertDialog.Root open={showReview}>
+        <AlertDialog.Portal>
+          <AlertDialog.Overlay className="brief-modal-backdrop">
+            <AlertDialog.Content className="brief-modal">
+              <AlertDialog.Title asChild><h3>Brief under review</h3></AlertDialog.Title>
+              <AlertDialog.Description asChild>
+                <p>Your campaign brief has been submitted successfully and is awaiting admin approval.</p>
+              </AlertDialog.Description>
+              <div>
+                <AlertDialog.Action asChild>
+                  <button type="button" className="btn-primary" onClick={() => navigate(publishMode === 'invite' ? '/dashboard/business/pending-bids' : '/dashboard/business')}>Got it</button>
+                </AlertDialog.Action>
+              </div>
+            </AlertDialog.Content>
+          </AlertDialog.Overlay>
+        </AlertDialog.Portal>
+      </AlertDialog.Root>
 
       <style jsx>{`
         .brief-builder-page {

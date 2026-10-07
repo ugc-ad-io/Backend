@@ -1,3 +1,4 @@
+import { useLiveEffect } from "../lib/liveUpdates";
 import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../App';
@@ -249,7 +250,7 @@ function BrowseBriefsPanel({ campaigns, myBids, loading, onView, onPitch }) {
     foodBeverage: false,
   });
 
-  useEffect(() => {
+  useLiveEffect(() => {
     fetchPayoutRanges();
   }, []);
 

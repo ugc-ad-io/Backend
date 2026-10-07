@@ -14,6 +14,9 @@ export default function Auth() {
   const [role, setRole] = useState('creator');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [name, setName] = useState('');
+  const [website, setWebsite] = useState('');
+  const [phone, setPhone] = useState('');
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
   const { login, setUser } = useAuth();
@@ -24,7 +27,7 @@ export default function Auth() {
 
     try {
       const endpoint = isLogin ? '/auth/login' : '/auth/signup';
-      const payload = isLogin ? { email, password } : { email, password, role };
+      const payload = isLogin ? { email, password } : { email, password, role, name: name.trim(), phone, dial_code: '+91', ...(role === 'business' ? { website: website.trim() } : {}) };
 
       const response = await axios.post(`${API}${endpoint}`, payload);
       const { token, ...userData } = response.data;
@@ -198,6 +201,11 @@ export default function Auth() {
             />
           </motion.div>
 
+          {!isLogin && <>
+            <div className="ap-field"><label className="ap-label" htmlFor="signup-name">{role === 'business' ? 'Brand name' : 'Your name'}</label><input id="signup-name" className="input-field" value={name} onChange={event => setName(event.target.value)} required /></div>
+            {role === 'business' && <div className="ap-field"><label className="ap-label" htmlFor="signup-website">Brand website</label><input id="signup-website" className="input-field" type="url" value={website} onChange={event => setWebsite(event.target.value)} placeholder="https://yourbrand.com" /></div>}
+            <div className="ap-field"><label className="ap-label" htmlFor="signup-phone">Mobile number (+91)</label><input id="signup-phone" className="input-field" type="tel" value={phone} onChange={event => setPhone(event.target.value)} required /></div>
+          </>}
           {/* Submit */}
           <motion.button
             type="submit"

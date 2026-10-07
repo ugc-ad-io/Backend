@@ -35,6 +35,7 @@ import {
 } from 'lucide-react';
 import { EmptyPanel, formatMoney, getInitial } from '../components/CreatorComponents';
 import DashboardLayout from '../components/DashboardLayout';
+import CompletionReview from '../components/CompletionReview';
 import './CreatorDashboard.css';
 import './MyDealsPage.css';
 
@@ -226,6 +227,7 @@ export default function MyDealsPage() {
   const [message, setMessage] = useState('');
   const [messageAttachments, setMessageAttachments] = useState([]);
   const [finalVideoUrl, setFinalVideoUrl] = useState(null);
+  const [deliverableIndex, setDeliverableIndex] = useState(0);
   const [captionUrl, setCaptionUrl] = useState(null);
   const [thumbnailUrl, setThumbnailUrl] = useState(null);
   const [rawFootageUrl, setRawFootageUrl] = useState(null);
@@ -252,6 +254,10 @@ export default function MyDealsPage() {
 
   useEffect(() => {
     if (user?.id) fetchDeals();
+    const refresh = () => { if (user?.id && document.visibilityState === 'visible') fetchDeals(); };
+    const interval = setInterval(refresh, 30000);
+    window.addEventListener('focus', refresh);
+    return () => { clearInterval(interval); window.removeEventListener('focus', refresh); };
   }, [user?.id]);
 
   const fetchDeals = async () => {
@@ -263,12 +269,22 @@ export default function MyDealsPage() {
         if (!list.length) return null;
         return list.find((item) => getDealId(item) === getDealId(current)) || list[0];
       });
+      return true;
     } catch (error) {
       toast.error('Failed to load deals');
+      return false;
     } finally {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    setFinalVideoUrl(null);
+    setCaptionUrl(null);
+    setThumbnailUrl(null);
+    setRawFootageUrl(null);
+    setDeliverableIndex(0);
+  }, [selectedDeal?.deal_id]);
 
   const handleFileUpload = async (file, setUrlFn, fileType) => {
     if (!file) return;
@@ -323,6 +339,7 @@ export default function MyDealsPage() {
     setSubmitting(true);
     try {
       await axios.post(`${API}/deals/${selectedDeal.deal_id}/content`, {
+        deliverable_index: deliverableIndex,
         video_url: finalVideoUrl,
         caption_url: captionUrl,
         thumbnail_url: thumbnailUrl,
@@ -330,11 +347,12 @@ export default function MyDealsPage() {
         creator_note: 'Submitted from creator deal room'
       });
       toast.success('Content submitted for brand review');
-      setFinalVideoUrl(null);
-      setCaptionUrl(null);
-      setThumbnailUrl(null);
-      setRawFootageUrl(null);
-      fetchDeals();
+      if (await fetchDeals()) {
+        setFinalVideoUrl(null);
+        setCaptionUrl(null);
+        setThumbnailUrl(null);
+        setRawFootageUrl(null);
+      }
     } catch (err) {
       toast.error(err.response?.data?.detail || 'Submission failed');
     } finally {
@@ -535,6 +553,7 @@ export default function MyDealsPage() {
           />
 
           <main className="deal-workspace">
+            <CompletionReview key={selectedDeal?.deal_id} deal={selectedDeal} />
             <DealCard className="deal-brief-card">
               <button type="button" className="deal-brief-toggle" onClick={() => setBriefOpen((value) => !value)}>
                 <span><FileText size={18} /></span>
@@ -599,6 +618,14 @@ export default function MyDealsPage() {
               </DealCard>
             ) : (
               <ContentSubmission
+                deliverableIndex={deliverableIndex}
+                onSelectDeliverable={(index) => {
+                  setDeliverableIndex(index);
+                  setFinalVideoUrl(null);
+                  setCaptionUrl(null);
+                  setThumbnailUrl(null);
+                  setRawFootageUrl(null);
+                }}
                 deal={selectedDeal}
                 finalVideoUrl={finalVideoUrl}
                 captionUrl={captionUrl}
@@ -764,6 +791,8 @@ function ShippingBlock({ deal, unboxingVideoUrl, onUpload, onSubmitReceipt, uplo
 }
 
 function ContentSubmission({
+  deliverableIndex,
+  onSelectDeliverable,
   deal,
   finalVideoUrl,
   captionUrl,
@@ -781,6 +810,9 @@ function ContentSubmission({
   const content = deal?.content_submission || {};
   const required = getRequiredAssets(deal);
   const versions = content.versions || [];
+  const requiredCount = content.required_count || Math.max(1, (deal?.campaign?.deliverable_items || []).reduce((sum, item) => sum + Number(item.quantity || 1), 0));
+  const uploadedSlots = new Set(versions.filter(version => version.video_url).map(version => version.deliverable_index || 0));
+  if (finalVideoUrl) uploadedSlots.add(deliverableIndex);
   const needsCaption = Boolean(required.caption_script);
   const needsThumbnail = Boolean(required.thumbnail);
   const needsRaw = Boolean(required.raw_footage);
@@ -793,6 +825,12 @@ function ContentSubmission({
         <div><h2>Content Submission</h2><p>{content.watermark_required_until_approval ? 'Watermarked preview until brand approval' : 'Brand approval rules loaded'}</p></div>
       </div>
       {content.watermark_required_until_approval && <div className="deal-watermark">Watermarked preview until brand approval</div>}
+      <p aria-live="polite">Deliverables uploaded: <strong>{Math.min(requiredCount, uploadedSlots.size)}/{requiredCount}</strong></p>
+      {requiredCount > 1 && <label>Deliverable
+        <select value={deliverableIndex} onChange={event => onSelectDeliverable(Number(event.target.value))} disabled={Boolean(uploadingFile) || submitting}>
+          {Array.from({ length: requiredCount }, (_, index) => <option key={index} value={index}>Deliverable {index + 1}</option>)}
+        </select>
+      </label>}
       <UploadZone icon={Play} label="Final Video Upload" accept="MP4 - MOV" uploaded={Boolean(finalVideoUrl)} onClick={() => document.getElementById('video-file-real').click()} disabled={uploadingFile === 'video'} />
       <input type="file" id="video-file-real" accept="video/*" onChange={(event) => onUpload(event.target.files?.[0], setFinalVideoUrl, 'video')} hidden />
       <div className="deal-asset-grid">
@@ -819,13 +857,19 @@ function ContentSubmission({
         )}
       </div>
       <div className="deal-version-row">
+        {finalVideoUrl && <article>
+          <div className="deal-preview-tile"><video src={getAssetUrl(finalVideoUrl)} controls playsInline preload="metadata" /></div>
+          <strong>Deliverable {deliverableIndex + 1}</strong>
+          <small>Uploaded successfully</small>
+          <span>Ready to submit for review</span>
+        </article>}
         {versions.length ? versions.map((version) => (
-          <article key={version.version}>
+          <article key={version.id || `${version.deliverable_index || 0}-${version.stage || 'final'}-${version.version}`}>
             <div className="deal-preview-tile">
               {version.thumbnail_url ? (
                 <img src={getAssetUrl(version.thumbnail_url)} alt={`v${version.version} thumbnail`} />
               ) : version.video_url ? (
-                <video src={getAssetUrl(version.video_url)} />
+                <video src={getAssetUrl(version.video_url)} controls playsInline preload="metadata" />
               ) : (
                 <Play size={24} />
               )}
@@ -836,11 +880,11 @@ function ContentSubmission({
                 </a>
               )}
             </div>
-            <strong>v{version.version}</strong>
+            <strong>Deliverable {(version.deliverable_index || 0) + 1} · v{version.version}</strong>
             <small>{formatDateTime(version.submitted_at)}</small>
             <span>{version.status}</span>
           </article>
-        )) : <article><strong>v1</strong><small>No upload yet</small><span>Awaiting submission</span></article>}
+        )) : !finalVideoUrl && <article><strong>v1</strong><small>No upload yet</small><span>Awaiting submission</span></article>}
       </div>
       <button type="button" className="deal-submit" disabled={!canSubmit || submitting} onClick={onSubmit}>
         <Upload size={17} /> {submitting ? 'Submitting...' : 'Submit Final Delivery'}

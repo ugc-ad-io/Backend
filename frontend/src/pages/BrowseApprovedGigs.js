@@ -1,3 +1,4 @@
+import { useLiveEffect } from "../lib/liveUpdates";
 import { useState, useEffect } from 'react';
 import { useAuth } from '../App';
 import { useNavigate } from 'react-router-dom';
@@ -78,7 +79,7 @@ export default function BrowseApprovedGigs() {
     { id: 'videography', label: 'Videography' }
   ];
 
-  useEffect(() => {
+  useLiveEffect(() => {
     fetchApprovedGigs();
   }, []);
 

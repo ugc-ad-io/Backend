@@ -48,7 +48,7 @@ export default function ReviewsPage() {
   ];
 
   useEffect(() => {
-    if (user?.approval_status !== 'approved') return;
+    if (!user?.id) return;
     fetchData();
     const interval = setInterval(fetchData, 10000);
     return () => clearInterval(interval);
@@ -56,7 +56,7 @@ export default function ReviewsPage() {
 
   const fetchData = async () => {
     try {
-      const reviewsRes = await axios.get(`${API}/reviews/creator/${user.id}`);
+      const reviewsRes = await axios.get(`${API}/reviews`);
       const reviewsList = reviewsRes.data || [];
 
       console.log('📊 Reviews loaded:', reviewsList.length);

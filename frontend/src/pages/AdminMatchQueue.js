@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { toast } from 'sonner';
@@ -36,7 +37,7 @@ export default function AdminMatchQueue() {
     }
   };
 
-  useEffect(() => { load(); }, []);
+  useLiveEffect(() => { load(); }, []);
 
   const openBuilder = (campaignId) => {
     setActiveId(campaignId);

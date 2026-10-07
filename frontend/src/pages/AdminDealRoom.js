@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { useMemo, useState } from 'react';
 import axios from 'axios';
 import { toast } from 'sonner';
 import { AlertTriangle, CheckCheck, Clock, ShieldAlert, Package } from 'lucide-react';
@@ -42,7 +43,7 @@ export default function AdminDealRoom() {
     }
   };
 
-  useEffect(() => {
+  useLiveEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

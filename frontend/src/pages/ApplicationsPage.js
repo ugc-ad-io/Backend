@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { useState } from 'react';
 import { ChevronLeft, CheckCircle, XCircle } from 'lucide-react';
 import axios from 'axios';
 import { toast } from 'sonner';
@@ -22,7 +23,7 @@ function ApplicationsPage() {
     deadline_days: 7
   });
 
-  useEffect(() => {
+  useLiveEffect(() => {
     fetchApplications();
   }, [applicationType]);
 

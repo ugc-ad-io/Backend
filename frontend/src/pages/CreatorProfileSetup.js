@@ -16,8 +16,7 @@ export default function CreatorProfileSetup() {
     bio: '',
     tags: [],
     social_links: { instagram: '', youtube: '', tiktok: '' },
-    rate_card: { video_30s: '', video_60s: '', photo_post: '' },
-    payment_methods: { upi: '', bank_account: '' },
+    rate_card: { video_30s: '', video_60s: '', photo_post: '', raw_payout: '', editing_payout: '' },
     receive_briefs: true,
     terms_agreed: false,
     intro_video: '',
@@ -326,6 +325,15 @@ export default function CreatorProfileSetup() {
             <h3><DollarSign size={20} /> Rate Card</h3>
             <div className="rate-grid">
               <div className="form-group">
+                <label htmlFor="raw_payout">Raw video payout per video (₹)</label>
+                <input id="raw_payout" type="number" min="1" className="input-field" required value={formData.rate_card.raw_payout || ''} onChange={e => handleNestedChange('rate_card', 'raw_payout', e.target.value)} placeholder="1000" />
+              </div>
+              <div className="form-group">
+                <label htmlFor="editing_payout">Additional payout to edit one video (₹)</label>
+                <input id="editing_payout" type="number" min="0" className="input-field" value={formData.rate_card.editing_payout || ''} onChange={e => handleNestedChange('rate_card', 'editing_payout', e.target.value)} placeholder="1000" />
+                <small>Added to your raw video payout when the brand requests your edited video.</small>
+              </div>
+              <div className="form-group">
                 <label htmlFor="video_30s">30s Video ($)</label>
                 <input
                   id="video_30s"
@@ -364,35 +372,6 @@ export default function CreatorProfileSetup() {
                   data-testid="rate-photo-post"
                 />
               </div>
-            </div>
-          </div>
-
-          <div className="form-section">
-            <h3>Payment Methods</h3>
-            <div className="form-group">
-              <label htmlFor="upi">UPI ID</label>
-              <input
-                id="upi"
-                type="text"
-                value={formData.payment_methods.upi}
-                onChange={(e) => handleNestedChange('payment_methods', 'upi', e.target.value)}
-                className="input-field"
-                placeholder="yourname@upi"
-                required
-                data-testid="upi-input"
-              />
-            </div>
-            <div className="form-group">
-              <label htmlFor="bank_account">Bank Account (Last 4 digits)</label>
-              <input
-                id="bank_account"
-                type="text"
-                value={formData.payment_methods.bank_account}
-                onChange={(e) => handleNestedChange('payment_methods', 'bank_account', e.target.value)}
-                className="input-field"
-                placeholder="XXXX1234"
-                data-testid="bank-input"
-              />
             </div>
           </div>
 
