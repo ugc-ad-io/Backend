@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../App';
 import axios from 'axios';
@@ -66,7 +67,7 @@ export default function PayoutWithLayout() {
   const [searchQuery, setSearchQuery] = useState("");
   const [showStatusDrop, setShowStatusDrop] = useState(false);
 
-  useEffect(() => {
+  useLiveEffect(() => {
     fetchData();
   }, []);
 

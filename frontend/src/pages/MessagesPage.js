@@ -21,7 +21,7 @@ const CHAT_FILTERS = [
 ];
 const ACTION_CARD_LABELS = {
   custom_offer: 'Custom Offer',
-  private_invitation: 'Private Invitation',
+  private_invitation: 'Send a Brief',
   counter_offer: 'Counter Offer',
   revision_request: 'Revision Request',
   milestone_update: 'Milestone Update',
@@ -67,7 +67,7 @@ const ACTION_CARD_FORM_FIELDS = {
     ['requires_shipment', 'Product shipped to creator?', 'select', 'no', ['No', 'Yes']]
   ],
   private_invitation: [
-    ['campaign_name', 'Campaign name', 'text', 'Private campaign'],
+    ['campaign_name', 'Campaign name', 'text', 'Campaign brief'],
     ['deliverable_summary', 'Deliverable summary', 'text', 'UGC video'],
     ['budget', 'Budget', 'number', '5000'],
     ['timeline', 'Timeline', 'text', '7 days'],
@@ -121,14 +121,17 @@ const timeAgo = (timestamp) => {
 };
 
 export default function MessagesPage() {
-  const { user, setUser } = useAuth();
+  const { user } = useAuth();
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
 
   const [conversations, setConversations] = useState([]);
-  const [selectedId, setSelectedId] = useState(null);
+  const [selectedId, setSelectedId] = useState(() => searchParams.get('conv'));
+  const [selectedProfile, setSelectedProfile] = useState(null);
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
   const [messages, setMessages] = useState([]);
   const [filter, setFilter] = useState('all');
   const [search, setSearch] = useState('');
@@ -176,19 +179,6 @@ export default function MessagesPage() {
       { name: 'Settings', icon: Settings, action: () => navigate('/settings') }
     ];
 
-  // Refresh user data on mount
-  useEffect(() => {
-    const refreshUserData = async () => {
-      try {
-        const response = await axios.get(`${API}/auth/me`);
-        setUser(response.data);
-      } catch (error) {
-        console.error('Failed to refresh user data');
-      }
-    };
-    refreshUserData();
-  }, [setUser]);
-
   // Fetch conversations on mount and every 5s
   useEffect(() => {
     if (user?.id) {
@@ -208,11 +198,22 @@ export default function MessagesPage() {
   // Fetch messages when conversation selected
   useEffect(() => {
     if (!selectedId) return;
+    setMessages([]);
+    setIsOtherTyping(false);
+    setSelectedProfile(null);
+    setNewMessage('');
+    setSelectedFiles([]);
+    setActionComposerType(null);
+    let active = true;
+    axios.get(`${API}/profile/${encodeURIComponent(selectedId)}`)
+      .then(({ data }) => { if (active) setSelectedProfile(data); })
+      .catch(() => {});
     fetchMessages(selectedId);
     fetchTyping(selectedId);
     const interval = setInterval(() => fetchMessages(selectedId), 3000);
     const typingInterval = setInterval(() => fetchTyping(selectedId), 3000);
     return () => {
+      active = false;
       clearInterval(interval);
       clearInterval(typingInterval);
     };
@@ -250,7 +251,7 @@ export default function MessagesPage() {
   const fetchMessages = async (otherId) => {
     try {
       const res = await axios.get(`${API}/chat/${otherId}`);
-      setMessages(res.data);
+      if (selectedIdRef.current === otherId) setMessages(res.data);
     } catch (err) {
       console.error('Failed to load messages');
     }
@@ -268,9 +269,9 @@ export default function MessagesPage() {
   const fetchTyping = async (otherId) => {
     try {
       const res = await axios.get(`${API}/chat/${otherId}/typing`);
-      setIsOtherTyping(Boolean(res.data.typing));
+      if (selectedIdRef.current === otherId) setIsOtherTyping(Boolean(res.data.typing));
     } catch (err) {
-      setIsOtherTyping(false);
+      if (selectedIdRef.current === otherId) setIsOtherTyping(false);
     }
   };
 
@@ -612,7 +613,11 @@ export default function MessagesPage() {
     return matchesSearch && matchesFilter;
   });
 
-  const selectedConv = conversations.find((c) => c.user_id === selectedId);
+  const selectedConv = conversations.find((c) => c.user_id === selectedId) || {
+    user_id: selectedId,
+    nickname: selectedProfile?.full_name || selectedProfile?.nickname || 'Loading profile...',
+    status: 'no_deal'
+  };
   const actionCardsOnly = warnings?.action_cards_only_until && new Date(warnings.action_cards_only_until) > new Date();
 
   return (
@@ -665,7 +670,10 @@ export default function MessagesPage() {
                 <div
                   key={conv.user_id}
                   className={`msg-conv-item ${selectedId === conv.user_id ? 'is-active' : ''}`}
-                  onClick={() => setSelectedId(conv.user_id)}
+                  onClick={() => {
+                    setSelectedId(conv.user_id);
+                    setSearchParams({ conv: conv.user_id });
+                  }}
                 >
                   <div className="msg-avatar-wrap">
                     <div className="msg-avatar" style={{ background: avatarColor(conv.nickname) }}>
@@ -699,15 +707,15 @@ export default function MessagesPage() {
           <div className="msg-chat-panel">
             {/* Header */}
             <div className="msg-chat-header">
-              <div className="msg-avatar-wrap" style={{ width: '48px', height: '48px' }}>
+              <button type="button" className="msg-avatar-wrap msg-profile-link" style={{ width: '48px', height: '48px' }} onClick={() => navigate(`/profile/${selectedId}`)} aria-label={`View ${selectedConv?.nickname || 'user'} profile`}>
                 <div className="msg-avatar" style={{ background: avatarColor(selectedConv?.nickname) }}>
                   {getInitial(selectedConv?.nickname)}
                 </div>
                 <span className="msg-online-dot"></span>
-              </div>
+              </button>
               <div className="msg-header-info">
                 <div>
-                  <strong>{selectedConv?.nickname}</strong>
+                  <button type="button" className="msg-profile-link" onClick={() => navigate(`/profile/${selectedId}`)}><strong>{selectedConv?.nickname}</strong></button>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                   <span style={{ width: '8px', height: '8px', background: '#48bb78', borderRadius: '50%', display: 'inline-block' }}></span>

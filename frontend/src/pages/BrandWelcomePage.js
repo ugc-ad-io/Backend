@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../App';
 import axios from 'axios';
@@ -81,7 +82,7 @@ export default function BrandWelcomePage() {
     { id: 'behind-scenes', label: 'Behind the Scenes', icon: 'camera' }
   ];
 
-  useEffect(() => {
+  useLiveEffect(() => {
     const fetchCampaigns = async () => {
       try {
         const response = await axios.get(`${API}/campaigns`);
@@ -93,7 +94,7 @@ export default function BrandWelcomePage() {
     fetchCampaigns();
   }, []);
 
-  useEffect(() => {
+  useLiveEffect(() => {
     const fetchApprovedGigs = async () => {
       try {
         const response = await axios.get(`${API}/gigs?status=approved`);
@@ -106,7 +107,7 @@ export default function BrandWelcomePage() {
     fetchApprovedGigs();
   }, []);
 
-  useEffect(() => {
+  useLiveEffect(() => {
     const fetchContentCategories = async () => {
       try {
         const response = await axios.get(`${API}/categories`);
@@ -156,7 +157,7 @@ export default function BrandWelcomePage() {
     },
     {
       title: 'Browse Top Creators',
-      description: 'Discover vetted creators and send private invitations',
+      description: 'Discover vetted creators and send a brief',
       icon: Users,
       path: '/dashboard/business/browse-creator'
     },

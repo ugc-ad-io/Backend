@@ -1,3 +1,4 @@
+import { useLiveEffect } from "../lib/liveUpdates";
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../App';
@@ -87,7 +88,7 @@ export default function PortfolioPage() {
     { name: 'Settings', icon: Settings, action: () => navigate('/settings') },
   ];
 
-  useEffect(() => {
+  useLiveEffect(() => {
     const refreshUserData = async () => {
       try {
         const response = await axios.get(`${API}/auth/me`);

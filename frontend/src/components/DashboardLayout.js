@@ -1,12 +1,10 @@
 import { useAuth } from '../App';
 import { useNavigate } from 'react-router-dom';
-import { useEffect, useState } from 'react';
-import axios from 'axios';
+import { useState } from 'react';
 import { ChevronDown, LogOut, Search, Menu } from 'lucide-react';
 import NotificationBell from './NotificationBell';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
 
 const getInitial = (name) => (name || 'U').trim().charAt(0).toUpperCase();
 
@@ -20,17 +18,9 @@ export default function DashboardLayout({
   sidebarVariant,
   sidebarLabel = 'Menu'
 }) {
-  const { user, setUser, logout } = useAuth();
+  const { user, logout } = useAuth();
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
-
-  useEffect(() => {
-    if (user?.id) {
-      axios.get(`${API}/auth/me`)
-        .then(res => setUser(res.data))
-        .catch(() => {});
-    }
-  }, []);
 
   const displayName = user?.nickname || user?.full_name || user?.email || 'Creator';
   const roleLabel = user?.role === 'business' ? 'Approved Business' : 'Approved Creator';

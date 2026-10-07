@@ -45,8 +45,12 @@ from campaign_helpers import (
     get_campaign_completion_percentage,
     map_legacy_to_new_fields,
     total_deliverable_quantity,
+    work_review_metadata,
+    creator_editing_quantity,
+    creator_editing_fee,
 )
 import admin_caps
+from review_helpers import received_review_query, review_summary
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -250,6 +254,7 @@ class SignupRequest(BaseModel):
     password: str
     role: UserRole
     name: Optional[str] = None
+    brand_name: Optional[str] = None
     # Brand website, captured at signup so a brand isn't created with just a
     # name and no site. Optional; stored on the business profile.
     website: Optional[str] = None
@@ -2282,7 +2287,8 @@ def campaign_creators_wanted(campaign: dict) -> int:
 def campaign_slot_budget(campaign: dict) -> float:
     """Budget committed to ONE creator = per-asset budget x total deliverable quantity.
     A brief asking each creator for 3 Reels holds three videos' worth per creator."""
-    return campaign_per_asset_budget(campaign) * total_deliverable_quantity(campaign)
+    return (campaign_per_asset_budget(campaign) * total_deliverable_quantity(campaign)
+            + to_float(campaign.get('editing_fee_per_video')) * creator_editing_quantity(campaign))
 
 
 def campaign_budget_total(campaign: dict) -> float:
@@ -2801,7 +2807,7 @@ def deal_creator_scope(campaign: dict, creator_id: str) -> dict:
     per-creator rows never leak into another creator's deal room."""
     if len(selected_creator_ids(campaign)) > 1:
         return {"campaign_id": campaign['id'],
-                "$or": [{"creator_id": creator_id}, {"creator_id": {"$in": [None, ""]}}, {"creator_id": {"$exists": False}}]}
+                "$or": [{"creator_id": creator_id}, {"campaign_wide": True}]}
     return {"campaign_id": campaign['id']}
 
 
@@ -2862,7 +2868,7 @@ def get_brief_sections(campaign: dict) -> List[dict]:
     objectives = campaign.get('objectives') or []
     objective_text = ', '.join(objectives) if objectives else brief_text
     fields = [
-        ("Campaign Basics", campaign.get('campaign_basics') or brief_text),
+        ("Campaign Overview", campaign.get('campaign_basics') or brief_text),
         ("Deliverables", campaign.get('deliverables') or objective_text),
         ("Creative Requirements", campaign.get('creative_requirements') or brief_text),
         ("Creative Restrictions", campaign.get('creative_restrictions') or campaign.get('restrictions') or ''),
@@ -2945,6 +2951,8 @@ def normalize_content_submission(campaign: dict, content_versions: List[dict], w
     versions = []
     for version in content_versions:
         versions.append({
+            "id": version.get('id'),
+            "deliverable_index": version.get('deliverable_index') or 0,
             "version": version.get('version'),
             "stage": version.get('stage'),  # 'raw' / 'edited' in the raw → edited flow
             "video_url": version.get('video_url'),
@@ -2959,6 +2967,8 @@ def normalize_content_submission(campaign: dict, content_versions: List[dict], w
     if work and not versions:
         work_files = work.get('work_files') or []
         versions.append({
+            "id": work.get('id'),
+            "deliverable_index": work.get('deliverable_index') or 0,
             "version": 1,
             "video_url": work_files[0] if work_files else None,
             "caption_url": None,
@@ -2969,6 +2979,8 @@ def normalize_content_submission(campaign: dict, content_versions: List[dict], w
         })
     return {
         "required_assets": get_required_assets(campaign),
+        "required_count": total_deliverable_quantity(campaign),
+        "submitted_count": len({v['deliverable_index'] for v in versions if v.get('video_url')}),
         "versions": versions,
         "watermark_required_until_approval": True
     }
@@ -3184,12 +3196,8 @@ async def settle_deal_lazily(campaign: dict) -> None:
         if submitted and (now - submitted).days >= int(platform_setting("auto_approval_days", AUTO_APPROVE_DAYS)):
             cards = await db.deal_action_cards.find({"campaign_id": cid}, {"_id": 0}).to_list(100)
             disputed = any(c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open' for c in cards)
-            if not disputed and (work.get('stage') or work.get('needs_ugc_edit')):
+            if not disputed:
                 await auto_approve_staged(work, campaign)
-            elif not disputed:
-                await db.work_submissions.update_one({"id": work['id']}, {"$set": {"status": WorkStatus.APPROVED, "approved_at": now_iso(), "auto_approved": True}})
-                await release_payout_now(campaign, work, source="auto_approval")
-                await notify_user(work['creator_id'], "Your content was auto-approved", "The brand didn't review in time, so your content was auto-approved and you've been paid.", link="/my-deals")
     # Release a due scheduled payout (PRD 8.7).
     escrow = await db.escrow.find_one({"campaign_id": cid, "payout_status": "scheduled"})
     if escrow:
@@ -3215,6 +3223,8 @@ async def get_deal_context(deal_id: str, current_user: dict) -> dict:
     #    the first creator's deal), and a brand/admin defaults to the first creator.
     hired = selected_creator_ids(campaign)
     target_creator_id = creator_override
+    if current_user.get('role') == UserRole.CREATOR and creator_override and creator_override != current_user['id']:
+        raise HTTPException(status_code=403, detail="You can only view your own creator deal")
     if not target_creator_id:
         if current_user.get('role') == UserRole.CREATOR and current_user['id'] in hired:
             target_creator_id = current_user['id']
@@ -3234,7 +3244,7 @@ async def get_deal_context(deal_id: str, current_user: dict) -> dict:
     # creator; if none exists (older single-creator deals never stored creator_id on
     # the shipment/receipt/escrow), fall back to the untagged campaign-level doc.
     shipment = (await db.shipments.find_one({"campaign_id": campaign['id'], "creator_id": creator['id']}, {"_id": 0})
-                or await db.shipments.find_one({"campaign_id": campaign['id'], "creator_id": {"$in": [None, ""]}}, {"_id": 0})
+                or (await db.shipments.find_one({"campaign_id": campaign['id'], "creator_id": {"$in": [None, ""]}}, {"_id": 0}) if len(hired) <= 1 else None)
                 or (await db.shipments.find_one({"campaign_id": campaign['id']}, {"_id": 0}) if len(hired) <= 1 else None))
     receipt = (await db.deal_receipts.find_one({"campaign_id": campaign['id'], "creator_id": creator['id']}, {"_id": 0})
                or (await db.deal_receipts.find_one({"campaign_id": campaign['id']}, {"_id": 0}) if len(hired) <= 1 else None))
@@ -3375,7 +3385,7 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
                 "message": "Payment was released."
             })
 
-    campaign_details = {key: value for key, value in campaign.items() if key != 'bids'}
+    campaign_details = normalize_campaign_response({key: value for key, value in campaign.items() if key != 'bids'})
     # The brief typed at checkout is a DRAFT until the brand sends it (which they can
     # only do once the creator accepts). The creator must not see it before then.
     if viewer.get('id') == creator.get('id'):
@@ -3388,7 +3398,7 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
         or normalized_shipment.get('courier_status')
         or normalized_shipment.get('required')
     )
-    can_mark_received = _has_shipment_record and normalized_shipment.get('courier_status') in ['delivered', 'shipped', 'in_transit'] and not normalized_receipt.get('received_at')
+    can_mark_received = viewer.get('role') == UserRole.CREATOR and _has_shipment_record and normalized_shipment.get('courier_status') in ['delivered', 'shipped', 'in_transit'] and not normalized_receipt.get('received_at')
     can_submit_content = viewer.get('role') == UserRole.CREATOR and creator['id'] == viewer['id'] and state['active_party'] == 'creator' and state['current_state'] in [
         "Received — Content in Progress",
         "Revision Requested",
@@ -3452,7 +3462,7 @@ async def signup(data: SignupRequest):
     user_id = str(uuid.uuid4())
     # Use the name the person typed at signup as their display name; only fall
     # back to a generated placeholder if they didn't give one.
-    typed_name = str(data.name or "").strip().lstrip("@")
+    typed_name = str((data.brand_name if data.role == UserRole.BUSINESS else None) or data.name or "").strip().lstrip("@")
     nickname = typed_name or await generate_nickname()
     # Compulsory at signup, no OTP. Stored split (dial code + national number) to
     # match how the profile-setup form keeps it, plus a ready-to-read combined
@@ -3514,6 +3524,10 @@ async def signup(data: SignupRequest):
         "role": data.role,
         "phone": phone,
         "dial_code": dial_code,
+        # The app routes on these: without them a fresh signup skipped the
+        # profile form and the approval gate and landed on the dashboard.
+        "profile_completed": False,
+        "approval_status": user_doc["approval_status"],
     }
 
 @api_router.post("/auth/login")
@@ -3947,6 +3961,8 @@ async def reset_password(data: ResetPasswordRequest):
 @api_router.get("/auth/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
     me = {k: v for k, v in current_user.items() if k != 'password'}
+    if me.get("role") in (UserRole.CREATOR, UserRole.BUSINESS):
+        me.update(await review_summary(db, me))
     # Back-compat: older creators had their signup portfolio stored only under
     # `profile.portfolio`; surface it at the top level the Portfolio page reads.
     if not me.get("portfolio"):
@@ -4264,7 +4280,7 @@ async def get_creator_directory(
     rating_map = {}
     if creator_ids:
         agg = await db.reviews.aggregate([
-            {"$match": {"creator_id": {"$in": creator_ids}}},
+            {"$match": {"creator_id": {"$in": creator_ids}, "reviewee_role": {"$ne": "business"}}},
             {"$group": {"_id": "$creator_id", "avg": {"$avg": "$rating"}, "count": {"$sum": 1}}},
         ]).to_list(None)
         rating_map = {a["_id"]: a for a in agg}
@@ -4617,7 +4633,7 @@ def creator_plan_price(creator: dict) -> float:
     """
     profile = creator.get("profile") or {}
     rate_card = profile.get("rate_card") or {}
-    raw = str(rate_card.get("expected_payout") or rate_card.get("last_salary") or "")
+    raw = str(rate_card.get("raw_payout") or rate_card.get("expected_payout") or rate_card.get("last_salary") or "")
     digits = re.sub(r"[^0-9]", "", raw)
     if digits:
         return float(digits)
@@ -6453,11 +6469,31 @@ async def get_2fa_status(current_user: dict = Depends(get_current_user)):
     user = await db.users.find_one({"id": current_user['id']}, {"two_factor_enabled": 1})
     return {"enabled": user.get('two_factor_enabled', False)}
 
+class CreatorRatesUpdate(BaseModel):
+    raw_payout: float = Field(gt=0)
+    editing_payout: float = Field(ge=0)
+
+
+@api_router.patch("/profile/rates")
+async def update_creator_rates(data: CreatorRatesUpdate, current_user: dict = Depends(get_current_user)):
+    if current_user.get('role') != UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Only creators can set creator rates")
+    await db.users.update_one({"id": current_user['id']}, {"$set": {
+        "profile.rate_card.raw_payout": data.raw_payout,
+        "profile.rate_card.expected_payout": data.raw_payout,
+        "profile.rate_card.editing_payout": data.editing_payout,
+    }})
+    return {"raw_payout": data.raw_payout, "editing_payout": data.editing_payout}
+
+
 @api_router.get("/profile/{user_id}")
 async def get_profile(user_id: str, current_user: dict = Depends(get_current_user)):
     user = await db.users.find_one({"id": user_id}, {"_id": 0, "password": 0})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    if user.get("role") in (UserRole.CREATOR, UserRole.BUSINESS):
+        user.update(await review_summary(db, user))
 
     # Hide a creator's social links from OTHER users (anti-disintermediation) — but
     # never from the creator viewing their own profile (that stripped their own links
@@ -6477,6 +6513,8 @@ async def get_profile(user_id: str, current_user: dict = Depends(get_current_use
     # which never carries deliverables_completed, so the profile modal always
     # showed 0. Compute it the same way the directory/shortlist do.
     if user.get('role') == UserRole.CREATOR:
+        user['raw_video_payout'] = creator_plan_price(user)
+        user['editing_payout'] = creator_editing_fee(user)
         user['deliverables_completed'] = await creator_deliverables_completed(user)
         # Same back-compat as /auth/me: a creator's signup portfolio can live only
         # under profile.portfolio, but the profile modal reads the TOP-LEVEL
@@ -6523,6 +6561,31 @@ async def flag_hidden_budget_if_needed(campaign_doc: dict) -> None:
     )
 
 
+async def apply_private_brief_pricing(campaign_data: dict) -> None:
+    """A brief sent to ONE creator (private) has a fixed budget: the creator's own
+    expected payout per video. Never trust the client's figure here."""
+    if not campaign_data.get('selected_creator'):
+        return
+    creator = await db.users.find_one(
+        {"id": campaign_data['selected_creator'], "role": UserRole.CREATOR}, {"_id": 0}
+    )
+    if not creator:
+        raise HTTPException(status_code=404, detail="Creator not found")
+    price = creator_plan_price(creator)
+    if price <= 0:
+        raise HTTPException(status_code=400, detail="This creator hasn't set a price yet. Message them to agree on one.")
+    campaign_data.pop('budget', None)
+    campaign_data.update({
+        "budget_mode": "fixed",
+        "budget_min": price,
+        "budget_max": price,
+        "per_video_budget": price,
+        "creators_wanted": 1,
+        "editing_fee_per_video": creator_editing_fee(creator),
+    })
+    campaign_data["total_budget"] = campaign_slot_budget(campaign_data)
+
+
 # Campaign Routes - Extended for 5-step flow
 @api_router.post("/campaigns/draft")
 async def create_draft(data: CampaignDraftCreate, current_user: dict = Depends(get_current_user)):
@@ -6535,7 +6598,8 @@ async def create_draft(data: CampaignDraftCreate, current_user: dict = Depends(g
     
     campaign_id = str(uuid.uuid4())
     campaign_data = data.dict(exclude_unset=True)
-    
+    await apply_private_brief_pricing(campaign_data)
+
     # Prepare campaign for storage with draft status
     campaign_doc = prepare_campaign_for_storage(campaign_data, status='draft')
 
@@ -6884,7 +6948,8 @@ async def create_campaign(data: CampaignCreateExtended, current_user: dict = Dep
     
     campaign_id = str(uuid.uuid4())
     campaign_data = data.dict(exclude_unset=True)
-    
+    await apply_private_brief_pricing(campaign_data)
+
     # Determine status: explicit drafts allow partial data. Publish requests must pass
     # validation and should never be silently converted to drafts.
     # Published briefs go to PENDING_APPROVAL and only become ACTIVE (visible to creators)
@@ -7375,6 +7440,14 @@ async def get_campaign(campaign_id: str, current_user: dict = Depends(get_curren
     # so the hired creator never appeared on the brand side.
     sel_ids = selected_creator_ids(campaign)
     if sel_ids:
+        hired_users = await db.users.find(
+            {"id": {"$in": sel_ids}}, {"_id": 0}
+        ).to_list(len(sel_ids))
+        hired_by_id = {str(u["id"]): u for u in hired_users}
+        campaign["hired_creators"] = [
+            {"id": creator_id, "name": person_display_name(hired_by_id.get(creator_id, {}), "Creator")}
+            for creator_id in sel_ids
+        ]
         sel = await db.users.find_one({"id": sel_ids[0]}, {"_id": 0}) or {}
         prof = sel.get("profile") or {}
         campaign.setdefault("selected_creator_name", person_display_name(sel, "Creator"))
@@ -7403,21 +7476,32 @@ async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Dep
     if not campaign or campaign['status'] != CampaignStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Campaign not available for bidding")
 
+    quantity = total_deliverable_quantity(campaign)
+    editing_quantity = creator_editing_quantity(campaign)
+    per_video_amount = data.amount
     if data.raw_amount is not None or data.edited_amount is not None:
         if not (data.raw_amount and data.raw_amount > 0 and data.edited_amount and data.edited_amount > 0):
             raise HTTPException(status_code=400, detail="Enter a payout for both the raw video and the edited video.")
-        data.amount = round(data.raw_amount + data.edited_amount, 2)
+        if not editing_quantity:
+            raise HTTPException(status_code=400, detail="This brief does not require creator editing")
+        per_video_amount = data.raw_amount
+        bid_total = round(data.raw_amount * quantity + data.edited_amount * editing_quantity, 2)
+    else:
+        bid_total = round(data.amount * quantity, 2)
 
     budget_ceiling = (
         to_float(campaign.get("budget_max"))
         or to_float(campaign.get("max_budget"))
         or to_float(campaign.get("budget"))
     )
-    if budget_ceiling and data.amount > budget_ceiling:
+    budget_ceiling = (budget_ceiling * quantity
+                      + to_float(campaign.get('editing_fee_per_video')) * editing_quantity)
+    if budget_ceiling and bid_total > budget_ceiling:
         raise HTTPException(
             status_code=400,
             detail=f"Bid cannot exceed the campaign budget of ₹{budget_ceiling:,.0f}",
         )
+    data.amount = bid_total
     
     # Check if creator has already bid on this campaign
     existing_bids = campaign.get('bids', [])
@@ -7427,6 +7511,8 @@ async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Dep
     bid_doc = {
         "id": str(uuid.uuid4()),
         "creator_id": current_user['id'],
+        "per_video_amount": per_video_amount,
+        "deliverable_quantity": quantity,
         "creator_nickname": current_user['nickname'],
         # Real name so brands see the creator's actual name, not the @handle.
         "creator_name": person_display_name(current_user, current_user['nickname']),
@@ -7518,7 +7604,7 @@ async def get_my_bids(current_user: dict = Depends(get_current_user)):
         else:
             bid_status = "pending"
 
-        campaign_details = {key: value for key, value in campaign.items() if key != 'bids'}
+        campaign_details = normalize_campaign_response({key: value for key, value in campaign.items() if key != 'bids'})
         result.append({
             "campaign": campaign_details,
             "my_bid": my_bid,
@@ -9323,6 +9409,10 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
     # own deliverable_index starting at 0, so without this filter approving Creator A's
     # work could stamp Creator B's same-index submission as approved instead.
     stage = work.get('stage')
+    if not stage and edit_mode(campaign) and not work.get('edited_files'):
+        stage = 'raw'
+        work['stage'] = stage
+        await db.work_submissions.update_one({"id": work_id}, {"$set": {"stage": stage}})
     approved_version = await db.deal_content_submissions.find_one(
         {"campaign_id": work['campaign_id'], "creator_id": work['creator_id'], "stage": stage,
          "$or": [{"deliverable_index": work_idx},
@@ -9345,7 +9435,7 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
         )
 
     brand_name = current_user.get('nickname', 'Brand')
-    mode = edit_mode(campaign)
+    mode = edit_mode(campaign, work_idx)
     if stage == 'raw' and mode == 'creator':
         # Raw approved → the creator now edits it. No payout until the edited cut is approved.
         await set_campaign_rollup(campaign, now)
@@ -9365,8 +9455,11 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
 
     if stage == 'raw' and mode == 'ugc':
         # Raw approved → creator is paid now; UGC.ad's editors cut the final video.
-        raw_progress = await deliverables_progress(campaign, work['creator_id'], stage='raw')
-        if raw_progress["complete"]:
+        existing_edit = await db.work_submissions.find_one({
+            "campaign_id": work['campaign_id'], "creator_id": work['creator_id'],
+            "deliverable_index": work_idx, "needs_ugc_edit": True,
+        })
+        if not existing_edit:
             # Insert the editing job BEFORE paying, so the payout's campaign roll-up sees
             # it and keeps the campaign in progress instead of completing it.
             await db.work_submissions.insert_one({
@@ -9402,7 +9495,7 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
     # PAYOUT GATE: only fund once EVERY required asset has an approved submission FROM
     # THIS CREATOR. Previously this counted approvals campaign-wide, so on a multi-creator
     # brief ONE creator's approval satisfied the gate for every hired creator at once.
-    progress = await deliverables_progress(campaign, work['creator_id'], stage='raw' if stage == 'raw' else None)
+    progress = await deliverables_progress(campaign, work['creator_id'])
     if not progress["complete"]:
         # Another hired creator may still have work awaiting review — don't hide it.
         pending = await db.work_submissions.count_documents(
@@ -9442,15 +9535,12 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
         await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "content_approved",
                                    f"Content approved. ₹{int(payout_info.get('net_payable', 0))} released to the creator.",
                                    creator_id=work['creator_id'])
-        await insert_deal_system_message(campaign, "Content approved. The creator has been paid.")
+        await insert_deal_system_message(campaign, "Content approved. The creator has been paid.", creator_id=work['creator_id'])
         return {"message": "Content approved. Creator funded instantly.", "payout_status": "released", **payout_info}
 
     # Fallback: nothing to release (e.g. a legacy deal with no escrow). Still mark
     # the campaign completed so it stops showing as "work submitted" / pending review.
-    await db.campaigns.update_one(
-        {"id": work['campaign_id']},
-        {"$set": {"status": CampaignStatus.COMPLETED, "payout_status": "approved", "approved_at": now, "updated_at": now}}
-    )
+    await set_campaign_rollup(campaign, now)
     await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "content_approved", "Content approved.", creator_id=work['creator_id'])
     await notify_user(work['creator_id'], "Your content was approved", "Your content was approved.", link="/my-deals", ntype="success", email=True, category="deal_updates")
     return {"message": "Content approved.", **payout_info}
@@ -9545,10 +9635,13 @@ async def set_campaign_rollup(campaign: dict, now: str):
     }})
 
 
-def edit_mode(campaign: dict) -> Optional[str]:
+def edit_mode(campaign: dict, deliverable_index: Optional[int] = None) -> Optional[str]:
     """Who cuts the edited video on this brief: 'creator', 'ugc' (UGC.ad's editors),
     or None when no edited file is required (one plain submission)."""
     items = campaign.get('deliverable_items') or []
+    if deliverable_index is not None:
+        expanded = [item for item in items for _ in range(int(item.get('quantity') or 1))]
+        items = expanded[deliverable_index:deliverable_index + 1]
     get = lambda d, k: d.get(k) if isinstance(d, dict) else getattr(d, k, None)
     if any(get(d, 'edited_required') and (get(d, 'edited_by') or 'creator') == 'creator' for d in items):
         return 'creator'
@@ -9563,7 +9656,7 @@ async def edit_stage(campaign: dict, creator_id: str, deliverable_index: int = 0
     'edited'      — raw approved, the creator now submits the edited cut (step 2);
     'ugc_editing' — raw approved, UGC.ad's editors cut it (creator's part is done);
     None          — no edited file on this brief: a single ordinary submission."""
-    mode = edit_mode(campaign)
+    mode = edit_mode(campaign, deliverable_index)
     if not mode:
         return None
     raw_ok = await db.work_submissions.find_one({
@@ -9610,16 +9703,29 @@ async def deliverables_progress(campaign: dict, creator_id: str, stage: Optional
     # the final payout gate; pass stage='raw' to count raw approvals instead (the
     # UGC-edits flow pays the creator once every raw is approved).
     query = {"campaign_id": campaign['id'], "creator_id": creator_id, "status": "approved"}
-    query["stage"] = "raw" if stage == "raw" else {"$ne": "raw"}
+    if stage == 'raw':
+        query['stage'] = 'raw'
     rows = await db.deal_content_submissions.find(
-        query, {"_id": 0, "deliverable_index": 1},
+        query, {"_id": 0, "deliverable_index": 1, "stage": 1},
     ).to_list(length=None)
+    legacy = await db.work_submissions.find(
+        query, {"_id": 0, "deliverable_index": 1, "stage": 1},
+    ).to_list(length=None)
+    rows.extend(legacy)
     approved_idx = set()
     for row in rows:
         try:
-            approved_idx.add(int(row.get('deliverable_index') or 0))
+            index = int(row.get('deliverable_index') or 0)
         except (TypeError, ValueError):
-            approved_idx.add(0)
+            continue
+        if not 0 <= index < required:
+            continue
+        mode = edit_mode(campaign, index)
+        if stage != 'raw' and mode == 'creator' and row.get('stage') != 'edited':
+            continue
+        if stage != 'raw' and mode == 'ugc' and row.get('stage') != 'raw':
+            continue
+        approved_idx.add(index)
     approved = len(approved_idx)
     return {
         "required": required,
@@ -9632,6 +9738,9 @@ async def deliverables_progress(campaign: dict, creator_id: str, stage: Optional
 async def release_payout_now(campaign: dict, work: dict, source: str = "approval") -> dict:
     """Instant funding: compute the payout (TDS/penalty/net + invoice) and release it
     to the creator's wallet immediately — no hold period. Guards against paying twice."""
+    progress = await deliverables_progress(campaign, work['creator_id'])
+    if not progress['complete']:
+        return {"released": False, "net_payable": 0, "deliverables": progress}
     escrow = await db.escrow.find_one({"campaign_id": campaign['id'], "creator_id": work['creator_id']})
     if escrow and escrow.get('payout_status') == 'released':
         # Already paid — never re-schedule/re-release (would double-pay).
@@ -9672,10 +9781,15 @@ async def release_scheduled_payout(escrow: dict) -> bool:
     penalty = float(escrow.get('penalty_amount') or 0)
     commission = float(escrow.get('commission_amount') if escrow.get('commission_amount') is not None else creator_commission(gross))
     revision_credit = float(escrow.get('revision_credit_owed') or 0)
-    net = float(escrow.get('net_payable') if escrow.get('net_payable') is not None else gross - commission - tds - penalty + revision_credit)
+    net = round(gross - commission - tds - penalty + revision_credit, 2)
     now = now_iso()
 
-    await db.escrow.update_one({"id": escrow['id']}, {"$set": {"status": "released", "payout_status": "released", "released_at": now}})
+    claimed = await db.escrow.update_one(
+        {"id": escrow['id'], "payout_status": "scheduled", "status": {"$ne": "released"}},
+        {"$set": {"status": "released", "payout_status": "released", "released_at": now, "net_payable": net,
+                  "revision_credit_paid": revision_credit}})
+    if claimed.modified_count != 1:
+        return False
     if creator_id:
         await db.users.update_one({"id": creator_id}, {"$inc": {"balance": net}})
     # Half of any late penalty is credited to the brand as goodwill (PRD 8.8).
@@ -9695,7 +9809,7 @@ async def release_scheduled_payout(escrow: dict) -> bool:
         creator_id=creator_id, receipt_type="earning", gross_amount=gross,
         campaign_id=campaign['id'], reference_id=escrow.get('id'),
         note="Scheduled payout released", tds_amount=tds, penalty_amount=penalty,
-        commission_amount=commission,
+        commission_amount=commission, revision_credit=revision_credit,
     )
     # Record the platform's two-sided commission for this deal (brand fee + creator fee).
     await record_platform_revenue(
@@ -9758,14 +9872,7 @@ async def auto_approve_stale_submissions() -> int:
         cards = await db.deal_action_cards.find({"campaign_id": campaign['id']}, {"_id": 0}).to_list(100)
         if any(c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open' for c in cards):
             continue
-        if work.get('stage') or work.get('needs_ugc_edit'):
-            await auto_approve_staged(work, campaign)
-            approved += 1
-            continue
-        await db.work_submissions.update_one({"id": work['id']}, {"$set": {"status": WorkStatus.APPROVED, "approved_at": now_iso(), "auto_approved": True}})
-        await release_payout_now(campaign, work, source="auto_approval")
-        await insert_deal_system_message(campaign, f"Content auto-approved after {int(platform_setting('auto_approval_days', AUTO_APPROVE_DAYS))} days with no brand review (PRD 8.4). The creator has been paid.")
-        await notify_user(work['creator_id'], "Your content was auto-approved", "The brand didn't review in time, so your content was auto-approved and you've been paid.", link="/my-deals")
+        await auto_approve_staged(work, campaign)
         approved += 1
         # release_payout_now() above also emails the creator — stagger for the same
         # rate-limit reason as release_due_payouts().
@@ -10107,13 +10214,19 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
 
     note = f" (paid revision, ₹{fee} charged)" if paid else f" ({cf.FREE_REVISION_LIMIT - used - 1} free revision(s) remaining)"
     await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "revision_requested", f"Brand requested content revisions.{note}", creator_id=work['creator_id'])
-    await insert_deal_system_message(campaign, f"Brand requested content revisions.{note}")
+    await insert_deal_system_message(campaign, f"Brand requested content revisions.{note}", creator_id=work['creator_id'])
     # Action-required for the creator → warning (amber ⚠), not a neutral info note.
     await notify_user(work['creator_id'], "Revision requested on your content",
                       "The brand requested changes on your submission. Open your deal to review the feedback and resubmit.",
                       link="/my-deals", ntype="warning", email=True, category="deal_updates")
 
     new_balance = float(current_user.get('balance') or 0) - fee
+    if used + 1 == cf.FREE_REVISION_LIMIT:
+        await notify_user(
+            current_user['id'], "Second revision: last free revision",
+            "Include all remaining changes in this revision. From the third revision, ₹500 will be deducted per revision; ₹300 goes to the creator.",
+            link="/dashboard/business/work-review", ntype="warning", category="deal_updates",
+        )
     if paid:
         # The brand's wallet was just debited. Telling nobody is not acceptable for a
         # money movement — they only ever saw a "Revision requested" toast.
@@ -10314,6 +10427,8 @@ async def submit_deal_receipt(deal_id: str, data: DealReceiptSubmit, current_use
                 status_code=400,
                 detail="The brand hasn't shipped the product yet. You can mark it received once it's on the way.",
             )
+        if not data.unboxing_video_url:
+            raise HTTPException(status_code=400, detail="Upload an unboxing video before marking the parcel received")
 
     received_at = data.received_at or now_iso()
     receipt_doc = {
@@ -11711,7 +11826,7 @@ async def get_work_pending_review(current_user: dict = Depends(get_current_user)
     # Get all campaigns for this business
     campaigns = await db.campaigns.find(
         {"business_id": _brand_ws_id(current_user)},
-        {"_id": 0, "id": 1}
+        {"_id": 0}
     ).to_list(1000)
     campaign_ids = [c['id'] for c in campaigns]
 
@@ -11721,10 +11836,14 @@ async def get_work_pending_review(current_user: dict = Depends(get_current_user)
         {"_id": 0}
     ).to_list(1000)
     # What approving does next (raw → edited flow), so the review UI can word the button.
-    modes = {c['id']: edit_mode(c) for c in await db.campaigns.find(
-        {"id": {"$in": list({w['campaign_id'] for w in work_submissions})}}, {"_id": 0, "id": 1, "deliverable_items": 1}).to_list(1000)}
+    modes = {c['id']: edit_mode(c) for c in campaigns}
     for w in work_submissions:
         w['edit_mode'] = modes.get(w['campaign_id'])
+    brief_by_id = {c['id']: c for c in campaigns}
+    for w in work_submissions:
+        brief = brief_by_id.get(w['campaign_id']) or {}
+        w.update(work_review_metadata(brief, w))
+        w['campaign_title'] = brief.get('title') or brief.get('campaign_name')
 
     # Attach each creator's real name so the brand sees it (not the @handle).
     creator_ids = {w.get('creator_id') for w in work_submissions if w.get('creator_id')}
@@ -11758,7 +11877,7 @@ async def get_business_work_review(current_user: dict = Depends(get_current_user
     ws_id = _brand_ws_id(current_user)
     campaigns = await db.campaigns.find(
         {"business_id": ws_id},
-        {"_id": 0, "id": 1, "title": 1, "status": 1, "deal_id": 1, "selected_creator": 1, "selected_creators": 1, "deliverable_items": 1},
+        {"_id": 0},
     ).to_list(10000)
     campaign_by_id = {c['id']: c for c in campaigns}
     campaign_ids = list(campaign_by_id.keys())
@@ -11801,6 +11920,7 @@ async def get_business_work_review(current_user: dict = Depends(get_current_user
         approved = status == 'approved'
         asset = cf.to_brand_facing_asset(work, approved=approved)
         creator = creator_by_id.get(creator_id) or {}
+        metadata = work_review_metadata(campaign, work)
         rows.append({
             # Disambiguated deal id (bare for the first/only creator, "<id>~<creator_id>"
             # for the rest) — approve/request-revision resolve this per-creator.
@@ -11817,6 +11937,9 @@ async def get_business_work_review(current_user: dict = Depends(get_current_user
             "editMode": edit_mode(campaign),
             "submittedAt": work.get('submitted_at'),
             "status": status,
+            **metadata,
+            "campaignDetails": metadata['campaign_details'],
+            "duration": metadata['duration_seconds'],
         })
     rows.sort(key=lambda r: r.get('submittedAt') or '', reverse=True)
     return rows
@@ -11841,6 +11964,11 @@ async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_
     # Denormalize fields the review UI expects.
     if campaign:
         work['campaign_title'] = campaign.get('title') or campaign.get('campaign_name')
+        work.update(work_review_metadata(campaign, work))
+    used = len(await deal_revision_history(work['campaign_id'], work['creator_id']))
+    work['revision_count_used'] = used
+    work['free_revisions_remaining'] = max(0, cf.FREE_REVISION_LIMIT - used)
+    work['next_revision_fee'] = revision_fee_for(used)
     creator = await db.users.find_one({"id": work['creator_id']}, {"_id": 0, "nickname": 1, "full_name": 1, "business_name": 1, "profile.business_name": 1, "profile.full_name": 1, "profile.fullName": 1})
     if creator:
         work['creator_nickname'] = creator.get('nickname') or creator.get('full_name')
@@ -11856,17 +11984,32 @@ async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_
 # Review Routes
 @api_router.post("/reviews")
 async def submit_review(data: ReviewSubmit, current_user: dict = Depends(get_current_user)):
+    if current_user.get('role') not in (UserRole.CREATOR, UserRole.BUSINESS):
+        raise HTTPException(status_code=403, detail="Only creators and brands can submit collaboration reviews")
+    if not 1 <= data.rating <= 5 or not data.review.strip():
+        raise HTTPException(status_code=400, detail="A rating from 1 to 5 and review text are required")
     rates_brand = bool(data.business_id) and current_user.get('role') == UserRole.CREATOR
+    campaign = await db.campaigns.find_one({"id": data.campaign_id})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    creator_id = current_user['id'] if rates_brand else data.creator_id
+    if creator_id not in selected_creator_ids(campaign):
+        raise HTTPException(status_code=403, detail="You can only review a participant in this deal")
+    if current_user.get('role') == UserRole.BUSINESS and campaign.get('business_id') != _brand_ws_id(current_user):
+        raise HTTPException(status_code=403, detail="You can only review your own deals")
+    if current_user.get('role') == UserRole.CREATOR and not rates_brand:
+        raise HTTPException(status_code=403, detail="Creators can review the brand they worked with")
+    escrow = await db.escrow.find_one({"campaign_id": data.campaign_id, "creator_id": creator_id})
+    if not escrow and len(selected_creator_ids(campaign)) == 1:
+        escrow = await db.escrow.find_one({"campaign_id": data.campaign_id})
+    completed = campaign.get('status') == CampaignStatus.COMPLETED or (escrow or {}).get('status') == 'released'
+    if not completed:
+        raise HTTPException(status_code=400, detail="You can review only after your deal is completed")
     # A creator can review a brand ONLY after that deal is completed, and only for a
     # brand they actually worked with (they were the selected creator on the campaign).
     if rates_brand:
-        campaign = await db.campaigns.find_one({"id": data.campaign_id})
-        if not campaign:
-            raise HTTPException(status_code=404, detail="Deal not found")
         if current_user['id'] not in selected_creator_ids(campaign) or campaign.get("business_id") != data.business_id:
             raise HTTPException(status_code=403, detail="You can only review a brand you've completed a deal with")
-        if campaign.get("status") != CampaignStatus.COMPLETED:
-            raise HTTPException(status_code=400, detail="You can review a brand only after the deal is completed")
     # A review is one-time and immutable: once you've reviewed the other party for
     # a campaign you can't add another (and there's no edit/undo). Block a repeat
     # so a double-submit / re-open can't stack or silently change the rating.
@@ -11874,18 +12017,19 @@ async def submit_review(data: ReviewSubmit, current_user: dict = Depends(get_cur
         "campaign_id": data.campaign_id,
         "reviewer_id": current_user['id'],
         "reviewee_role": "business" if rates_brand else "creator",
+        **({} if rates_brand else {"creator_id": creator_id}),
     })
     if already:
         raise HTTPException(status_code=409, detail="You have already reviewed this. Reviews can't be changed once submitted.")
     review_doc = {
         "id": str(uuid.uuid4()),
         "campaign_id": data.campaign_id,
-        "creator_id": data.creator_id,
-        "business_id": data.business_id,
+        "creator_id": creator_id,
+        "business_id": campaign.get('business_id'),
         "reviewee_role": "business" if rates_brand else "creator",
         "reviewer_id": current_user['id'],
         "rating": data.rating,
-        "review": data.review,
+        "review": data.review.strip(),
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     await db.reviews.insert_one(review_doc)
@@ -11913,16 +12057,19 @@ async def submit_review(data: ReviewSubmit, current_user: dict = Depends(get_cur
 
 @api_router.get("/reviews/creator/{creator_id}")
 async def get_creator_reviews(creator_id: str):
-    reviews = await db.reviews.find({"creator_id": creator_id}, {"_id": 0}).to_list(1000)
+    reviews = await db.reviews.find(
+        received_review_query({"id": creator_id, "role": "creator"}), {"_id": 0}
+    ).sort("created_at", -1).to_list(1000)
     return reviews
 
 @api_router.get("/reviews/business/{business_id}")
 async def get_business_reviews(business_id: str):
     """Reviews creators left for a brand (reviewee_role == 'business'). Powers the
     brand profile card a creator opens from Messages — mirror of the creator route."""
+    business = await db.users.find_one({"id": business_id}, {"_id": 0, "id": 1, "team_of": 1})
     reviews = await db.reviews.find(
-        {"business_id": business_id, "reviewee_role": "business"}, {"_id": 0}
-    ).to_list(1000)
+        received_review_query({**(business or {"id": business_id}), "role": "business"}), {"_id": 0}
+    ).sort("created_at", -1).to_list(1000)
     return reviews
 
 # Shipment Routes
@@ -12007,7 +12154,13 @@ async def receive_shipment(data: ShipmentReceive, current_user: dict = Depends(g
         "creator",
         current_user.get('nickname', 'Creator'),
         "unboxing_uploaded" if data.unboxing_video else "receipt_confirmed",
-        "Shipment receipt confirmed with unboxing video." if data.unboxing_video else "Shipment receipt confirmed."
+        "Shipment receipt confirmed with unboxing video." if data.unboxing_video else "Shipment receipt confirmed.",
+        creator_id=creator_id,
+    )
+    await notify_user(
+        campaign['business_id'], "Product received",
+        f"{current_user.get('nickname', 'The creator')} confirmed receipt of your product for '{campaign.get('title', 'your campaign')}'.",
+        link="/dashboard/business/shipments", ntype="success", email=True, category="deal_updates",
     )
     if data.items_damaged:
         await db.deal_action_cards.insert_one({
@@ -12023,8 +12176,8 @@ async def receive_shipment(data: ShipmentReceive, current_user: dict = Depends(g
             "message": data.dispute_reason,
             "attachment_urls": [data.unboxing_video] if data.unboxing_video else []
         })
-        await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "dispute_raised", "Damaged or wrong product reported.")
-        await insert_deal_system_message(campaign, "Damaged or wrong product has been reported by the creator.")
+        await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "dispute_raised", "Damaged or wrong product reported.", creator_id=creator_id)
+        await insert_deal_system_message(campaign, "Damaged or wrong product has been reported by the creator.", creator_id=creator_id)
     
     return {"message": "Shipment marked as received"}
 
@@ -12254,7 +12407,8 @@ def brand_display_name(brand: Optional[dict]) -> Optional[str]:
 async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount: float,
                                 campaign_id: Optional[str] = None, reference_id: Optional[str] = None,
                                 note: Optional[str] = None, tds_amount: float = 0.0,
-                                penalty_amount: float = 0.0, commission_amount: Optional[float] = None) -> dict:
+                                penalty_amount: float = 0.0, commission_amount: Optional[float] = None,
+                                revision_credit: float = 0.0) -> dict:
     """Generate and persist a payout receipt for a creator. receipt_type is
     'earning' (escrow release) or 'withdrawal' (payout to bank/UPI). TDS and any
     late-delivery penalty are recorded as deductions (PRD 8.7/8.8). The creator-side
@@ -12265,7 +12419,8 @@ async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount
         commission = creator_commission(gross_amount) if receipt_type == "earning" else 0.0
     tds_amount = round(float(tds_amount or 0), 2)
     penalty_amount = round(float(penalty_amount or 0), 2)
-    net_amount = round(gross_amount - commission - tds_amount - penalty_amount, 2)
+    revision_credit = round(float(revision_credit or 0), 2)
+    net_amount = round(gross_amount - commission - tds_amount - penalty_amount + revision_credit, 2)
     seq = await db.payout_receipts.count_documents({}) + 1
 
     # WHO paid, and for WHAT. A receipt used to carry only a raw campaign uuid, so
@@ -12291,6 +12446,7 @@ async def create_payout_receipt(creator_id: str, receipt_type: str, gross_amount
         "commission_amount": commission,
         "tds_amount": tds_amount,
         "penalty_amount": penalty_amount,
+        "revision_credit": revision_credit,
         "net_amount": net_amount,
         "currency": "INR",
         "campaign_id": campaign_id,
@@ -15569,8 +15725,8 @@ def platform_setting(key: str, default=None):
 
 
 def commission_percent() -> float:
-    """Platform commission %, driven by Admin → Settings → Commission rate."""
-    return to_float(platform_setting("commission_rate", 20)) or 20.0
+    """Standard platform commission for both brands and creators."""
+    return 20.0
 
 
 def feature_enabled(flag: str) -> bool:
@@ -15772,7 +15928,7 @@ async def admin_financials_overview(current_user: dict = Depends(require_cap("vi
     next7 = [e for e in scheduled if (e.get("payout_scheduled_at") or "") <= horizon]
     scheduled_total = round(sum(to_float(e.get("net_payable") or e.get("amount")) for e in next7), 2)
     invoices = await db.invoices.find({}, {"_id": 0}).to_list(20000)
-    commission_earned = round(sum(to_float(i.get("gross_amount")) * 0.25 for i in invoices), 2)
+    commission_earned = round(sum(to_float(i.get("gross_amount")) * commission_percent() / 100 for i in invoices), 2)
     return {
         "total_escrow_held": total_escrow_held,
         "total_wallet_balance": total_wallet,
@@ -15900,7 +16056,7 @@ async def export_gst(current_user: dict = Depends(require_cap("export_tax"))):
     rows = []
     for inv in invoices:
         gross = to_float(inv.get("gross_amount"))
-        commission = round(gross * 0.25, 2)
+        commission = round(gross * commission_percent() / 100, 2)
         gst = round(commission * 0.18, 2)
         rows.append({
             "invoice_id": inv.get("id"), "business_id": inv.get("business_id"), "campaign_id": inv.get("campaign_id"),
@@ -16811,15 +16967,9 @@ async def list_my_reviews(current_user: dict = Depends(get_current_user)):
     real list and star breakdown. Was a stub returning [] — which is why the
     page read 'No reviews yet' and 0% per star even when the aggregate showed a
     rating. Creator sees reviews left for them; a brand sees reviews left for it."""
-    if current_user.get("role") == UserRole.BUSINESS:
-        ws_id = _brand_ws_id(current_user)
-        reviews = await db.reviews.find(
-            {"business_id": ws_id, "reviewee_role": "business"}, {"_id": 0}
-        ).sort("created_at", -1).to_list(1000)
-    else:
-        reviews = await db.reviews.find(
-            {"creator_id": current_user["id"], "reviewee_role": {"$ne": "business"}}, {"_id": 0}
-        ).sort("created_at", -1).to_list(1000)
+    reviews = await db.reviews.find(
+        received_review_query(current_user), {"_id": 0}
+    ).sort("created_at", -1).to_list(1000)
     return reviews
 
 
@@ -16877,6 +17027,15 @@ async def payout_overview(current_user: dict = Depends(get_current_user)):
 
 app.include_router(categories_router)
 app.include_router(gigs_router)
+@api_router.get("/live/revision")
+async def live_revision(current_user: dict = Depends(get_current_user)):
+    revision = await db.live_updates.find_one({"_id": "revision"}) or {}
+    return {"version": revision.get("version", "initial")}
+
+
+from live_updates import LiveUpdatesMiddleware
+app.add_middleware(LiveUpdatesMiddleware, database=db)
+
 app.include_router(api_router)
 
 from starlette.middleware.base import BaseHTTPMiddleware

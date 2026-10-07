@@ -483,7 +483,9 @@
 
 .deal-brief-toggle strong {
   min-width: 0;
-  font-size: 17px;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.35;
   text-align: left;
 }
 
@@ -491,7 +493,8 @@
   margin-left: auto;
   color: #7387ff;
   font-style: normal;
-  font-weight: 850;
+  font-size: 12px;
+  font-weight: 500;
   text-align: right;
 }
 
@@ -526,14 +529,19 @@
 
 .deal-brief-body h3 {
   color: #07074e;
-  font-size: 14px;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.4;
 }
 
 .deal-brief-body p {
-  margin-top: 7px;
+  margin-top: 10px;
   color: #4a5568;
-  line-height: 1.5;
-  font-weight: 650;
+  font-size: 14px;
+  line-height: 1.7;
+  font-weight: 400;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
 }
 
 .deal-link-btn {

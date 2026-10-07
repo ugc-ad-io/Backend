@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '../App';
 import axios from 'axios';
@@ -31,7 +32,7 @@ export default function WorkReview() {
   const [review, setReview] = useState('');
   const [revisionFeedback, setRevisionFeedback] = useState('');
 
-  useEffect(() => {
+  useLiveEffect(() => {
     const fetchWork = async () => {
       try {
         const response = await axios.get(`${API}/work/${workId}`);
@@ -105,8 +106,16 @@ export default function WorkReview() {
       <div className="review-container fade-in">
         <div className="review-header">
           <h1>Review Submitted Work</h1>
-          <p>Campaign: {work.campaign_title}</p>
+          <p>Campaign: {work.campaign_title || work.campaign_details?.title || 'Campaign details unavailable'}</p>
           <p className="creator-info">By {work.creator_nickname}</p>
+        </div>
+
+        <div className="work-section">
+          <h3>Campaign Details</h3>
+          <p><strong>Product:</strong> {work.campaign_details?.product_name || 'Not specified'}</p>
+          <p><strong>Duration:</strong> {work.duration_label || (work.duration_seconds > 0 ? `${work.duration_seconds} seconds` : 'Not specified')}</p>
+          <p><strong>Format:</strong> {work.campaign_details?.video_format || 'Not specified'}</p>
+          <p className="work-description">{work.campaign_details?.brief_text || 'No campaign brief provided.'}</p>
         </div>
 
         <div className="work-section">
@@ -209,6 +218,8 @@ export default function WorkReview() {
         <div className="modal-overlay" onClick={() => setShowRevisionModal(false)}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
             <h2>Request Revision</h2>
+            {work?.free_revisions_remaining === 1 && <p className="info-note">This is the second and last free revision. Include all remaining changes now. From the third revision, ₹500 will be deducted per revision (₹300 goes to the creator).</p>}
+            {work?.free_revisions_remaining === 0 && <p className="info-note">This revision costs ₹{work?.next_revision_fee || 500}, deducted from your wallet. ₹300 goes to the creator.</p>}
             <div className="form-group">
               <label htmlFor="feedback">Revision Feedback</label>
               <textarea

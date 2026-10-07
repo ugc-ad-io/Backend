@@ -40,6 +40,7 @@ import {
   Package
 } from 'lucide-react';
 import DashboardLayout from '../components/DashboardLayout';
+import NotificationBell from '../components/NotificationBell';
 import './CreatorDashboard.css';
 import './ProfileSettings.css';
 
@@ -115,6 +116,20 @@ const defaultCompany = {
   kyb_status: 'pending'
 };
 
+const BUSINESS_TYPES = [
+  'D2C E-commerce', 'Digital Agency', 'SaaS Platform', 'Lifestyle Brand',
+  'Retail', 'Manufacturer', 'Service Provider', 'Other'
+];
+
+const BUSINESS_CATEGORIES = [
+  'Fashion & Apparel', 'Beauty & Cosmetics', 'Technology & Gadgets', 'Food & Beverage',
+  'Health & Fitness', 'Home & Lifestyle', 'Travel & Tourism', 'Education', 'Entertainment', 'Other'
+];
+
+// A value saved before this field had a fixed list (e.g. free-typed at onboarding)
+// must still show up as a selected option instead of rendering blank.
+const withCurrentValue = (list, value) => (value && !list.includes(value) ? [value, ...list] : list);
+
 const INDIAN_STATES = [
   'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chhattisgarh', 'Goa', 'Gujarat',
   'Haryana', 'Himachal Pradesh', 'Jharkhand', 'Karnataka', 'Kerala', 'Madhya Pradesh',
@@ -160,6 +175,8 @@ export default function ProfileSettings() {
   
   // Profile states
   const [bio, setBio] = useState('');
+  const [rawPayout, setRawPayout] = useState('');
+  const [editingPayout, setEditingPayout] = useState('');
   const [description, setDescription] = useState('');
   const [profilePhoto, setProfilePhoto] = useState(null);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
@@ -345,6 +362,9 @@ export default function ProfileSettings() {
     try {
       const response = await axios.get(`${API}/auth/me`);
       setBio(response.data.bio || '');
+      const rates = response.data.profile?.rate_card || {};
+      setRawPayout(rates.raw_payout || rates.expected_payout || '');
+      setEditingPayout(rates.editing_payout || '');
       setDescription(response.data.description || '');
       setProfilePhoto(response.data.profile_photo || null);
     } catch (error) {
@@ -393,6 +413,7 @@ export default function ProfileSettings() {
     setLoading(true);
     try {
       await axios.put(`${API}/profile/update-info?bio=${encodeURIComponent(bio)}&description=${encodeURIComponent(description)}`);
+      if (rawPayout) await axios.patch(`${API}/profile/rates`, { raw_payout: Number(rawPayout), editing_payout: Number(editingPayout || 0) });
       setUser({ ...user, bio, description });
       toast.success('Profile updated successfully!');
     } catch (error) {
@@ -514,11 +535,11 @@ export default function ProfileSettings() {
   const brandNav = [
     { label: 'Brand Dashboard', icon: LayoutDashboard, path: '/dashboard/business' },
     { label: 'Post a Brief', icon: FileCheck, path: '/dashboard/business/post-brief' },
-    { label: 'Creator Bids', icon: Users, path: '/dashboard/business/pending-bids', badge: 3, tone: 'orange' },
+    { label: 'Creator Bids', icon: Users, path: '/dashboard/business/pending-bids' },
     { label: 'Browse Creator', icon: Search, path: '/dashboard/business/browse-creator' },
     { label: 'All Campaigns', icon: Briefcase, path: '/dashboard/business/all-campaigns' },
     { label: 'Work Review', icon: FileCheck, path: '/dashboard/business/work-review' },
-    { label: 'Messages', icon: MessageSquare, path: '/messages', badge: 2, tone: 'green' },
+    { label: 'Messages', icon: MessageSquare, path: '/messages' },
     { label: 'Manage Shipment', icon: Package, path: '/dashboard/business/shipments' },
     { label: 'Wallet', icon: Wallet, path: '/dashboard/business/wallet' },
     { label: 'Settings', icon: Settings, path: '/settings', active: true }
@@ -608,9 +629,9 @@ export default function ProfileSettings() {
             <em className={`bs-kyb ${company.kyb_status}`}>KYB {company.kyb_status || 'pending'}</em>
           </div>
           <div className="bs-card-body bs-form-grid">
-            {renderBrandField('Business Type', company.business_type, value => setCompany(current => ({ ...current, business_type: value })))}
+            {renderBrandField('Business Type', company.business_type, value => setCompany(current => ({ ...current, business_type: value })), { options: withCurrentValue(BUSINESS_TYPES, company.business_type), placeholder: 'Select business type' })}
             {renderBrandField('GST Number', company.gst_number, value => setCompany(current => ({ ...current, gst_number: value })))}
-            {renderBrandField('Business Category', company.business_category, value => setCompany(current => ({ ...current, business_category: value })))}
+            {renderBrandField('Business Category', company.business_category, value => setCompany(current => ({ ...current, business_category: value })), { options: withCurrentValue(BUSINESS_CATEGORIES, company.business_category), placeholder: 'Select category' })}
             {renderBrandField('Country', company.country, value => setCompany(current => ({ ...current, country: value })))}
             {renderBrandField('Billing Address', company.billing_address, value => setCompany(current => ({ ...current, billing_address: value })), { full: true, textarea: true })}
             {renderBrandField('City', company.city, value => setCompany(current => ({ ...current, city: value })))}
@@ -763,7 +784,7 @@ export default function ProfileSettings() {
 
   if (user?.role === 'business') {
     return (
-      <div className="dashboard-page">
+      <div className="dashboard-page brand-settings-page">
         <aside className="business-sidebar">
           <div>
             <div className="business-sidebar-brand">
@@ -787,7 +808,9 @@ export default function ProfileSettings() {
             </nav>
           </div>
           <div className="business-sidebar-profile">
-            <div className="business-avatar">{getInitial(displayName)}</div>
+            <div className="business-avatar">
+              {logoSrc ? <img src={logoSrc} alt="Brand logo" /> : getInitial(displayName)}
+            </div>
             <div>
               <strong>{displayName}</strong>
               <span>Approved Business</span>
@@ -811,15 +834,9 @@ export default function ProfileSettings() {
                 <input type="search" placeholder="Search deals, creators, briefs..." aria-label="Search dashboard" />
               </div>
               <div className="header-actions">
-                <button className="brand-round-action" type="button" aria-label="Notifications">
-                  <Bell size={18} />
-                  <i />
-                </button>
-                <button className="brand-round-action" type="button" aria-label="Help">
-                  <HelpCircle size={18} />
-                </button>
-                <button className="brand-profile-photo" type="button" aria-label="Profile">
-                  {getInitial(displayName)}
+                <NotificationBell />
+                <button className="brand-profile-photo" type="button" aria-label="Profile" onClick={() => setBrandTab('profile')}>
+                  {logoSrc ? <img src={logoSrc} alt="Brand logo" /> : getInitial(displayName)}
                 </button>
               </div>
             </div>
@@ -970,6 +987,15 @@ export default function ProfileSettings() {
                       maxLength={500}
                     />
                     <span className="ps-char-count">{bio.length}/500</span>
+                  </div>
+
+                  <div className="ps-form-group">
+                    <label>Raw video payout per video (₹)</label>
+                    <input type="number" min="1" value={rawPayout} onChange={e => setRawPayout(e.target.value)} placeholder="1000" />
+                  </div>
+                  <div className="ps-form-group">
+                    <label>Additional payout to edit one video (₹)</label>
+                    <input type="number" min="0" value={editingPayout} onChange={e => setEditingPayout(e.target.value)} placeholder="1000" />
                   </div>
 
                   <div className="ps-form-group">

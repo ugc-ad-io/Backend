@@ -32,6 +32,7 @@ import {
 } from 'lucide-react';
 import { EmptyPanel, formatMoney, getInitial } from '../components/CreatorComponents';
 import DashboardLayout from '../components/DashboardLayout';
+import CompletionReview from '../components/CompletionReview';
 import './MyDealsPage.css';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
@@ -149,6 +150,10 @@ export default function BrandDealRoom() {
 
   useEffect(() => {
     if (user?.id) fetchDeals();
+    const refresh = () => { if (user?.id && document.visibilityState === 'visible') fetchDeals(); };
+    const interval = setInterval(refresh, 30000);
+    window.addEventListener('focus', refresh);
+    return () => { clearInterval(interval); window.removeEventListener('focus', refresh); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id]);
 
@@ -364,6 +369,7 @@ export default function BrandDealRoom() {
 
           {/* Workspace */}
           <main className="deal-workspace">
+            <CompletionReview key={selectedDeal?.deal_id} deal={selectedDeal} />
             <section className="deal-card deal-brief-card">
               <button type="button" className="deal-brief-toggle" onClick={() => setBriefOpen((v) => !v)}>
                 <span><FileText size={18} /></span>
@@ -401,7 +407,7 @@ export default function BrandDealRoom() {
             </section>
 
             {/* Shipping block — brand uploads tracking in state 1 */}
-            <section className="deal-card deal-shipping-card" id="brand-tracking-card">
+            {selectedDeal?.shipment?.required && <section className="deal-card deal-shipping-card" id="brand-tracking-card">
               <div className="deal-section-title"><span><Truck size={18} /></span><div><h2>Shipping</h2><p>Coordinate product delivery to the creator</p></div></div>
               {selectedDeal?.shipment?.tracking_id ? (
                 <div className="deal-receipt-grid">
@@ -432,6 +438,7 @@ export default function BrandDealRoom() {
               )}
             </section>
 
+            }
             {/* Content review */}
             <section className="deal-card deal-delivery-card" id="brand-review-card">
               <div className="deal-section-title"><span><FileCheck size={18} /></span><div><h2>Content Review</h2><p>{watermarked ? 'Watermarked preview until you approve' : 'Approved — full-resolution unlocked'}</p></div></div>

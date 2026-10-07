@@ -13,8 +13,9 @@ export default function BusinessProfileSetup() {
   const { user, setUser } = useAuth();
   const [loading, setLoading] = useState(false);
   const [formData, setFormData] = useState({
+    business_name: user?.business_name || user?.profile?.business_name || user?.full_name || '',
     business_description: '',
-    website: '',
+    website: user?.profile?.website || '',
     social_links: { facebook: '', instagram: '', linkedin: '' },
     product_type: '',
     industry_category: '',
@@ -76,6 +77,7 @@ export default function BusinessProfileSetup() {
         <form onSubmit={handleSubmit} className="profile-form">
           <div className="form-section">
             <h3>Business Information</h3>
+            <div className="form-group"><label htmlFor="business_name">Brand Name</label><input id="business_name" className="input-field" value={formData.business_name} onChange={event => handleInputChange('business_name', event.target.value)} required /></div>
             <div className="form-group">
               <label htmlFor="business_description">Business Description</label>
               <textarea

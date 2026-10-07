@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../App';
 import axios from 'axios';
@@ -12,6 +13,7 @@ const API = `${BACKEND_URL}/api`;
 export default function ShipmentTracking() {
   const [searchParams] = useSearchParams();
   const campaignId = searchParams.get('campaign');
+  const creatorId = searchParams.get('creator');
   const navigate = useNavigate();
   const { user } = useAuth();
   const [campaign, setCampaign] = useState(null);
@@ -19,6 +21,7 @@ export default function ShipmentTracking() {
   const [loading, setLoading] = useState(true);
   const [showUpdateModal, setShowUpdateModal] = useState(false);
   const [showReceiveModal, setShowReceiveModal] = useState(false);
+  const modalViewportRef = useRef(null);
   const [shipmentData, setShipmentData] = useState({
     courier_name: '',
     courier_tracking_url: '',
@@ -36,12 +39,54 @@ export default function ShipmentTracking() {
     dispute_reason: ''
   });
 
-  useEffect(() => {
+  useLiveEffect(() => {
     if (campaignId) {
       fetchCampaign();
       fetchShipment();
     }
   }, [campaignId]);
+
+  useEffect(() => {
+    if (!showUpdateModal && !showReceiveModal) return;
+
+    const overlay = modalViewportRef.current;
+    const viewport = window.visualViewport;
+    let frame;
+    const keepFieldVisible = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        if (viewport) {
+          overlay.style.setProperty('--shipment-viewport-height', `${viewport.height}px`);
+          overlay.style.setProperty('--shipment-viewport-top', `${viewport.offsetTop}px`);
+        }
+        const field = document.activeElement;
+        if (overlay.contains(field) && field.matches('input, textarea, select')) {
+          const group = field.closest('.form-group') || field;
+          const content = field.closest('.modal-content');
+          const bounds = group.getBoundingClientRect();
+          const visible = content.getBoundingClientRect();
+          if (bounds.bottom > visible.bottom - 16) {
+            content.scrollTop += bounds.bottom - visible.bottom + 16;
+          } else if (bounds.top < visible.top + 16) {
+            content.scrollTop += bounds.top - visible.top - 16;
+          }
+        }
+      });
+    };
+
+    keepFieldVisible();
+    overlay.addEventListener('focusin', keepFieldVisible);
+    window.addEventListener('resize', keepFieldVisible);
+    viewport?.addEventListener('resize', keepFieldVisible);
+    viewport?.addEventListener('scroll', keepFieldVisible);
+    return () => {
+      cancelAnimationFrame(frame);
+      overlay.removeEventListener('focusin', keepFieldVisible);
+      window.removeEventListener('resize', keepFieldVisible);
+      viewport?.removeEventListener('resize', keepFieldVisible);
+      viewport?.removeEventListener('scroll', keepFieldVisible);
+    };
+  }, [showUpdateModal, showReceiveModal]);
 
   const fetchCampaign = async () => {
     try {
@@ -56,7 +101,7 @@ export default function ShipmentTracking() {
 
   const fetchShipment = async () => {
     try {
-      const response = await axios.get(`${API}/shipment/${campaignId}`);
+      const response = await axios.get(`${API}/shipment/${campaignId}${creatorId ? `?creator_id=${encodeURIComponent(creatorId)}` : ""}`);
       setShipment(response.data);
     } catch (error) {
       // Shipment might not exist yet
@@ -70,6 +115,7 @@ export default function ShipmentTracking() {
       const courierSlip = `https://storage.example.com/courier/${Date.now()}.pdf`;
       await axios.post(`${API}/shipment/update`, {
         campaign_id: campaignId,
+        ...(creatorId ? { creator_id: creatorId } : {}),
         courier_name: shipmentData.courier_name,
         courier_tracking_url: shipmentData.courier_tracking_url,
         tracking_number: shipmentData.tracking_number,
@@ -91,6 +137,7 @@ export default function ShipmentTracking() {
       const unboxingVideo = `https://storage.example.com/unboxing/${Date.now()}.mp4`;
       await axios.post(`${API}/shipment/receive`, {
         campaign_id: campaignId,
+        ...(creatorId ? { creator_id: creatorId } : {}),
         unboxing_video: unboxingVideo,
         items_damaged: receiveData.items_damaged,
         dispute_reason: receiveData.items_damaged ? receiveData.dispute_reason : undefined
@@ -260,7 +307,7 @@ export default function ShipmentTracking() {
 
       {/* Update Shipment Modal */}
       {showUpdateModal && (
-        <div className="modal-overlay" onClick={() => setShowUpdateModal(false)}>
+        <div ref={modalViewportRef} className="modal-overlay shipment-modal-overlay" onClick={() => setShowUpdateModal(false)}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
             <h2>Update Shipment Details</h2>
             <form onSubmit={handleUpdateShipment} className="shipment-form">
@@ -371,7 +418,7 @@ export default function ShipmentTracking() {
 
       {/* Receive Shipment Modal */}
       {showReceiveModal && (
-        <div className="modal-overlay" onClick={() => setShowReceiveModal(false)}>
+        <div ref={modalViewportRef} className="modal-overlay shipment-modal-overlay" onClick={() => setShowReceiveModal(false)}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
             <h2>Mark Shipment as Received</h2>
             <form onSubmit={handleReceiveShipment} className="receive-form">
@@ -689,6 +736,20 @@ export default function ShipmentTracking() {
           margin-bottom: 32px;
         }
 
+        .shipment-page .shipment-modal-overlay {
+          top: var(--shipment-viewport-top, 0px);
+          bottom: auto;
+          height: var(--shipment-viewport-height, 100dvh);
+          box-sizing: border-box;
+        }
+
+        .shipment-page .shipment-modal-overlay .modal-content {
+          max-height: 100%;
+          box-sizing: border-box;
+          overscroll-behavior: contain;
+          scroll-padding-block: 16px;
+        }
+
         .shipment-form,
         .receive-form {
           display: flex;
@@ -733,6 +794,20 @@ export default function ShipmentTracking() {
         }
 
         @media (max-width: 768px) {
+          .shipment-page .shipment-modal-overlay {
+            padding: 12px;
+          }
+
+          .shipment-page .shipment-modal-overlay .modal-content {
+            padding: 24px 20px;
+          }
+
+          .shipment-page .shipment-modal-overlay input,
+          .shipment-page .shipment-modal-overlay textarea,
+          .shipment-page .shipment-modal-overlay select {
+            font-size: 16px;
+          }
+
           .shipment-container {
             padding: 32px 24px;
           }

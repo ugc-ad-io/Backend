@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../App';
 import axios from 'axios';
@@ -50,8 +51,8 @@ function BriefSections({ campaign }) {
 
   return (
     <>
-      {/* Section 1: Campaign Basics */}
-      <Section title="Campaign Basics">
+      {/* Section 1: Campaign Overview */}
+      <Section title="Campaign Overview">
         <Field label="Product" value={campaign.product_name} />
         <Field label="Category" value={campaign.product_category} />
         <Field label="Product description" value={campaign.product_description} />
@@ -119,8 +120,8 @@ function BriefSections({ campaign }) {
       {/* Section 7: Timeline & Creator */}
       <Section title="Timeline & Creator">
         <Field label="Ship product by" value={campaign.product_shipping_by} />
-        <Field label="Draft delivery by" value={campaign.draft_delivery_by} />
-        <Field label="Final delivery by" value={campaign.final_delivery_by || campaign.due_date} />
+        <Field label={(campaign.deliverable_items || []).some(item => item.edited_required) ? 'Draft delivery by' : 'Content delivery by'} value={campaign.draft_delivery_by || campaign.due_date} />
+        {(campaign.deliverable_items || []).some(item => item.edited_required) && <Field label="Final delivery by" value={campaign.final_delivery_by || campaign.due_date} />}
         <Field label="Free revisions" value={campaign.free_revisions ?? campaign.revision_limit} />
         <Field label="Creator level" value={campaign.creator_level} />
         <Field label="Quality tier" value={campaign.content_quality_tier} />
@@ -148,6 +149,7 @@ export default function CampaignDetails() {
   const navigate = useNavigate();
   const { user } = useAuth();
   const [campaign, setCampaign] = useState(null);
+  const [publishing, setPublishing] = useState(false);
   const [loading, setLoading] = useState(true);
   const [selectedCreator, setSelectedCreator] = useState(null);
   const [showBidModal, setShowBidModal] = useState(false);
@@ -159,8 +161,26 @@ export default function CampaignDetails() {
   const [showCreatorModal, setShowCreatorModal] = useState(false);
   const [creatorDetails, setCreatorDetails] = useState(null);
   const [loadingCreator, setLoadingCreator] = useState(false);
+  const [scriptBusy, setScriptBusy] = useState(false);
+  const [scriptChangeNote, setScriptChangeNote] = useState('');
+  const [requestingScriptChanges, setRequestingScriptChanges] = useState(false);
+  const handleScriptReview = async (action) => {
+    if (scriptBusy) return;
+    if (action === 'request_changes' && !scriptChangeNote.trim()) {
+      toast.error('Tell the team what to change.'); return;
+    }
+    setScriptBusy(true);
+    try {
+      await axios.post(`${API}/campaigns/${id}/script-confirmation`, { action, note: scriptChangeNote.trim() });
+      await fetchCampaign();
+      setRequestingScriptChanges(false);
+      toast.success(action === 'confirm' ? 'Script confirmed' : 'Change request sent');
+    } catch (error) {
+      toast.error(error.response?.data?.detail || 'Unable to update script');
+    } finally { setScriptBusy(false); }
+  };
 
-  useEffect(() => {
+  useLiveEffect(() => {
     fetchCampaign();
   }, [id]);
 
@@ -306,6 +326,51 @@ export default function CampaignDetails() {
 
       <div className="campaign-container fade-in">
         <div className="campaign-main">
+          {isBusiness && campaign.status === 'awaiting_brand_confirmation' && (
+            <section className="brand-script-review">
+              <h3>Your script is ready ? review it</h3>
+              <p>Creators see the brief after you confirm.</p>
+              <div className="brand-script-content">{campaign.script_text || 'No script attached. Contact support.'}</div>
+              {requestingScriptChanges && <textarea aria-label="Requested script changes" value={scriptChangeNote} onChange={e => setScriptChangeNote(e.target.value)} placeholder="What should change?" />}
+              <div className="brand-script-actions">
+                <button disabled={scriptBusy} className="brand-script-primary" onClick={() => handleScriptReview(requestingScriptChanges ? 'request_changes' : 'confirm')}>{scriptBusy ? 'Please wait?' : requestingScriptChanges ? 'Send change request' : 'Confirm ? send to creators'}</button>
+                <button disabled={scriptBusy} onClick={() => setRequestingScriptChanges(!requestingScriptChanges)}>{requestingScriptChanges ? 'Back' : 'Request changes'}</button>
+              </div>
+            </section>
+          )}
+          {isBusiness && ['draft', 'rejected'].includes(campaign.status) && <section className="brand-script-review">
+            <h3>This brief is in draft</h3>
+            <p>Publish your brief to submit it for approval. The campaign budget and listing fee will be reserved from your wallet.</p>
+            <button type="button" className="btn-primary" disabled={publishing} onClick={async () => {
+              setPublishing(true);
+              try {
+                await axios.post(`${API}/campaigns/${id}/submit`);
+                await fetchCampaign();
+                toast.success('Brief submitted for approval');
+              } catch (error) {
+                const detail = error.response?.data?.detail;
+                toast.error(typeof detail === 'string' ? detail : detail?.message || 'Complete the required brief fields before publishing');
+              } finally { setPublishing(false); }
+            }}>{publishing ? 'Publishing...' : 'Publish Brief'}</button>
+          </section>}
+          {isBusiness && hiredIds(campaign).length > 0 && (
+            <section className="brand-hired-creators">
+              <h3>Hired creators ({hiredIds(campaign).length})</h3>
+              {hiredIds(campaign).map(creatorId => {
+                const hired = campaign.hired_creators?.find(c => String(c.id) === String(creatorId));
+                const bid = campaign.bids?.find(b => String(b.creator_id) === String(creatorId));
+                const name = hired?.name || bid?.creator_name || bid?.creator_nickname || 'Creator';
+                return <div key={creatorId} className="brand-hired-creator">
+                  <strong>{name}</strong>
+                  <div className="brand-hired-actions">
+                    <button onClick={() => handleViewCreatorProfile(creatorId)}>Profile</button>
+                    <button onClick={() => navigate(`/chat/${creatorId}`)}>Chat</button>
+                    {(campaign.requires_shipment || campaign.shipment_required) && <button onClick={() => navigate(`/shipment?campaign=${encodeURIComponent(id)}&creator=${encodeURIComponent(creatorId)}`)}>Ship</button>}
+                  </div>
+                </div>;
+              })}
+            </section>
+          )}
           <div className="campaign-info-card">
             <div className="campaign-title-section">
               <h1>{campaign.title}</h1>
@@ -424,7 +489,7 @@ export default function CampaignDetails() {
                       <div className="bid-row-left">
                         <div className="bid-number">#{idx + 1}</div>
                         <div className="bid-info">
-                          <div className="bid-creator-name">{bid.creator_nickname}</div>
+                          <div className="bid-creator-name">{bid.creator_name || bid.creator_nickname || 'Creator'}</div>
                           <div className="bid-meta-inline">
                             <span className="bid-amount-inline">${bid.amount}</span>
                             {bid.raw_amount != null && <small> (Raw Rs. {bid.raw_amount} + Edited Rs. {bid.edited_amount})</small>}

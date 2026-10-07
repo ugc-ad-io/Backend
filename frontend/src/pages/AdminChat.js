@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { useState } from 'react';
 import axios from 'axios';
 import { toast } from 'sonner';
 import { Shield, ShieldAlert, LogIn, Pause, FileDown, ListFilter, Send, RotateCcw } from 'lucide-react';
@@ -38,8 +39,8 @@ export default function AdminChat() {
     catch (e) { toast.error('Failed to load audit log'); }
   };
 
-  useEffect(() => { loadThreads(); }, []);
-  useEffect(() => {
+  useLiveEffect(() => { loadThreads(); }, []);
+  useLiveEffect(() => {
     if (tab === 'filter') loadFilterLog();
     if (tab === 'audit') loadAudit();
   }, [tab]);

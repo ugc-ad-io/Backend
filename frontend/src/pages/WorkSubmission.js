@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useLiveEffect } from "../lib/liveUpdates";
+import { useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../App';
 import axios from 'axios';
@@ -18,7 +19,7 @@ export default function WorkSubmission() {
   const [description, setDescription] = useState('');
   const [files, setFiles] = useState([]);
 
-  useEffect(() => {
+  useLiveEffect(() => {
     if (campaignId) {
       fetchCampaign();
     }

@@ -1,42 +1,45 @@
-import { useState, useEffect, createContext, useContext } from 'react';
+import { startLiveUpdates } from "./lib/liveUpdates";
+import { useState, useEffect, createContext, useContext, lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import './App.css';
 import Landing from './pages/Landing';
 import Auth from './pages/Auth';
-import CreatorProfileSetup from './pages/CreatorProfileSetup';
-import BusinessProfileSetup from './pages/BusinessProfileSetup';
-import CreatorDashboard from './pages/CreatorDashboard';
-import BusinessDashboard from './pages/BusinessDashboard';
-import BrandWelcomePage from './pages/BrandWelcomePage';
-import AdminDashboard from './pages/AdminDashboard';
-import ProfileSettings from './pages/ProfileSettings';
-import CampaignDetails from './pages/CampaignDetails';
-import BrandShortlist from './pages/BrandShortlist';
-import AdminMatchQueue from './pages/AdminMatchQueue';
-import AdminDisputes from './pages/AdminDisputes';
-import RaiseDispute from './pages/RaiseDispute';
-import MessagesPage from './pages/MessagesPage';
-import ChatPage from './pages/ChatPage';
-import WorkSubmission from './pages/WorkSubmission';
-import WorkReview from './pages/WorkReview';
-import PayoutWithLayout from './pages/PayoutWithLayout';
-import ShipmentTracking from './pages/ShipmentTracking';
-import BrowseBriefs from './pages/BrowseBriefs';
-import MyDealsPage from './pages/MyDealsPage';
-import BrandDealRoom from './pages/BrandDealRoom';
-import AdminDealRoom from './pages/AdminDealRoom';
-import AdminChat from './pages/AdminChat';
-import MyBidsPage from './pages/MyBidsPage';
-import MyActiveWorkPage from './pages/MyActiveWorkPage';
-import ReviewsPage from './pages/ReviewsPage';
-import PortfolioPage from './pages/PortfolioPage';
-import CreateGig from './pages/CreateGig';
-import AdminGigManagement from './pages/AdminGigManagement';
-import BrowseApprovedGigs from './pages/BrowseApprovedGigs';
-import ApplicationsPage from './pages/ApplicationsPage';
 import AdminLayout from './components/AdminLayout';
 import { Toaster } from 'sonner';
+
+const CreatorProfileSetup = lazy(() => import('./pages/CreatorProfileSetup'));
+const BusinessProfileSetup = lazy(() => import('./pages/BusinessProfileSetup'));
+const CreatorDashboard = lazy(() => import('./pages/CreatorDashboard'));
+const BusinessDashboard = lazy(() => import('./pages/BusinessDashboard'));
+const BrandWelcomePage = lazy(() => import('./pages/BrandWelcomePage'));
+const AdminDashboard = lazy(() => import('./pages/AdminDashboard'));
+const ProfileSettings = lazy(() => import('./pages/ProfileSettings'));
+const PublicProfile = lazy(() => import('./pages/PublicProfile'));
+const CampaignDetails = lazy(() => import('./pages/CampaignDetails'));
+const BrandShortlist = lazy(() => import('./pages/BrandShortlist'));
+const AdminMatchQueue = lazy(() => import('./pages/AdminMatchQueue'));
+const AdminDisputes = lazy(() => import('./pages/AdminDisputes'));
+const RaiseDispute = lazy(() => import('./pages/RaiseDispute'));
+const MessagesPage = lazy(() => import('./pages/MessagesPage'));
+const ChatPage = lazy(() => import('./pages/ChatPage'));
+const WorkSubmission = lazy(() => import('./pages/WorkSubmission'));
+const WorkReview = lazy(() => import('./pages/WorkReview'));
+const PayoutWithLayout = lazy(() => import('./pages/PayoutWithLayout'));
+const ShipmentTracking = lazy(() => import('./pages/ShipmentTracking'));
+const BrowseBriefs = lazy(() => import('./pages/BrowseBriefs'));
+const MyDealsPage = lazy(() => import('./pages/MyDealsPage'));
+const BrandDealRoom = lazy(() => import('./pages/BrandDealRoom'));
+const AdminDealRoom = lazy(() => import('./pages/AdminDealRoom'));
+const AdminChat = lazy(() => import('./pages/AdminChat'));
+const MyBidsPage = lazy(() => import('./pages/MyBidsPage'));
+const MyActiveWorkPage = lazy(() => import('./pages/MyActiveWorkPage'));
+const ReviewsPage = lazy(() => import('./pages/ReviewsPage'));
+const PortfolioPage = lazy(() => import('./pages/PortfolioPage'));
+const CreateGig = lazy(() => import('./pages/CreateGig'));
+const AdminGigManagement = lazy(() => import('./pages/AdminGigManagement'));
+const BrowseApprovedGigs = lazy(() => import('./pages/BrowseApprovedGigs'));
+const ApplicationsPage = lazy(() => import('./pages/ApplicationsPage'));
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -54,6 +57,7 @@ axios.interceptors.request.use((config) => {
 });
 
 function AuthProvider({ children }) {
+  useEffect(() => startLiveUpdates(), []);
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -73,6 +77,19 @@ function AuthProvider({ children }) {
     }
   }, []);
 
+  useEffect(() => {
+    const refresh = () => {
+      if (document.visibilityState !== 'visible' || !localStorage.getItem('token')) return;
+      axios.get(`${API}/auth/me`).then(res => setUser(res.data)).catch(() => {});
+    };
+    const interval = setInterval(refresh, 60000);
+    window.addEventListener('focus', refresh);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', refresh);
+    };
+  }, []);
+
   const login = (token, userData) => {
     localStorage.setItem('token', token);
     setUser(userData);
@@ -83,19 +100,17 @@ function AuthProvider({ children }) {
     setUser(null);
   };
 
-  if (loading) {
-    return <div className="loading-screen">Loading...</div>;
-  }
-
   return (
-    <AuthContext.Provider value={{ user, setUser, login, logout }}>
+    <AuthContext.Provider value={{ user, setUser, login, logout, loading }}>
       {children}
     </AuthContext.Provider>
   );
 }
 
 function ProtectedRoute({ children, allowedRoles }) {
-  const { user } = useAuth();
+  const { user, loading } = useAuth();
+
+  if (loading) return <div className="loading-screen" role="status">Loading account...</div>;
 
   if (!user) {
     return <Navigate to="/auth" />;
@@ -114,6 +129,7 @@ function App() {
       <BrowserRouter>
         <AuthProvider>
           <Toaster position="top-right" richColors />
+          <Suspense fallback={<div className="loading-screen" role="status">Loading page...</div>}>
           <Routes>
             <Route path="/" element={<Landing />} />
             <Route path="/auth" element={<Auth />} />
@@ -431,7 +447,9 @@ function App() {
                 </ProtectedRoute>
               }
             />
+            <Route path="/profile/:id" element={<ProtectedRoute allowedRoles={['business', 'creator', 'admin', 'campaign_manager', 'support_staff']}><PublicProfile /></ProtectedRoute>} />
           </Routes>
+          </Suspense>
         </AuthProvider>
       </BrowserRouter>
     </div>

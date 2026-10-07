@@ -70,14 +70,16 @@ def test_directory_preview_reads_structured_profile_portfolio_items():
     assert result["portfolio_preview"] == item["videoUrl"]
     assert result["portfolio_video"] == item["videoUrl"]
 
-
 def test_directory_separates_uploaded_video_from_its_thumbnail():
     video_url = "https://res.cloudinary.com/example/video/upload/sample.mp4"
     thumbnail_url = "https://cdn.example.com/sample.jpg"
     result = server.creator_directory_public_view(
         creator(
             "video-with-thumbnail",
-            portfolio=[{"thumbnail_url": thumbnail_url, "videoUrl": video_url}],
+            portfolio=[{
+                "thumbnail_url": thumbnail_url,
+                "videoUrl": video_url,
+            }],
         ),
         deliverables_completed=0,
     )
