@@ -25,7 +25,7 @@ security = HTTPBearer()
 
 JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key-change-in-production')
 JWT_ALGORITHM = 'HS256'
-BASE_URL = os.environ.get('BASE_URL', 'https://backend-chq9.onrender.com')
+BASE_URL = os.environ.get('BASE_URL', 'https://app.ugcad.io')
 
 # ============================================================================
 # ENUMS
