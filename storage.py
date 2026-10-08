@@ -12,10 +12,11 @@ Configure with either:
   * ``CLOUDINARY_URL=cloudinary://<api_key>:<api_secret>@<cloud_name>``  (one var)
   * or ``CLOUDINARY_CLOUD_NAME`` + ``CLOUDINARY_API_KEY`` + ``CLOUDINARY_API_SECRET``
 
-Video uploads require S3 configuration and never fall back to Cloudinary.
-Configure ``S3_BUCKET``, ``S3_ACCESS_KEY_ID`` and ``S3_SECRET_ACCESS_KEY``.
-Optional: ``S3_REGION``, ``S3_ENDPOINT``, ``S3_FORCE_PATH_STYLE`` and
-``S3_PUBLIC_URL`` (CDN base).
+S3 (AWS or any S3-compatible store such as MinIO) takes priority over Cloudinary
+when ``S3_BUCKET`` + ``S3_ACCESS_KEY_ID`` + ``S3_SECRET_ACCESS_KEY`` are set, so
+turning it on is an env change, not a code change. Optional: ``S3_REGION``,
+``S3_ENDPOINT`` (non-AWS), ``S3_FORCE_PATH_STYLE``, ``S3_PUBLIC_URL`` (CDN base).
+Video uploads require S3 to be configured and never fall back to Cloudinary.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ import io
 import logging
 import mimetypes
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -35,27 +38,26 @@ _s3_client = None
 
 
 def s3_enabled() -> bool:
-    return all(os.environ.get(key) for key in ("S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"))
+    return all(os.environ.get(k) for k in ("S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"))
 
 
 def s3_public_url(key: str) -> str:
-    """Build the public URL for an object stored in the configured S3 bucket."""
+    """The URL a browser loads the object from. Objects must be publicly
+    readable there (bucket policy or a CDN) — the URL is stored as-is."""
     path = quote(key)
-    public_base = os.environ.get("S3_PUBLIC_URL")
-    if public_base:
-        return f"{public_base.rstrip('/')}/{path}"
-
+    base = os.environ.get("S3_PUBLIC_URL")
+    if base:
+        return f"{base.rstrip('/')}/{path}"
     bucket = os.environ["S3_BUCKET"]
     endpoint = os.environ.get("S3_ENDPOINT")
-    if endpoint:
+    if endpoint:  # MinIO and friends address the bucket in the path
         return f"{endpoint.rstrip('/')}/{bucket}/{path}"
-
     region = os.environ.get("S3_REGION") or "us-east-1"
     return f"https://{bucket}.s3.{region}.amazonaws.com/{path}"
 
 
 def upload_to_s3(content: bytes, key: str) -> Optional[str]:
-    """Upload an object to S3 and return its public URL."""
+    """Upload bytes to the S3 bucket and return the public URL, or None on failure."""
     global _s3_client
     try:
         if _s3_client is None:
@@ -71,12 +73,12 @@ def upload_to_s3(content: bytes, key: str) -> Optional[str]:
                 endpoint_url=os.environ.get("S3_ENDPOINT") or None,
                 config=Config(s3={"addressing_style": "path" if path_style else "auto"}),
             )
-
+        # Without a Content-Type S3 serves octet-stream and a browser downloads
+        # the video instead of playing it. upload_fileobj goes multipart on its
+        # own for large files.
         content_type = mimetypes.guess_type(key)[0] or "application/octet-stream"
         _s3_client.upload_fileobj(
-            io.BytesIO(content),
-            os.environ["S3_BUCKET"],
-            key,
+            io.BytesIO(content), os.environ["S3_BUCKET"], key,
             ExtraArgs={"ContentType": content_type},
         )
         return s3_public_url(key)
@@ -86,7 +88,8 @@ def upload_to_s3(content: bytes, key: str) -> Optional[str]:
 
 
 class CloudStorageError(Exception):
-    """Persistent storage is unavailable or rejected an upload."""
+    """Persistent storage is unavailable or rejected the upload. Raised rather
+    than silently falling back to another provider or ephemeral local disk."""
 
 
 def _ensure_cloudinary() -> bool:
@@ -160,6 +163,72 @@ def upload_to_cloudinary(content: bytes, public_id: str, kind: Optional[str] = N
         return None
 
 
+def _video_codec(path: str) -> Optional[str]:
+    """First video stream's codec name, or None if ffprobe can't tell."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def ensure_browser_compatible_video(content: bytes) -> tuple[bytes, bool]:
+    """Re-encode to H.264/AAC in a true MP4 container if needed for browser playback.
+
+    Phones — iPhones especially, in their default "High Efficiency" camera mode
+    — record HEVC/H.265 video. Browsers can read the file (duration, audio) but
+    most can't decode HEVC frames, so the video plays as a black box with sound
+    only. Cloudinary used to fix this invisibly via an on-the-fly transform; S3
+    just serves the raw file, so without this the bug comes back for every
+    phone-recorded upload.
+
+    Returns (possibly-new bytes, whether the container was normalized to .mp4).
+    When codec is already H.264 this still remuxes (stream copy — fast, no
+    quality loss) rather than skipping entirely: it guarantees the output is a
+    genuine .mp4 container, which matters because the caller renames the file
+    to .mp4 whenever this returns True — serving a .mov file under a .mp4 name
+    (wrong Content-Type) would just trade one playback bug for another.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "in")
+        with open(src, "wb") as f:
+            f.write(content)
+
+        codec = _video_codec(src)
+        if codec is None:
+            # Unreadable/corrupt upload — let it through as-is; persist_file's
+            # caller already validates the file before this point, and failing
+            # the whole upload over a transcode we can't even diagnose is worse
+            # than occasionally storing an unplayable file.
+            logger.warning("[video] ffprobe couldn't read codec; storing untranscoded")
+            return content, False
+
+        dst = os.path.join(tmp, "out.mp4")
+        # Already H.264: fast remux only (no re-encode). Anything else: full transcode.
+        video_args = ["-c:v", "copy"] if codec == "h264" else [
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+        ]
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", src, *video_args, "-c:a", "aac",
+                 "-movflags", "+faststart", dst],
+                capture_output=True, timeout=300, check=True,
+            )
+        except Exception as exc:
+            logger.error("[video] transcode failed (codec=%s, %.1f MB): %s",
+                         codec, len(content) / (1024 * 1024), exc)
+            raise CloudStorageError(
+                "Could not process this video. Please try a different file or format; "
+                "if this keeps happening, contact support."
+            )
+        with open(dst, "rb") as f:
+            return f.read(), True
+
+
 def persist_file(
     content: bytes,
     unique_filename: str,
@@ -171,29 +240,33 @@ def persist_file(
 ) -> str:
     """Store an uploaded file and return a retrievable URL.
 
-    Videos require S3 and never fall back to Cloudinary or local storage.
-    Other media uses Cloudinary when configured and local storage only for
-    development environments without a cloud provider."""
+    Prefers Cloudinary (persistent); falls back to writing to the local uploads
+    disk and returning ``public_path`` (e.g. ``/uploads/profiles/x.jpg``) ONLY
+    when Cloudinary isn't configured at all (local dev). When Cloudinary is
+    configured but rejects the file, this raises CloudStorageError instead —
+    a local-disk fallback on Render just stores a path that 404s after the
+    next deploy (this silently destroyed creator work submissions before).
+
+    Videos require S3; other files use S3 when configured, otherwise Cloudinary
+    or local development storage."""
     if kind == "video":
-        if not s3_enabled():
-            raise CloudStorageError(
-                "Video storage is not configured for S3. Please contact support before retrying."
-            )
-        url = upload_to_s3(content, f"{cloud_folder}/{unique_filename}")
-        if url:
-            return url
-        raise CloudStorageError(
-            f"Could not store this file ({len(content) / (1024 * 1024):.0f} MB) in S3. "
-            "Please try again; if this keeps happening, contact support."
-        )
+        content, normalized = ensure_browser_compatible_video(content)
+        if normalized and not unique_filename.lower().endswith(".mp4"):
+            unique_filename = f"{Path(unique_filename).stem}.mp4"
+            public_path = f"{public_path.rsplit('.', 1)[0]}.mp4" if "." in Path(public_path).name else public_path
 
     if s3_enabled():
         url = upload_to_s3(content, f"{cloud_folder}/{unique_filename}")
         if url:
             return url
         raise CloudStorageError(
-            f"Could not store this file ({len(content) / (1024 * 1024):.0f} MB) in S3. "
+            f"Could not store this file ({len(content) / (1024 * 1024):.0f} MB). "
             "Please try again; if this keeps happening, contact support."
+        )
+
+    if kind == "video":
+        raise CloudStorageError(
+            "Video storage is not configured for S3. Please contact support before retrying."
         )
 
     public_id = Path(unique_filename).stem

@@ -43,9 +43,13 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# curl is used by the compose healthcheck; libjq/libonig are jq's runtime libs.
+# curl is used by the compose healthcheck; libjq/libonig are jq's runtime libs;
+# ffmpeg transcodes uploaded video to browser-compatible H.264 (storage.py
+# ensure_browser_compatible_video) — phones record HEVC, which S3 serves as-is
+# and most browsers can't decode.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl \
+      ffmpeg \
       libjq1 \
       libonig5 \
     && rm -rf /var/lib/apt/lists/*
