@@ -164,14 +164,20 @@ def upload_to_cloudinary(content: bytes, public_id: str, kind: Optional[str] = N
 
 
 def _video_codec(path: str) -> Optional[str]:
-    """First video stream's codec name, or None if ffprobe can't tell."""
+    """First video stream's codec name, or None if ffprobe can't tell.
+
+    `csv=p=0` emits a trailing comma on some ffprobe builds even for a single
+    field ("h264,\\r\\n") — strip it, or the codec=="h264" check below never
+    matches and every already-compatible upload pays for a full re-encode it
+    didn't need.
+    """
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
             capture_output=True, text=True, timeout=30,
         )
-        return out.stdout.strip() or None
+        return out.stdout.strip().split(',')[0].strip() or None
     except Exception:
         return None
 
