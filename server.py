@@ -3527,6 +3527,26 @@ async def signup(data: SignupRequest):
         "approval_status": user_doc["approval_status"],
     }
 
+def two_factor_gate(user: dict, totp_token: Optional[str]) -> Optional[dict]:
+    """The second factor, for EVERY route that signs a user in.
+
+    Returns None when the sign-in may go ahead, or the reply asking for a code.
+    Deliberately hands out no token of any kind until the code checks out: the
+    old reply carried a "temp_token" that was a full 7-day session, so the
+    password alone was enough to get in.
+    """
+    if not user.get('two_factor_enabled'):
+        return None
+    if not totp_token:
+        return {"requires_2fa": True, "message": "2FA verification required"}
+    secret = user.get('two_factor_secret')
+    if not secret:
+        raise HTTPException(status_code=500, detail="2FA misconfigured")
+    if not pyotp.TOTP(secret).verify(totp_token, valid_window=1):
+        raise HTTPException(status_code=401, detail="Invalid 2FA code")
+    return None
+
+
 @api_router.post("/auth/login")
 async def login(data: LoginRequest, totp_token: Optional[str] = None):
     user = await db.users.find_one({"email": data.email}, {"_id": 0})
@@ -3547,25 +3567,10 @@ async def login(data: LoginRequest, totp_token: Optional[str] = None):
         await db.users.update_one({"id": user['id']}, {"$set": {"active": True}})
         user['active'] = True
 
-    # Check if 2FA is enabled
-    if user.get('two_factor_enabled'):
-        if not totp_token:
-            # Return a special response indicating 2FA is required
-            return {
-                "requires_2fa": True,
-                "temp_token": create_token(user['id'], user['email'], user['role']),
-                "message": "2FA verification required"
-            }
-        
-        # Verify 2FA token
-        secret = user.get('two_factor_secret')
-        if not secret:
-            raise HTTPException(status_code=500, detail="2FA misconfigured")
-        
-        totp = pyotp.TOTP(secret)
-        if not totp.verify(totp_token, valid_window=1):
-            raise HTTPException(status_code=401, detail="Invalid 2FA code")
-    
+    challenge = two_factor_gate(user, totp_token)
+    if challenge:
+        return challenge
+
     token = create_token(user['id'], user.get('email', data.email), user.get('role'))
     return {
         "token": token,
@@ -3612,7 +3617,7 @@ def _verify_google_id_token(credential: str) -> Optional[dict]:
 
 
 @api_router.post("/auth/google")
-async def google_auth(data: GoogleAuthRequest):
+async def google_auth(data: GoogleAuthRequest, totp_token: Optional[str] = None):
     """Sign in / sign up with Google. The client sends the ID token (credential)
     from Google Identity Services; we verify it, find-or-create the user, then
     issue our own JWT — same response shape as /auth/login."""
@@ -3672,6 +3677,11 @@ async def google_auth(data: GoogleAuthRequest):
         if user.get("banned", False):
             raise HTTPException(status_code=403, detail=f"Account banned: {user.get('ban_reason', 'Account suspended')}")
         await enforce_suspension(user)
+        # Google proves who the user is, not that they hold the second factor.
+        # The client retries with the same credential plus ?totp_token=.
+        challenge = two_factor_gate(user, totp_token)
+        if challenge:
+            return challenge
 
         # Self-deactivation hides the account until the user logs back in,
         # mirroring /auth/login.
@@ -3756,7 +3766,7 @@ def _auth_response(user: dict) -> dict:
 
 
 @api_router.post("/auth/apple")
-async def apple_auth(data: AppleAuthRequest):
+async def apple_auth(data: AppleAuthRequest, totp_token: Optional[str] = None):
     """Sign in / sign up with Apple. Required by App Store guideline 4.8 wherever
     we offer Google sign-in. Mirrors /auth/google: verify the identity token,
     find-or-create the user, issue our own JWT.
@@ -3843,6 +3853,9 @@ async def apple_auth(data: AppleAuthRequest):
         if user.get("banned", False):
             raise HTTPException(status_code=403, detail=f"Account banned: {user.get('ban_reason', 'Account suspended')}")
         await enforce_suspension(user)
+        challenge = two_factor_gate(user, totp_token)
+        if challenge:
+            return challenge
 
         if user.get('active') is False:
             await db.users.update_one({"id": user["id"]}, {"$set": {"active": True}})
@@ -3952,6 +3965,10 @@ async def reset_password(data: ResetPasswordRequest):
         {"$set": {"password": hash_password(password)}, "$unset": {"reset_code": "", "reset_code_expires": ""}},
     )
     fresh = await db.users.find_one({"id": user["id"]}, {"_id": 0})
+    # The reset code only proves access to the inbox. With 2FA on, that must not
+    # be a way in: change the password, then make them sign in with the code.
+    if (fresh or user).get("two_factor_enabled"):
+        return {"requires_2fa": True, "message": "Password reset. Sign in with your new password and your authenticator code."}
     return _auth_response(fresh or user)
 
 
@@ -6405,7 +6422,9 @@ async def setup_2fa(current_user: dict = Depends(get_current_user)):
     
     return {
         "secret": secret,
-        "qr_code": f"data:image/png;base64,{img_str}"
+        "qr_code": f"data:image/png;base64,{img_str}",
+        # Lets the app open the authenticator directly; you can't scan your own screen.
+        "otpauth_url": totp_uri,
     }
 
 @api_router.post("/profile/2fa/verify")
