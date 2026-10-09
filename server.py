@@ -56,7 +56,10 @@ from categories import categories_router, seed_categories
 from gigs import gigs_router
 import creator_features as cf
 import agreement_content as agr
-from storage import persist_file, cloudinary_enabled, CloudStorageError
+from storage import (
+    persist_file, cloudinary_enabled, CloudStorageError,
+    s3_enabled, s3_public_url, presign_video_post, s3_object_size, s3_delete, process_incoming_video,
+)
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -13724,6 +13727,119 @@ async def upload_file(file: UploadFile = File(...), current_user: dict = Depends
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
+
+# ── Direct-to-S3 video upload (up to VIDEO_MAX_BYTES) ───────────────────────
+# /upload/file cannot carry a big video: the hosting proxy in front of this server
+# cuts requests past ~100 MB and the browser only sees "Network Error". So large
+# videos go browser -> S3 directly (presign), then the server converts them to
+# browser-playable MP4 in the background (finalize) while the page polls (status).
+INCOMING_UPLOAD_PREFIX = "ugcad/incoming"
+VIDEO_JOB_STALE_SECONDS = 45 * 60
+_video_job_slot = asyncio.Semaphore(1)   # ffmpeg is CPU/disk heavy: one conversion at a time
+_video_job_tasks: set = set()            # strong refs so a running job is never garbage-collected
+
+
+class PresignRequest(BaseModel):
+    filename: str
+    content_type: str = ""
+    size: int
+
+
+class FinalizeRequest(BaseModel):
+    key: str
+    original_filename: Optional[str] = None
+
+
+@api_router.post("/upload/presign")
+async def presign_video_upload(data: PresignRequest, current_user: dict = Depends(get_current_user)):
+    """Signed form for ONE browser-to-S3 video upload. S3 enforces the size and
+    content type, so the cap holds even if the page is tampered with."""
+    if not s3_enabled():
+        raise HTTPException(status_code=501, detail="Large video uploads are not available on this server.")
+    kind = validate_upload_payload(data.content_type, data.filename, data.size)
+    if kind != "video":
+        raise HTTPException(status_code=400, detail="Direct upload is only for videos.")
+    # Whatever the client claims, sign a real video type so S3 never serves it as HTML.
+    content_type = data.content_type if data.content_type in VIDEO_CONTENT_TYPES else "video/mp4"
+    ext = re.sub(r"[^a-z0-9.]", "", Path(data.filename).suffix.lower())[:8]
+    key = f"{INCOMING_UPLOAD_PREFIX}/{current_user['id']}_{uuid.uuid4()}{ext}"
+    post = await asyncio.to_thread(presign_video_post, key, content_type, VIDEO_MAX_BYTES)
+    return {"url": post["url"], "fields": post["fields"], "key": key, "max_bytes": VIDEO_MAX_BYTES}
+
+
+async def _run_video_job(job_id: str) -> None:
+    job = await db.upload_jobs.find_one({"id": job_id}, {"_id": 0})
+    if not job:
+        return
+    final_name = f"{job['user_id']}_{uuid.uuid4()}.mp4"
+    final_key = f"ugcad/uploads/{final_name}"
+    try:
+        async with _video_job_slot:
+            duration, size = await asyncio.to_thread(process_incoming_video, job["key"], final_key, MAX_VIDEO_SECONDS)
+        metadata = {
+            "id": str(uuid.uuid4()),
+            "file_url": s3_public_url(final_key),
+            "filename": final_name,
+            "original_filename": job.get("original_filename"),
+            "content_type": "video/mp4",
+            "size": size,
+            "kind": "video",
+            "duration_seconds": duration,
+            "uploaded_by": job["user_id"],
+            "created_at": now_iso(),
+        }
+        await db.uploaded_files.insert_one(dict(metadata))
+        await db.upload_jobs.update_one({"id": job_id}, {"$set": {"status": "done", "result": metadata, "finished_at": now_iso()}})
+    except CloudStorageError as exc:
+        await db.upload_jobs.update_one({"id": job_id}, {"$set": {"status": "failed", "error": str(exc), "finished_at": now_iso()}})
+    except Exception:
+        logger.exception("[video-job] %s failed", job_id)
+        await db.upload_jobs.update_one({"id": job_id}, {"$set": {
+            "status": "failed", "error": "Could not process this video. Please try again.", "finished_at": now_iso()}})
+    finally:
+        await asyncio.to_thread(s3_delete, job["key"])
+
+
+@api_router.post("/upload/finalize")
+async def finalize_video_upload(data: FinalizeRequest, current_user: dict = Depends(get_current_user)):
+    """The browser finished sending the video to S3: start converting it. Returns
+    a job id immediately; poll /upload/status/{job_id} for the result."""
+    uid = current_user["id"]
+    if ".." in data.key or not data.key.startswith(f"{INCOMING_UPLOAD_PREFIX}/{uid}_"):
+        raise HTTPException(status_code=403, detail="Not your upload.")
+    existing = await db.upload_jobs.find_one({"key": data.key, "user_id": uid}, {"_id": 0})
+    if existing:   # a retried request must not start a second conversion
+        return {"job_id": existing["id"], "status": existing["status"]}
+    size = await asyncio.to_thread(s3_object_size, data.key)
+    if not size:
+        raise HTTPException(status_code=404, detail="We did not receive that upload. Please try again.")
+    job = {
+        "id": str(uuid.uuid4()), "user_id": uid, "key": data.key, "status": "processing",
+        "original_filename": data.original_filename, "size": size, "created_at": now_iso(),
+    }
+    await db.upload_jobs.insert_one(dict(job))
+    task = asyncio.create_task(_run_video_job(job["id"]))
+    _video_job_tasks.add(task)
+    task.add_done_callback(_video_job_tasks.discard)
+    return {"job_id": job["id"], "status": "processing"}
+
+
+@api_router.get("/upload/status/{job_id}")
+async def video_upload_status(job_id: str, current_user: dict = Depends(get_current_user)):
+    job = await db.upload_jobs.find_one({"id": job_id, "user_id": current_user["id"]}, {"_id": 0})
+    if not job:
+        raise HTTPException(status_code=404, detail="Upload not found.")
+    status = job["status"]
+    if status == "processing":
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(job["created_at"])).total_seconds()
+        except Exception:
+            age = 0
+        if age > VIDEO_JOB_STALE_SECONDS:   # the server restarted mid-conversion
+            status = "failed"
+            job["error"] = "Processing was interrupted. Please upload the video again."
+    return {"status": status, "result": job.get("result"), "error": job.get("error")}
+
 
 @api_router.options("/image/{filename}")
 async def image_options(filename: str):

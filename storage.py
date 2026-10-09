@@ -56,28 +56,33 @@ def s3_public_url(key: str) -> str:
     return f"https://{bucket}.s3.{region}.amazonaws.com/{path}"
 
 
+def get_s3():
+    """The shared S3 client, built once from the S3_* settings."""
+    global _s3_client
+    if _s3_client is None:
+        import boto3
+        from botocore.config import Config
+
+        path_style = str(os.environ.get("S3_FORCE_PATH_STYLE", "")).lower() in ("1", "true", "yes")
+        _s3_client = boto3.client(
+            "s3",
+            aws_access_key_id=os.environ["S3_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["S3_SECRET_ACCESS_KEY"],
+            region_name=os.environ.get("S3_REGION") or "us-east-1",
+            endpoint_url=os.environ.get("S3_ENDPOINT") or None,
+            config=Config(s3={"addressing_style": "path" if path_style else "auto"}),
+        )
+    return _s3_client
+
+
 def upload_to_s3(content: bytes, key: str) -> Optional[str]:
     """Upload bytes to the S3 bucket and return the public URL, or None on failure."""
-    global _s3_client
     try:
-        if _s3_client is None:
-            import boto3
-            from botocore.config import Config
-
-            path_style = str(os.environ.get("S3_FORCE_PATH_STYLE", "")).lower() in ("1", "true", "yes")
-            _s3_client = boto3.client(
-                "s3",
-                aws_access_key_id=os.environ["S3_ACCESS_KEY_ID"],
-                aws_secret_access_key=os.environ["S3_SECRET_ACCESS_KEY"],
-                region_name=os.environ.get("S3_REGION") or "us-east-1",
-                endpoint_url=os.environ.get("S3_ENDPOINT") or None,
-                config=Config(s3={"addressing_style": "path" if path_style else "auto"}),
-            )
         # Without a Content-Type S3 serves octet-stream and a browser downloads
         # the video instead of playing it. upload_fileobj goes multipart on its
         # own for large files.
         content_type = mimetypes.guess_type(key)[0] or "application/octet-stream"
-        _s3_client.upload_fileobj(
+        get_s3().upload_fileobj(
             io.BytesIO(content), os.environ["S3_BUCKET"], key,
             ExtraArgs={"ContentType": content_type},
         )
@@ -182,6 +187,45 @@ def _video_codec(path: str) -> Optional[str]:
         return None
 
 
+def video_duration_seconds(path: str) -> Optional[float]:
+    """Length of the video in seconds, or None if ffprobe can't tell."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(out.stdout.strip().split(",")[0])
+    except Exception:
+        return None
+
+
+def transcode_video_file(src: str, dst: str, timeout: int = 300) -> bool:
+    """Write a browser-playable H.264/AAC MP4 of `src` to `dst`.
+
+    Already-H.264 input is remuxed (stream copy: fast, lossless); anything else
+    (iPhone HEVC) is re-encoded. Returns False, leaving `dst` unwritten, when
+    ffprobe can't read the file at all. Raises CloudStorageError if ffmpeg fails.
+    """
+    codec = _video_codec(src)
+    if codec is None:
+        return False
+    video_args = ["-c:v", "copy"] if codec == "h264" else [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+    ]
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", src, *video_args, "-c:a", "aac", "-movflags", "+faststart", dst],
+            capture_output=True, timeout=timeout, check=True,
+        )
+    except Exception as exc:
+        logger.error("[video] transcode failed (codec=%s): %s", codec, exc)
+        raise CloudStorageError(
+            "Could not process this video. Please try a different file or format; "
+            "if this keeps happening, contact support."
+        )
+    return True
+
+
 def ensure_browser_compatible_video(content: bytes) -> tuple[bytes, bool]:
     """Re-encode to H.264/AAC in a true MP4 container if needed for browser playback.
 
@@ -204,35 +248,66 @@ def ensure_browser_compatible_video(content: bytes) -> tuple[bytes, bool]:
         with open(src, "wb") as f:
             f.write(content)
 
-        codec = _video_codec(src)
-        if codec is None:
+        dst = os.path.join(tmp, "out.mp4")
+        if not transcode_video_file(src, dst):
             # Unreadable/corrupt upload — let it through as-is; persist_file's
             # caller already validates the file before this point, and failing
             # the whole upload over a transcode we can't even diagnose is worse
             # than occasionally storing an unplayable file.
             logger.warning("[video] ffprobe couldn't read codec; storing untranscoded")
             return content, False
-
-        dst = os.path.join(tmp, "out.mp4")
-        # Already H.264: fast remux only (no re-encode). Anything else: full transcode.
-        video_args = ["-c:v", "copy"] if codec == "h264" else [
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-        ]
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", src, *video_args, "-c:a", "aac",
-                 "-movflags", "+faststart", dst],
-                capture_output=True, timeout=300, check=True,
-            )
-        except Exception as exc:
-            logger.error("[video] transcode failed (codec=%s, %.1f MB): %s",
-                         codec, len(content) / (1024 * 1024), exc)
-            raise CloudStorageError(
-                "Could not process this video. Please try a different file or format; "
-                "if this keeps happening, contact support."
-            )
         with open(dst, "rb") as f:
             return f.read(), True
+
+
+# ── Direct-to-S3 upload for large videos ─────────────────────────────────────
+# A video over ~100 MB cannot travel through the app server: the hosting proxy
+# cuts the request. Instead the browser POSTs it to S3 with a signed form, then
+# the server converts it to browser-playable MP4 in the background.
+
+def presign_video_post(key: str, content_type: str, max_bytes: int, expires: int = 3600) -> dict:
+    """A signed form for one browser upload. S3 itself rejects any file whose
+    size is outside 1..max_bytes or whose Content-Type differs from the signed one."""
+    return get_s3().generate_presigned_post(
+        Bucket=os.environ["S3_BUCKET"], Key=key,
+        Fields={"Content-Type": content_type},
+        Conditions=[{"Content-Type": content_type}, ["content-length-range", 1, max_bytes]],
+        ExpiresIn=expires,
+    )
+
+
+def s3_object_size(key: str) -> Optional[int]:
+    """Size in bytes of an object, or None when it does not exist."""
+    try:
+        return get_s3().head_object(Bucket=os.environ["S3_BUCKET"], Key=key)["ContentLength"]
+    except Exception:
+        return None
+
+
+def s3_delete(key: str) -> None:
+    try:
+        get_s3().delete_object(Bucket=os.environ["S3_BUCKET"], Key=key)
+    except Exception as exc:
+        logger.warning("[s3] could not delete %s: %s", key, exc)
+
+
+def process_incoming_video(incoming_key: str, final_key: str, max_seconds: float) -> tuple[Optional[float], int]:
+    """Turn a browser-uploaded video into a browser-playable MP4 at `final_key`.
+
+    Downloads to disk (never into memory: this can be 400 MB), checks the length,
+    converts, uploads. Returns (duration_seconds, final_size_bytes). Raises
+    CloudStorageError with a message safe to show the user.
+    """
+    bucket = os.environ["S3_BUCKET"]
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = os.path.join(tmp, "in"), os.path.join(tmp, "out.mp4")
+        get_s3().download_file(bucket, incoming_key, src)
+        duration = video_duration_seconds(src)
+        if duration is not None and duration > max_seconds:
+            raise CloudStorageError(f"Videos must be {int(max_seconds // 60)} minutes or shorter.")
+        out = dst if transcode_video_file(src, dst, timeout=1800) else src
+        get_s3().upload_file(out, bucket, final_key, ExtraArgs={"ContentType": "video/mp4"})
+        return duration, os.path.getsize(out)
 
 
 def persist_file(
