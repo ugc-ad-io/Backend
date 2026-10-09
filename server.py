@@ -8411,6 +8411,197 @@ async def activate_deal_from_card(card: dict) -> Optional[dict]:
     return campaign
 
 
+async def find_countered_private_campaign(card: dict) -> Optional[dict]:
+    """The private brief a counter-offer is answering, or None.
+
+    A creator who counters a private invitation is renegotiating THAT brief, which
+    already exists, is funded and is listed in their deals. The counter card carries
+    no deal_id, so accepting it used to fall through to activate_deal_from_card, which
+    builds a brand-new "Direct deal" and charges the brand a second time - leaving the
+    original brief alive next to it. Here we find the brief instead, so the accepted
+    counter can be applied to it.
+
+    The origin is the newest invitation/offer in this thread that was answered with
+    "counter" before this card was sent. A counter to a creator's custom offer has no
+    brief, so it returns None and keeps its normal "create a deal" behaviour.
+    """
+    participants = card.get("participants") or []
+    if card.get("type") != "counter_offer" or len(participants) != 2:
+        return None
+    origin = await db.chat_action_cards.find_one(
+        {
+            "participants": {"$all": participants},
+            "type": {"$in": ["private_invitation", "custom_offer"]},
+            "status": "counter",
+            "created_at": {"$lte": card.get("created_at") or now_iso()},
+        },
+        {"_id": 0},
+        sort=[("created_at", -1)],
+    )
+    if not origin or origin.get("type") != "private_invitation" or not origin.get("deal_id"):
+        return None
+    campaign = await get_campaign_by_deal_id(origin["deal_id"])
+    if not campaign or campaign.get("visibility") != PRIVATE_VISIBILITY:
+        return None
+    users = await db.users.find({"id": {"$in": participants}}, {"_id": 0}).to_list(2)
+    brand = next((u for u in users if u.get("role") == UserRole.BUSINESS), None)
+    creator = next((u for u in users if u.get("role") == UserRole.CREATOR), None)
+    if not brand or not creator:
+        return None
+    if str(campaign.get("business_id")) != str(_brand_ws_id(brand)):
+        return None
+    if str(campaign.get("selected_creator") or "") != creator["id"]:
+        return None
+    # Already started (held escrow for this creator): nothing left to renegotiate.
+    if await db.escrow.find_one({"campaign_id": campaign["id"], "status": "held", "creator_id": creator["id"]}, {"_id": 0, "id": 1}):
+        return None
+    return campaign
+
+
+async def _countered_private_settlement(card: dict, campaign: dict) -> dict:
+    """What the brand owes for the countered price, measured against what the brief
+    already holds in reserve (the same arithmetic select_creator uses when hiring)."""
+    amount = _accepted_offer_amount(card)
+    fee = brand_commission(amount)
+    total = round(amount + fee, 2)
+    reservation = await db.escrow.find_one({"campaign_id": campaign["id"], "status": "reserved"}, {"_id": 0})
+    slot = 0.0
+    if reservation:
+        slot = to_float(reservation.get("slot_amount"))
+        if slot <= 0:
+            slots_total = int(reservation.get("slots_total") or 1)
+            slot = round(to_float(reservation.get("reserved_amount") or reservation.get("amount")) / max(1, slots_total), 2)
+    return {"amount": amount, "fee": fee, "total": total, "reservation": reservation, "slot": slot,
+            "shortfall": round(max(0.0, total - slot), 2) if reservation else total}
+
+
+async def enforce_countered_private_funding(card: dict, campaign: dict) -> None:
+    """Accepting a counter only needs the DIFFERENCE from the brief's reserved budget."""
+    settlement = await _countered_private_settlement(card, campaign)
+    if settlement["amount"] <= 0:
+        return
+    brand = await db.users.find_one({"id": campaign.get("business_id")}, {"_id": 0}) or {}
+    balance = to_float(brand.get("balance"))
+    shortfall = settlement["shortfall"]
+    if shortfall > 0 and balance < shortfall:
+        topup = round(shortfall - balance, 2)
+        deadline = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+        await db.chat_action_cards.update_one(
+            {"id": card["id"]},
+            {"$set": {"pending_topup": True, "topup_deadline": deadline, "shortfall": topup}},
+        )
+        await notify_user(
+            brand.get("id") or campaign.get("business_id"),
+            "Top up to confirm this deal",
+            f"The creator's counter-offer is \u20b9{int(settlement['amount'])} (+\u20b9{int(settlement['fee'])} platform fee). "
+            f"Your reserved budget covers \u20b9{int(settlement['slot'])}, so add \u20b9{int(topup)} to accept.",
+            link="/dashboard/business/wallet",
+        )
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "message": "The brand's wallet has insufficient balance for this counter-offer. The brand has been asked to top up within 24 hours.",
+                "shortfall": topup,
+            },
+        )
+
+
+async def activate_countered_private_deal(card: dict, campaign: dict) -> Optional[dict]:
+    """Apply an accepted counter-offer to the private brief it answers and start the deal.
+
+    The brief keeps its title and details; the agreed price and revision terms replace
+    the original ones; the reserved budget is settled against the new price (surplus
+    back to the wallet, shortfall charged) and becomes the held escrow for this creator,
+    exactly as when a brand hires from bids. No second campaign is created.
+    """
+    participants = card.get("participants") or []
+    users = await db.users.find({"id": {"$in": participants}}, {"_id": 0}).to_list(2)
+    brand = next((u for u in users if u.get("role") == UserRole.BUSINESS), None)
+    creator = next((u for u in users if u.get("role") == UserRole.CREATOR), None)
+    if not brand or not creator:
+        return None
+
+    settlement = await _countered_private_settlement(card, campaign)
+    amount, fee, total = settlement["amount"], settlement["fee"], settlement["total"]
+    now = now_iso()
+    brand_id = brand["id"]
+    funded = True
+    reservation = settlement["reservation"]
+    if reservation:
+        if total <= settlement["slot"]:
+            surplus = round(settlement["slot"] - total, 2)
+            if surplus > 0:
+                await db.users.update_one({"id": brand_id}, {"$inc": {"balance": surplus}})
+        else:
+            debit = await db.users.update_one(
+                {"id": brand_id, "balance": {"$gte": settlement["shortfall"]}},
+                {"$inc": {"balance": -settlement["shortfall"]}},
+            )
+            funded = debit.modified_count == 1
+        await db.escrow.delete_one({"id": reservation["id"]})   # one slot: the pool is fully used
+    else:
+        debit = await db.users.update_one({"id": brand_id, "balance": {"$gte": total}}, {"$inc": {"balance": -total}})
+        funded = debit.modified_count == 1
+
+    escrow_id = str(uuid.uuid4())
+    await db.escrow.insert_one({
+        "id": escrow_id,
+        "campaign_id": campaign["id"],
+        "business_id": campaign.get("business_id"),
+        "creator_id": creator["id"],
+        "amount": amount,
+        "brand_commission_amount": fee,
+        "brand_commission_percent": commission_percent(),
+        "brand_charged": total,
+        "reserved_amount": settlement["slot"] or total,
+        "funded": funded,
+        "status": "held",
+        "source": "private_counter",
+        "origin_card_id": card.get("id"),
+        "created_at": now,
+        "updated_at": now,
+    })
+
+    quantity = max(1, total_deliverable_quantity(campaign))
+    per_asset = round(amount / quantity, 2)
+    update = {
+        "budget_min": per_asset,
+        "budget_max": per_asset,
+        "per_video_budget": per_asset,
+        "total_budget": amount,
+        "selected_creator": creator["id"],
+        "escrow_id": escrow_id,
+        "status": CampaignStatus.IN_PROGRESS,
+        "work_started_at": now,
+        "updated_at": now,
+        "counter_accepted": {
+            "card_id": card.get("id"),
+            "price": amount,
+            "timeline": (card.get("fields") or {}).get("timeline"),
+            "usage_rights": (card.get("fields") or {}).get("usage_rights"),
+            "accepted_at": now,
+        },
+    }
+    revisions = str((card.get("fields") or {}).get("revisions") or "").strip()
+    if revisions.isdigit():
+        update["revision_limit"] = int(revisions)
+        update["free_revisions"] = int(revisions)
+    await db.campaigns.update_one(
+        {"id": campaign["id"]},
+        {"$set": update, "$addToSet": {"selected_creators": creator["id"], "escrow_ids": escrow_id}},
+    )
+    campaign = await db.campaigns.find_one({"id": campaign["id"]}, {"_id": 0})
+
+    await db.chat_action_cards.update_one(
+        {"id": card["id"]},
+        {"$set": {"deal_campaign_id": campaign["id"], "deal_id": make_deal_id(campaign)}},
+    )
+    await insert_deal_activity(campaign, "system", "UGCAD.IO", "deal_started",
+                               f"Counter-offer accepted — deal opened at \u20b9{int(amount)} with the funds held in escrow.")
+    await insert_deal_system_message(campaign, f"Counter-offer accepted. \u20b9{int(amount)} is held in escrow and the deal room is now open.")
+    return campaign
+
+
 @api_router.post("/chat/action-cards/{card_id}/respond")
 async def respond_chat_action_card(card_id: str, data: ChatActionCardRespond, current_user: dict = Depends(get_current_user)):
     card = await db.chat_action_cards.find_one({"id": card_id}, {"_id": 0})
@@ -8454,9 +8645,18 @@ async def respond_chat_action_card(card_id: str, data: ChatActionCardRespond, cu
                     },
                 )
 
+    # A counter to a private invitation renegotiates that brief (see
+    # find_countered_private_campaign) instead of opening a second deal.
+    countered_campaign = None
+    if data.action == "accept" and card.get("type") == "counter_offer":
+        countered_campaign = await find_countered_private_campaign(card)
+
     # PRD 5.9: brand wallet must cover the deal at acceptance (blocks if short).
     if data.action == "accept" and card.get("type") in DEAL_FORMING_CARD_TYPES:
-        await enforce_brand_wallet_for_acceptance(card)
+        if countered_campaign:
+            await enforce_countered_private_funding(card, countered_campaign)
+        else:
+            await enforce_brand_wallet_for_acceptance(card)
 
     response = {
         "action": data.action,
@@ -8495,7 +8695,10 @@ async def respond_chat_action_card(card_id: str, data: ChatActionCardRespond, cu
     deal = None
     if data.action == "accept" and card.get("type") in DEAL_FORMING_CARD_TYPES:
         try:
-            deal = await activate_deal_from_card({**card, "status": data.action})
+            if countered_campaign:
+                deal = await activate_countered_private_deal({**card, "status": data.action}, countered_campaign)
+            else:
+                deal = await activate_deal_from_card({**card, "status": data.action})
         except Exception:
             logger.exception("Failed to activate deal from accepted card %s", card_id)
 
