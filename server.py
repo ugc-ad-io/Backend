@@ -4322,12 +4322,25 @@ async def get_creator_directory(
         ]).to_list(None)
         rating_map = {a["_id"]: a for a in agg}
 
+    # Completed-deal counts for every creator in ONE grouped query. Asking per creator
+    # (creator_deliverables_completed) cost a database round trip per card.
+    completed_counts = {}
+    if creator_ids:
+        done = await db.campaigns.aggregate([
+            {"$match": {"selected_creator": {"$in": creator_ids}, "status": CampaignStatus.COMPLETED}},
+            {"$group": {"_id": "$selected_creator", "n": {"$sum": 1}}},
+        ]).to_list(None)
+        completed_counts = {d["_id"]: d["n"] for d in done}
+
     rows = []
     for creator in creators:
         if not creator_matches_directory_filters(creator, category, language, region, style, budget):
             continue
         await ensure_public_creator_id(creator)
-        deliverables = await creator_deliverables_completed(creator)
+        try:   # same rule as creator_deliverables_completed: a stored count wins
+            deliverables = int(creator["deliverables_completed"])
+        except (KeyError, TypeError, ValueError):
+            deliverables = completed_counts.get(creator.get("id"), 0)
         pub = creator_directory_public_view(creator, deliverables)
         _r = rating_map.get(creator.get("id"))
         pub["avg_rating"] = round(_r["avg"], 1) if (_r and _r.get("count")) else None
@@ -10510,6 +10523,25 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
         "next_revision_fee": revision_fee_for(used + 1),
     }
 
+async def build_deal_rows(deal_ids_per_campaign: List[List[str]], current_user: dict) -> list:
+    """Deal rows for a list page, in order. Each deal costs several database round
+    trips; built one after another, a creator with ~20 deals waited ~4 s for the page.
+    Different campaigns are built in parallel. Deals of the SAME campaign stay one after
+    another, because viewing a deal may settle it (settle_deal_lazily) and two settles
+    of one campaign must not overlap."""
+    slots = asyncio.Semaphore(8)
+
+    async def one_campaign(deal_ids):
+        async with slots:
+            rows = []
+            for deal_id in deal_ids:
+                rows.append(await build_deal_response(await get_deal_context(deal_id, current_user), current_user))
+            return rows
+
+    groups = await asyncio.gather(*(one_campaign(ids) for ids in deal_ids_per_campaign))
+    return [row for rows in groups for row in rows]
+
+
 @api_router.get("/deals/my")
 async def get_my_deals(current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
@@ -10535,13 +10567,8 @@ async def get_my_deals(current_user: dict = Depends(get_current_user)):
         ]},
     }, {"_id": 0}).to_list(100)
 
-    result = []
-    for campaign in campaigns:
-        # This creator's own deal (get_deal_context resolves it to the viewer).
-        context = await get_deal_context(person_deal_id(campaign, current_user['id']), current_user)
-        result.append(await build_deal_response(context, current_user))
-
-    return result
+    # This creator's own deal on each campaign (get_deal_context resolves it to the viewer).
+    return await build_deal_rows([[person_deal_id(c, current_user['id'])] for c in campaigns], current_user)
 
 @api_router.get("/deals/business")
 async def get_business_deals(current_user: dict = Depends(get_current_user)):
@@ -10554,15 +10581,10 @@ async def get_business_deals(current_user: dict = Depends(get_current_user)):
         "archived_by_brand": {"$ne": True},  # hide what the brand has archived
     }, {"_id": 0}).to_list(200)
 
-    result = []
-    for campaign in campaigns:
-        # One deal per hired creator — a multi-creator brief yields several deal rows,
-        # each addressed by its own per-creator deal id.
-        for cid in selected_creator_ids(campaign):
-            context = await get_deal_context(person_deal_id(campaign, cid), current_user)
-            result.append(await build_deal_response(context, current_user))
-
-    return result
+    # One deal per hired creator — a multi-creator brief yields several deal rows,
+    # each addressed by its own per-creator deal id.
+    return await build_deal_rows(
+        [[person_deal_id(c, cid) for cid in selected_creator_ids(c)] for c in campaigns], current_user)
 
 
 # Human-readable label + normalized bucket for each offer-card lifecycle state,
