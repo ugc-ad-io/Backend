@@ -4193,6 +4193,7 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
         "nickname": creator.get("nickname") or "",
         "profile_photo": first_non_empty(creator.get("profile_photo"), creator.get("profile_picture"), profile.get("profile_photo"), profile.get("profile_picture")),
         "primary_category": primary_category or "",
+        "categories": creator_categories(creator, primary_category),
         "languages": compact_list(creator.get("languages"), profile.get("languages"), creator.get("content_languages"), profile.get("content_languages")),
         "city_tier": first_non_empty(creator.get("city_tier"), creator.get("location_region"), profile.get("city_tier"), profile.get("location_region")) or "",
         "deliverables_completed": deliverables_completed,
@@ -4209,10 +4210,27 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
         "level_label": cf.CREATOR_LEVELS[cf.normalize_level(creator.get("level"))]["label"],
     }
 
+def creator_categories(creator: dict, primary: Optional[str] = None) -> List[str]:
+    """Every category a creator picked, primary first, case-insensitively unique.
+
+    Onboarding saves the multi-select as profile.content_categories (older app
+    builds: contentCategories); primary_category is only the first of them, so
+    reading it alone listed a creator under one category.
+    """
+    profile = creator.get("profile") or {}
+    seen, out = set(), []
+    for value in compact_list(primary, creator.get("content_categories"),
+                              profile.get("content_categories"), profile.get("contentCategories")):
+        key = str(value).strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(str(value).strip())
+    return out
+
 def creator_matches_directory_filters(creator: dict, category: Optional[str], language: Optional[str], region: Optional[str], style: Optional[str], budget: Optional[str]) -> bool:
     profile = creator.get("profile") or {}
     return (
-        matches_text_filter(category, creator.get("primary_category"), creator.get("category"), creator.get("tags"), profile.get("primary_category"), profile.get("category"), profile.get("tags")) and
+        matches_text_filter(category, creator.get("primary_category"), creator.get("category"), creator.get("tags"), profile.get("primary_category"), profile.get("category"), profile.get("tags"), creator_categories(creator)) and
         matches_text_filter(language, creator.get("languages"), profile.get("languages"), creator.get("content_languages"), profile.get("content_languages")) and
         matches_text_filter(region, creator.get("city_tier"), creator.get("location_region"), profile.get("city_tier"), profile.get("location_region")) and
         matches_text_filter(style, creator.get("content_style"), profile.get("content_style")) and
@@ -4242,6 +4260,7 @@ def creator_best_match_score(creator: dict, brand: dict) -> int:
         profile.get("primary_category"),
         profile.get("category"),
         profile.get("tags"),
+        creator_categories(creator),
     )]
     return 1 if any(term in creator_terms for term in terms) else 0
 
