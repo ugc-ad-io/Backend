@@ -349,6 +349,29 @@ def make_video_previews_in_background(content: bytes, video_key: str) -> None:
     threading.Thread(target=run, daemon=True).start()
 
 
+def backfill_missing_previews(video_keys) -> int:
+    """Make previews for any of these bucket videos that have none. Returns how many
+    were made. One video at a time; each original is downloaded to disk, not memory."""
+    s3, bucket, made = get_s3(), os.environ["S3_BUCKET"], 0
+    for key in video_keys:
+        base = preview_base_key(key)
+        try:
+            s3.head_object(Bucket=bucket, Key=f"{base}.jpg")
+            s3.head_object(Bucket=bucket, Key=f"{base}.mp4")
+            continue   # already has both
+        except Exception:
+            pass
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in")
+            try:
+                s3.download_file(bucket, key, src)
+            except Exception as exc:
+                logger.warning("[preview] could not download %s: %s", key, exc)
+                continue
+            made += make_video_previews(src, key)
+    return made
+
+
 def process_incoming_video(incoming_key: str, final_key: str, max_seconds: float) -> tuple[Optional[float], int]:
     """Turn a browser-uploaded video into a browser-playable MP4 at `final_key`.
 

@@ -63,6 +63,7 @@ import agreement_content as agr
 from storage import (
     persist_file, cloudinary_enabled, CloudStorageError,
     s3_enabled, s3_public_url, presign_video_post, s3_object_size, s3_delete, process_incoming_video,
+    backfill_missing_previews,
 )
 
 # MongoDB connection
@@ -17675,6 +17676,29 @@ async def admin_run_onboarding_reminders(
     return await send_onboarding_reminders(dry_run=dry_run)
 
 
+# Bucket key of a portfolio video, read straight out of the stored URL.
+_S3_VIDEO_KEY = re.compile(r'https?://[^/"\s]+\.amazonaws\.com/(?!previews/)([^"?#\s]+\.(?:mp4|mov|webm|m4v))', re.I)
+
+
+async def backfill_video_previews() -> None:
+    """Give every portfolio video its preview clip + poster if it has none (videos
+    uploaded before previews were made on upload). Runs once per boot in the
+    background; videos that already have both cost one HEAD request each.
+    ponytail: scans all creators each boot; keep a "previews_done" flag if that list grows large."""
+    if not s3_enabled():
+        return
+    try:
+        from urllib.parse import unquote
+        keys = set()
+        async for creator in db.users.find({"role": UserRole.CREATOR},
+                                            {"_id": 0, "portfolio": 1, "profile.portfolio": 1, "profile.portfolio_items": 1}):
+            keys.update(unquote(k) for k in _S3_VIDEO_KEY.findall(json.dumps(creator, default=str)))
+        made = await asyncio.to_thread(backfill_missing_previews, sorted(keys))
+        logger.info("[preview] backfill checked %d videos, made %d previews", len(keys), made)
+    except Exception:
+        logger.exception("[preview] backfill failed")
+
+
 @app.on_event("startup")
 async def startup_initialization():
     """Initialize default data collections."""
@@ -17713,6 +17737,11 @@ async def startup_initialization():
 
     # Seed categories
     await seed_categories()
+
+    # Thumbnails + small clips for older portfolio videos that have none.
+    backfill = asyncio.create_task(backfill_video_previews())
+    _video_job_tasks.add(backfill)
+    backfill.add_done_callback(_video_job_tasks.discard)
 
     # Start the hourly "your onboarding form is still pending" sweep (24h + 48h
     # nudges). Kept as a plain task rather than an external cron so it needs no
