@@ -49,6 +49,9 @@ def env(monkeypatch):
 
     def counter_and_accept(price, wallet=None, budget=1000):
         """Publish a private brief, approve it, creator counters at `price`, brand accepts."""
+        # A private brief is priced at the creator's own rate, whatever the brand sends,
+        # so `budget` is set as that rate.
+        run(server.db.users.update_one({"id": creator}, {"$set": {"profile.rate_card.expected_payout": str(budget)}}))
         payload = {
             "status": "pending_approval", "title": "White label perfume", "product_name": "Perfume",
             "product_category": "Beauty & Cosmetics", "category": "Beauty & Cosmetics",
