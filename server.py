@@ -5890,6 +5890,28 @@ def _apply_reapplication_fields(current_user: dict, update_fields: dict, now_str
     update_fields["application_attempts"] = int(current_user.get("application_attempts") or 1) + 1
 
 
+def _is_established_member(user: dict) -> bool:
+    """True when this person has already been approved by an admin.
+
+    Editing an approved profile must apply straight away: nothing goes back to
+    "in review" and no admin has anything to approve. Besides APPROVED itself this
+    covers a brand that an earlier version of /profile/business knocked back to
+    PENDING on every edit — its record still carries the admin's approval decision
+    (`review.decided_by`, no rejection `reason_code`), so it is restored instead of
+    being stuck "in review" for something nobody can approve a second time.
+    """
+    status = user.get("approval_status")
+    if status == ApprovalStatus.APPROVED:
+        return True
+    review = user.get("review") or {}
+    return (
+        status == ApprovalStatus.PENDING
+        and bool(review.get("decided_by"))
+        and not review.get("reason_code")
+        and not review.get("more_info_message")
+    )
+
+
 @api_router.put("/profile/creator")
 async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
@@ -5925,14 +5947,10 @@ async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict 
     if real_name:
         update_fields["nickname"] = real_name
         update_fields["full_name"] = real_name
-    if was_approved:
-        # An already-approved creator editing their profile (details, new work) must NOT
-        # be knocked back to PENDING — that silently de-lists them from the brand
-        # directory. Keep them approved/discoverable and flag the edit for re-review.
-        update_fields["profile_review_status"] = "pending_review"
-        update_fields["profile_updated_at"] = now_str
-    else:
+    if not was_approved:
         update_fields["approval_status"] = ApprovalStatus.PENDING
+    # An already-approved creator editing their profile (details, new work) is NOT sent
+    # back for review: the edit applies immediately and they stay approved/discoverable.
 
     # Mirror the portfolio to the top-level field so the Portfolio page (and the
     # creator directory) can read it — these read `user.portfolio`, while the
@@ -5961,21 +5979,16 @@ async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict 
 
     _apply_reapplication_fields(current_user, update_fields, now_str)
 
-    await db.users.update_one(
-        {"id": current_user['id']},
-        {"$set": update_fields}
-    )
+    update_op = {"$set": update_fields}
+    if was_approved:
+        # Clear the stale "edit awaiting review" flag older versions left behind.
+        update_op["$unset"] = {"profile_review_status": "", "profile_updated_at": ""}
+    await db.users.update_one({"id": current_user['id']}, update_op)
 
     if was_approved:
-        # Stay live for brands, but let ops know there are edits to look at.
-        await notify_admins(
-            "Creator updated their profile",
-            f"{current_user.get('nickname') or 'A creator'} edited their approved profile — review the changes.",
-            link="/dashboard/admin/profiles",
-        )
-        return {"message": "Profile updated", "username": username or None}
+        return {"message": "Profile updated", "username": username or None, "approval_status": ApprovalStatus.APPROVED}
 
-    return {"message": "Profile submitted for review", "username": username or None}
+    return {"message": "Profile submitted for review", "username": username or None, "approval_status": ApprovalStatus.PENDING}
 
 @api_router.patch("/profile/portfolio")
 async def update_portfolio(portfolio: List[Any], current_user: dict = Depends(get_current_user)):
@@ -6017,10 +6030,14 @@ async def update_business_profile(data: BusinessProfileUpdate, current_user: dic
         raise HTTPException(status_code=403, detail="Only businesses can update business profile")
 
     profile_data = data.dict()
+    # An already-approved brand editing its profile stays approved (see _is_established_member);
+    # only a first submission or a reapplication goes to review.
+    was_approved = _is_established_member(current_user)
+    new_status = ApprovalStatus.APPROVED if was_approved else ApprovalStatus.PENDING
     set_fields = {
         "profile": profile_data,
         "profile_completed": True,
-        "approval_status": ApprovalStatus.PENDING,
+        "approval_status": new_status,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     # The brand's name becomes their display name (replaces any auto handle).
@@ -6049,7 +6066,9 @@ async def update_business_profile(data: BusinessProfileUpdate, current_user: dic
         }}
     )
 
-    return {"message": "Profile submitted for review"}
+    if was_approved:
+        return {"message": "Profile updated", "approval_status": new_status}
+    return {"message": "Profile submitted for review", "approval_status": new_status}
 
 # Profile Management Routes
 @api_router.post("/profile/upload-photo")
