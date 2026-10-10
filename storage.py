@@ -27,6 +27,7 @@ import mimetypes
 import os
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -291,6 +292,63 @@ def s3_delete(key: str) -> None:
         logger.warning("[s3] could not delete %s: %s", key, exc)
 
 
+PREVIEW_CACHE = "public, max-age=31536000, immutable"
+
+
+def preview_base_key(video_key: str) -> str:
+    """previews/<video key without extension>. The app and website derive the same
+    path from the video URL, so this naming is a contract: keep the three in step."""
+    return f"previews/{video_key.rsplit('.', 1)[0]}"
+
+
+def make_video_previews(src: str, video_key: str) -> bool:
+    """Write the ~2 MB 480p clip and the still poster that tiles show instead of the
+    original, next to each other at preview_base_key(video_key) + .mp4 / .jpg.
+
+    Settings match the previews already in the bucket (480 wide, H.264 Main, 25 fps,
+    ~360 kbps). Best effort: returns False and logs on any failure, never raises,
+    because a missing preview only costs speed, never the upload itself.
+    """
+    base = preview_base_key(video_key)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip, poster = os.path.join(tmp, "p.mp4"), os.path.join(tmp, "p.jpg")
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", src, "-vf", "scale=480:-2", "-r", "25", "-c:v", "libx264",
+                 "-profile:v", "main", "-preset", "veryfast", "-crf", "30", "-maxrate", "450k",
+                 "-bufsize", "900k", "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", clip],
+                check=True, capture_output=True, timeout=1800,
+            )
+            # Half a second in skips black first frames; a shorter clip falls back to frame 0.
+            for seek in ("0.5", "0"):
+                subprocess.run(["ffmpeg", "-y", "-ss", seek, "-i", src, "-frames:v", "1",
+                                "-vf", "scale=480:-2", "-q:v", "4", poster],
+                               capture_output=True, timeout=120)
+                if os.path.exists(poster) and os.path.getsize(poster):
+                    break
+            else:
+                raise RuntimeError("no frame for the poster")
+            for path, content_type, ext in ((clip, "video/mp4", "mp4"), (poster, "image/jpeg", "jpg")):
+                get_s3().upload_file(path, os.environ["S3_BUCKET"], f"{base}.{ext}",
+                                     ExtraArgs={"ContentType": content_type, "CacheControl": PREVIEW_CACHE})
+        return True
+    except Exception as exc:
+        logger.warning("[preview] could not make previews for %s: %s", video_key, exc)
+        return False
+
+
+def make_video_previews_in_background(content: bytes, video_key: str) -> None:
+    """For a video already held in memory (the /upload/file path): previews take a
+    few seconds of ffmpeg, so they must not hold up the upload response."""
+    def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in")
+            with open(src, "wb") as handle:
+                handle.write(content)
+            make_video_previews(src, video_key)
+    threading.Thread(target=run, daemon=True).start()
+
+
 def process_incoming_video(incoming_key: str, final_key: str, max_seconds: float) -> tuple[Optional[float], int]:
     """Turn a browser-uploaded video into a browser-playable MP4 at `final_key`.
 
@@ -307,6 +365,7 @@ def process_incoming_video(incoming_key: str, final_key: str, max_seconds: float
             raise CloudStorageError(f"Videos must be {int(max_seconds // 60)} minutes or shorter.")
         out = dst if transcode_video_file(src, dst, timeout=1800) else src
         get_s3().upload_file(out, bucket, final_key, ExtraArgs={"ContentType": "video/mp4"})
+        make_video_previews(out, final_key)
         return duration, os.path.getsize(out)
 
 
@@ -337,8 +396,11 @@ def persist_file(
             public_path = f"{public_path.rsplit('.', 1)[0]}.mp4" if "." in Path(public_path).name else public_path
 
     if s3_enabled():
-        url = upload_to_s3(content, f"{cloud_folder}/{unique_filename}")
+        key = f"{cloud_folder}/{unique_filename}"
+        url = upload_to_s3(content, key)
         if url:
+            if kind == "video":
+                make_video_previews_in_background(content, key)
             return url
         raise CloudStorageError(
             f"Could not store this file ({len(content) / (1024 * 1024):.0f} MB). "
