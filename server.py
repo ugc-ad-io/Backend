@@ -63,8 +63,9 @@ import agreement_content as agr
 from storage import (
     persist_file, cloudinary_enabled, CloudStorageError,
     s3_enabled, s3_public_url, presign_video_post, s3_object_size, s3_delete, process_incoming_video,
-    backfill_missing_previews,
+    backfill_missing_previews, s3_key_from_url, presign_download,
 )
+from urllib.parse import urlparse
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -9550,10 +9551,44 @@ async def assess_late_delivery(creator_id: str, campaign: dict, work: dict) -> d
     return {"is_late": True, "severity": severity, "penalty_pct": pct, "offense_number": offense_number, "hours_late": round(hours_late, 1)}
 
 
+def build_download_link(url: str, name: str) -> dict:
+    """How a browser should fetch `url` so it SAVES the file.
+
+    forced=True  -> `url` already carries "attachment"; just navigate to it.
+    forced=False -> the file is served as-is (e.g. local /uploads on the API host); the
+                    caller should fetch it itself or simply open it.
+    """
+    key = s3_key_from_url(url)
+    ext = os.path.splitext(key or urlparse(url).path)[1].lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,5}", ext or ""):
+        ext = ""
+    filename = f"{name}{ext}" if ext and not name.lower().endswith(ext) else name
+    if key:
+        try:
+            return {"url": presign_download(key, filename), "forced": True, "filename": filename}
+        except Exception as exc:  # noqa: BLE001 - fall back to the plain public URL
+            logger.warning("[download] could not presign %s: %s", key, exc)
+    if "res.cloudinary.com" in url and "/upload/" in url and "/fl_attachment" not in url:
+        return {"url": url.replace("/upload/", "/upload/fl_attachment/", 1), "forced": True, "filename": filename}
+    return {"url": url, "forced": False, "filename": filename}
+
+
 @api_router.get("/work/{work_id}/download")
-async def download_work(work_id: str, current_user: dict = Depends(get_current_user)):
+async def download_work(
+    work_id: str,
+    as_link: bool = False,
+    name: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+):
     """Download the delivered file. Allowed for the brand on the campaign, the
-    creator, or an admin — and (for the brand) only once the work is approved."""
+    creator, or an admin — and (for the brand) only once the work is approved.
+
+    Default: 302 to the file (kept for old clients). With ?as_link=1 the answer is
+    JSON {url, forced, ...} instead. The website must use that: a browser XHR that
+    follows a redirect to S3 is sent with `Origin: null`, which the bucket's CORS rules
+    reject, so the old redirect could never be fetched as a blob from ugcad.io. The
+    browser instead navigates to `url` — a presigned S3 link that says "save as" — which
+    needs no CORS. `name` is only a filename hint; the extension comes from the file."""
     # The Work Review card passes a CAMPAIGN id, not a work_submission id (same shape as
     # the approve fix). Resolve either: try the work id first, then fall back to the
     # campaign's latest work submission — preferring the approved one.
@@ -9605,10 +9640,12 @@ async def download_work(work_id: str, current_user: dict = Depends(get_current_u
         url = sub.get("original_url") or sub.get("video_url")
     if not url:
         raise HTTPException(status_code=404, detail="No downloadable file for this work")
-    # Files live on Cloudinary or /uploads — hand back the URL to stream from.
-    from fastapi.responses import RedirectResponse
+    # Files live on S3, Cloudinary (older uploads) or /uploads.
     if not str(url).startswith("http"):
         url = f"/{str(url).lstrip('/')}"
+    if as_link:
+        return build_download_link(str(url), name or campaign.get("title") or "deliverable")
+    from fastapi.responses import RedirectResponse
     return RedirectResponse(url)
 
 

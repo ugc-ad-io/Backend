@@ -25,12 +25,13 @@ import io
 import logging
 import mimetypes
 import os
+import re
 import subprocess
 import tempfile
 import threading
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 logger = logging.getLogger("storage")
 
@@ -55,6 +56,72 @@ def s3_public_url(key: str) -> str:
         return f"{endpoint.rstrip('/')}/{bucket}/{path}"
     region = os.environ.get("S3_REGION") or "us-east-1"
     return f"https://{bucket}.s3.{region}.amazonaws.com/{path}"
+
+
+def s3_key_from_url(url: str) -> Optional[str]:
+    """The object key a URL issued by s3_public_url points at, or None for any other URL
+    (Cloudinary, a local /uploads path, somebody else's bucket)."""
+    if not url or not s3_enabled():
+        return None
+    bucket = os.environ["S3_BUCKET"]
+    region = os.environ.get("S3_REGION") or "us-east-1"
+    bases = [
+        f"https://{bucket}.s3.{region}.amazonaws.com/",
+        f"https://{bucket}.s3.amazonaws.com/",
+    ]
+    if os.environ.get("S3_PUBLIC_URL"):
+        bases.insert(0, os.environ["S3_PUBLIC_URL"].rstrip("/") + "/")
+    if os.environ.get("S3_ENDPOINT"):
+        bases.insert(0, f"{os.environ['S3_ENDPOINT'].rstrip('/')}/{bucket}/")
+    for base in bases:
+        if url.startswith(base):
+            return unquote(url[len(base):].split("?", 1)[0].split("#", 1)[0]) or None
+    return None
+
+
+_presign_client = None
+
+
+def _presign_s3():
+    """A client that signs for the REGIONAL host (bucket.s3.<region>.amazonaws.com).
+
+    boto3 otherwise puts the global s3.amazonaws.com host in the link, which only works
+    while DNS still routes to the bucket's region. Presigning makes no network call."""
+    global _presign_client
+    if os.environ.get("S3_ENDPOINT"):
+        return get_s3()          # MinIO and friends: the configured client is right
+    if _presign_client is None:
+        import boto3
+        from botocore.config import Config
+
+        region = os.environ.get("S3_REGION") or "us-east-1"
+        _presign_client = boto3.client(
+            "s3",
+            aws_access_key_id=os.environ["S3_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["S3_SECRET_ACCESS_KEY"],
+            region_name=region,
+            endpoint_url=f"https://s3.{region}.amazonaws.com",
+            config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+        )
+    return _presign_client
+
+
+def presign_download(key: str, filename: str, expires: int = 600) -> str:
+    """A short-lived URL that makes the browser SAVE the object as `filename`.
+
+    Content-Disposition: attachment is what turns a cross-origin link into a download
+    (the <a download> attribute is ignored across origins). A plain navigation to this
+    URL needs no CORS at all — unlike an XHR, which a redirect to S3 breaks."""
+    safe = re.sub(r"[^A-Za-z0-9._ -]+", "", filename).strip(" .") or "deliverable"
+    return _presign_s3().generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": os.environ["S3_BUCKET"],
+            "Key": key,
+            "ResponseContentDisposition": f'attachment; filename="{safe}"',
+        },
+        ExpiresIn=expires,
+    )
 
 
 def get_s3():
