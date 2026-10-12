@@ -203,6 +203,14 @@ class CampaignStatus(str, Enum):
     PAUSED = "paused"
     BANNED = "banned"
 
+# The only roles a person can give THEMSELVES at signup (email, Google or Apple).
+# Staff roles — admin, campaign_manager, support_staff — carry platform-wide powers
+# (payouts, wallets, every user's data) and are granted only by an existing admin via
+# /admin/staff/create. Signup used to accept any UserRole, so anyone could register as
+# an approved admin.
+SELF_SERVICE_ROLES = (UserRole.CREATOR, UserRole.BUSINESS)
+
+
 # Marks a brief that was sent to ONE creator through Private Invitation. Such a brief
 # never enters the public browse list, no matter what status it reaches - only the
 # invited creator sees it (in their messages and their deals).
@@ -3019,6 +3027,9 @@ def normalize_revision_tracker(work: Optional[dict], response: Optional[dict],
         "free_revision_limit": cf.FREE_REVISION_LIMIT,
         "free_revisions_remaining": max(0, cf.FREE_REVISION_LIMIT - used),
         "next_revision_fee": revision_fee_for(used),
+        # What every revision AFTER the free ones costs. next_revision_fee is 0 while free
+        # revisions remain, so a "your next one is paid" warning needs this separately.
+        "paid_revision_fee": revision_fee_for(cf.FREE_REVISION_LIMIT),
         "latest_feedback": latest.get('feedback'),
         "requested_changes": requested_changes or [],
         "items": latest.get('items') or [],
@@ -3387,7 +3398,12 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
                 "message": "Payment was released."
             })
 
-    campaign_details = normalize_campaign_response({key: value for key, value in campaign.items() if key != 'bids'})
+    # The creator's own deal embeds the brief; on a multi-creator brief the shared
+    # status / work_submission describe whoever acted last, so show this creator's own.
+    embedded = campaign
+    if viewer.get('role') == UserRole.CREATOR and viewer.get('id') == creator.get('id'):
+        embedded = await scope_campaign_to_creator(campaign, creator['id'])
+    campaign_details = normalize_campaign_response({key: value for key, value in embedded.items() if key != 'bids'})
     # The brief typed at checkout is a DRAFT until the brand sends it (which they can
     # only do once the creator accepts). The creator must not see it before then.
     if viewer.get('id') == creator.get('id'):
@@ -3455,8 +3471,20 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
     }
 
 # Auth Routes
+async def send_welcome_notification(user_id: str, role) -> None:
+    """First thing a new person sees in their notification bell. Shared by email,
+    Google and Apple signup so every route onboards the same way."""
+    tip = {
+        UserRole.CREATOR.value: "Browse open briefs and complete your profile to start getting matched with brands.",
+        UserRole.BUSINESS.value: "Post your first brief to start getting matched with creators.",
+    }.get(getattr(role, "value", role), "You're all set.")
+    await notify_user(user_id, "👋 Welcome to UGCad.io!", tip, ntype="info", category="system")
+
+
 @api_router.post("/auth/signup")
 async def signup(data: SignupRequest):
+    if data.role not in SELF_SERVICE_ROLES:
+        raise HTTPException(status_code=403, detail="Staff accounts are created by an administrator.")
     existing = await db.users.find_one({"email": data.email}, {"_id": 0})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -3512,11 +3540,7 @@ async def signup(data: SignupRequest):
     # First thing the person sees in their notification bell — without this the
     # bell either showed nothing or, for some accounts, a leftover/garbled row from
     # an unrelated admin broadcast that was never meant as a welcome message.
-    role_tip = {
-        UserRole.CREATOR: "Browse open briefs and complete your profile to start getting matched with brands.",
-        UserRole.BUSINESS: "Post your first brief to start getting matched with creators.",
-    }.get(data.role, "You're all set.")
-    await notify_user(user_id, "👋 Welcome to UGCad.io!", role_tip, ntype="info", category="system")
+    await send_welcome_notification(user_id, data.role)
 
     return {
         "token": token,
@@ -3649,7 +3673,7 @@ async def google_auth(data: GoogleAuthRequest, totp_token: Optional[str] = None)
     if not user:
         # New account — role from the signup selector, defaulting to creator.
         role = data.role.value if data.role else UserRole.CREATOR.value
-        if role not in [UserRole.CREATOR.value, UserRole.BUSINESS.value, UserRole.ADMIN.value]:
+        if role not in [r.value for r in SELF_SERVICE_ROLES]:
             role = UserRole.CREATOR.value
 
         user_id = str(uuid.uuid4())
@@ -3677,6 +3701,7 @@ async def google_auth(data: GoogleAuthRequest, totp_token: Optional[str] = None)
 
         await db.users.insert_one(user_doc)
         user = user_doc
+        await send_welcome_notification(user_id, role)
     else:
         # Block banned accounts, mirroring /auth/login.
         if user.get("banned", False):
@@ -3822,7 +3847,7 @@ async def apple_auth(data: AppleAuthRequest, totp_token: Optional[str] = None):
                 detail="Apple did not return an email. Remove this app under Settings > Apple ID > Sign in with Apple, then try again.",
             )
         role = data.role.value if data.role else UserRole.CREATOR.value
-        if role not in [UserRole.CREATOR.value, UserRole.BUSINESS.value, UserRole.ADMIN.value]:
+        if role not in [r.value for r in SELF_SERVICE_ROLES]:
             role = UserRole.CREATOR.value
 
         user_id = str(uuid.uuid4())
@@ -3853,6 +3878,7 @@ async def apple_auth(data: AppleAuthRequest, totp_token: Optional[str] = None):
 
         await db.users.insert_one(user_doc)
         user = user_doc
+        await send_welcome_notification(user_id, role)
     else:
         # Same gates /auth/login and /auth/google apply.
         if user.get("banned", False):
@@ -7396,6 +7422,51 @@ async def enrich_bids_with_creator_names(campaigns: list) -> None:
                 bid["creator_name"] = name_by_id[bid["creator_id"]]
 
 
+# Statuses a multi-creator brief moves through once creators are hired. campaign.status and
+# campaign.work_submission are ONE shared slot per brief (the last writer wins), so on a
+# brief with several hired creators they describe whoever acted most recently, not the
+# viewing creator.
+_CREATOR_SCOPED_STATUSES = {
+    CampaignStatus.IN_PROGRESS.value, "work_submitted", CampaignStatus.COMPLETED.value,
+}
+
+
+async def scope_campaign_to_creator(campaign: dict, creator_id: str) -> dict:
+    """What THIS creator should see of a brief with more than one hired creator.
+
+    Without this, creator A submitting work flipped the brief to "work_submitted" and
+    stored A's file in the shared work_submission, so creator B - who had submitted
+    nothing - saw "your content is under review" and A's submission on their own card,
+    and B's Active Work timeline moved with A's. Status is derived the same way
+    campaign_rollup_status does it for the brand, but from this creator's own work and
+    payout only. Single-creator briefs, and briefs still hiring, are returned untouched."""
+    hired = selected_creator_ids(campaign)
+    status = str(getattr(campaign.get("status"), "value", campaign.get("status")) or "")
+    if len(hired) < 2 or creator_id not in hired or status not in _CREATOR_SCOPED_STATUSES:
+        return campaign
+    escrow = await db.escrow.find_one(
+        {"campaign_id": campaign["id"], "creator_id": creator_id}, {"_id": 0, "status": 1, "payout_status": 1})
+    work = await db.work_submissions.find_one(
+        {"campaign_id": campaign["id"], "creator_id": creator_id}, {"_id": 0}, sort=[("submitted_at", -1)])
+    if escrow and (escrow.get("payout_status") == "released" or escrow.get("status") == "released"):
+        own = CampaignStatus.COMPLETED.value
+    elif work and work.get("status") == WorkStatus.SUBMITTED:
+        own = "work_submitted"
+    else:
+        own = CampaignStatus.IN_PROGRESS.value
+    own_submission = None
+    if work:
+        own_submission = {
+            "id": work.get("id"), "creator_id": creator_id,
+            "work_files": work.get("work_files") or [], "edited_files": work.get("edited_files") or [],
+            "raw_files": work.get("raw_files") or [], "stage": work.get("stage"),
+            "video_url": (work.get("edited_files") or work.get("work_files") or work.get("raw_files") or [None])[0],
+            "creator_note": work.get("description"), "submitted_at": work.get("submitted_at"),
+            "status": work.get("status"),
+        }
+    return {**campaign, "status": own, "work_submission": own_submission, "scoped_to_creator": True}
+
+
 @api_router.get("/campaigns")
 async def get_campaigns(
     status: Optional[str] = None,
@@ -7449,8 +7520,10 @@ async def get_campaigns(
         # status=active to browse and status=completed for "Deals Closed"; ignoring it
         # listed the creator's own in-progress deals in Browse and counted every
         # campaign as a closed deal). Without the param, behaviour is unchanged.
-        if status:
+        if status and status not in _CREATOR_SCOPED_STATUSES:
             query = {"$and": [query, {"status": status}]}
+        # For in_progress / work_submitted / completed the match is made AFTER each brief
+        # is scoped to this creator (below): the shared status belongs to whoever acted last.
     elif current_user['role'] == UserRole.BUSINESS:
         query['business_id'] = _brand_ws_id(current_user)  # team members see the owner's campaigns
         # Optionally filter by status
@@ -7463,6 +7536,12 @@ async def get_campaigns(
         query['status'] = status
     
     campaigns = await db.campaigns.find(query, {"_id": 0}).to_list(1000)
+
+    if current_user['role'] == UserRole.CREATOR:
+        campaigns = [await scope_campaign_to_creator(c, current_user['id']) for c in campaigns]
+        if status and status in _CREATOR_SCOPED_STATUSES:
+            campaigns = [c for c in campaigns
+                         if str(getattr(c.get("status"), "value", c.get("status")) or "") == status]
     
     # Normalize all campaigns
     normalized_campaigns = []
@@ -7495,9 +7574,12 @@ async def get_campaign(campaign_id: str, current_user: dict = Depends(get_curren
             and current_user['id'] not in selected_creator_ids(campaign)):
         raise HTTPException(status_code=404, detail="Campaign not found")
 
+    if current_user.get('role') == UserRole.CREATOR:
+        campaign = await scope_campaign_to_creator(campaign, current_user['id'])
+
     # Normalize response to include both old and new fields
     campaign = normalize_campaign_response(campaign)
-    
+
     # Add completion percentage if draft
     if campaign.get('status') == CampaignStatus.DRAFT:
         campaign['completion_percentage'] = get_campaign_completion_percentage(campaign)
@@ -7676,12 +7758,13 @@ async def get_my_bids(current_user: dict = Depends(get_current_user)):
         else:
             bid_status = "pending"
 
-        campaign_details = normalize_campaign_response({key: value for key, value in campaign.items() if key != 'bids'})
+        scoped = await scope_campaign_to_creator(campaign, current_user['id'])
+        campaign_details = normalize_campaign_response({key: value for key, value in scoped.items() if key != 'bids'})
         result.append({
             "campaign": campaign_details,
             "my_bid": my_bid,
             "bid_status": bid_status,
-            "campaign_status": campaign.get('status'),
+            "campaign_status": scoped.get('status'),
             "submitted_at": my_bid.get('submitted_at')
         })
 
@@ -10596,7 +10679,11 @@ async def get_my_deals(current_user: dict = Depends(get_current_user)):
     # never names a creator until long after it goes active.
     campaigns = await db.campaigns.find({
         "$or": [{"selected_creators": current_user['id']}, {"selected_creator": current_user['id']}],
-        "archived_by_creator": {"$ne": True},  # hide what the creator has archived
+        # Hide what THIS creator archived. archived_by_creator is the old campaign-wide
+        # flag: it is only honoured while one creator is hired, because on a multi-creator
+        # brief creator A archiving used to hide the deal from B as well.
+        "archived_creator_ids": {"$ne": current_user['id']},
+        "$and": [{"$or": [{"archived_by_creator": {"$ne": True}}, {"selected_creators.1": {"$exists": True}}]}],
         "status": {"$nin": [
             CampaignStatus.DRAFT.value,
             CampaignStatus.PENDING_APPROVAL.value,
@@ -12095,11 +12182,14 @@ async def archive_deal(deal_id: str, current_user: dict = Depends(get_current_us
     if not campaign:
         raise HTTPException(status_code=404, detail="Deal not found")
     ensure_deal_access(campaign, current_user)
-    field = "archived_by_creator" if current_user.get("role") == UserRole.CREATOR else "archived_by_brand"
-    await db.campaigns.update_one(
-        {"id": campaign['id']},
-        {"$set": {field: True, "archived_at": now_iso()}},
-    )
+    if current_user.get("role") == UserRole.CREATOR:
+        # Per creator, so archiving your own deal never hides another creator's.
+        update = {"$addToSet": {"archived_creator_ids": current_user["id"]}, "$set": {"archived_at": now_iso()}}
+        if len(selected_creator_ids(campaign)) < 2:
+            update["$set"]["archived_by_creator"] = True  # legacy readers
+    else:
+        update = {"$set": {"archived_by_brand": True, "archived_at": now_iso()}}
+    await db.campaigns.update_one({"id": campaign['id']}, update)
     return {"message": "Deal archived"}
 
 @api_router.get("/work/campaign/{campaign_id}")
@@ -12134,7 +12224,16 @@ async def get_work_by_campaign(campaign_id: str, creator_id: Optional[str] = Non
     # viewing their own submission still gets it unchanged.
     if is_owner_brand:
         approved = work.get("status") == WorkStatus.APPROVED
-        return cf.to_brand_facing_asset(work, approved=approved)
+        asset = cf.to_brand_facing_asset(work, approved=approved)
+        # The revision composer needs the deal's REAL count: each resubmission is a new
+        # doc, so its own `revisions` list always starts empty.
+        used = len(await deal_revision_history(work['campaign_id'], work['creator_id']))
+        asset['revision_count_used'] = used
+        asset['free_revision_limit'] = cf.FREE_REVISION_LIMIT
+        asset['free_revisions_remaining'] = max(0, cf.FREE_REVISION_LIMIT - used)
+        asset['next_revision_fee'] = revision_fee_for(used)
+        asset['paid_revision_fee'] = revision_fee_for(cf.FREE_REVISION_LIMIT)
+        return asset
     return work
 
 @api_router.get("/work/pending-review")
@@ -12209,9 +12308,13 @@ async def get_business_work_review(current_user: dict = Depends(get_current_user
     ).sort("submitted_at", -1).to_list(20000)
     # Most recent row per (campaign, creator) — rows are already newest-first.
     latest_by_pair = {}
+    # Revisions are counted PER DEAL: every resubmission is a new doc whose own list
+    # starts empty (see deal_revision_history), so sum them across the pair's docs.
+    revisions_by_pair = {}
     for w in work_submissions:
         key = (w.get('campaign_id'), w.get('creator_id'))
         latest_by_pair.setdefault(key, w)
+        revisions_by_pair[key] = revisions_by_pair.get(key, 0) + len(w.get('revisions') or [])
 
     creator_ids = {cid for (_, cid) in latest_by_pair if cid}
     creators = await db.users.find(
@@ -12257,6 +12360,13 @@ async def get_business_work_review(current_user: dict = Depends(get_current_user
             "editMode": edit_mode(campaign),
             "submittedAt": work.get('submitted_at'),
             "status": status,
+            # So the revision dialog can warn BEFORE the brand sends revision #2 that the
+            # next one is paid, with the real numbers (price comes from Settings).
+            "revisionsUsed": revisions_by_pair.get((campaign_id, creator_id), 0),
+            "freeRevisionLimit": cf.FREE_REVISION_LIMIT,
+            "freeRevisionsRemaining": max(0, cf.FREE_REVISION_LIMIT - revisions_by_pair.get((campaign_id, creator_id), 0)),
+            "nextRevisionFee": revision_fee_for(revisions_by_pair.get((campaign_id, creator_id), 0)),
+            "paidRevisionFee": revision_fee_for(cf.FREE_REVISION_LIMIT),
             **metadata,
             "campaignDetails": metadata['campaign_details'],
             "duration": metadata['duration_seconds'],
@@ -12289,6 +12399,7 @@ async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_
     work['revision_count_used'] = used
     work['free_revisions_remaining'] = max(0, cf.FREE_REVISION_LIMIT - used)
     work['next_revision_fee'] = revision_fee_for(used)
+    work['paid_revision_fee'] = revision_fee_for(cf.FREE_REVISION_LIMIT)
     creator = await db.users.find_one({"id": work['creator_id']}, {"_id": 0, "nickname": 1, "full_name": 1, "business_name": 1, "profile.business_name": 1, "profile.full_name": 1, "profile.fullName": 1})
     if creator:
         work['creator_nickname'] = creator.get('nickname') or creator.get('full_name')
