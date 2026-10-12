@@ -717,6 +717,9 @@ class DisputeCreate(BaseModel):
     evidence_urls: List[str] = []   # min 1 required
 
 class DisputeRuling(BaseModel):
+    # Only needed when the dispute was opened for a whole multi-creator brief and so names
+    # no creator: it says whose deal and money the ruling applies to.
+    creator_id: Optional[str] = None
     ruling: str                # favor_brand / favor_creator / split / no_fault
     refund_amount: Optional[float] = 0     # to brand wallet
     creator_amount: Optional[float] = 0    # released to creator
@@ -2823,6 +2826,26 @@ def deal_creator_scope(campaign: dict, creator_id: str) -> dict:
     return {"campaign_id": campaign['id']}
 
 
+def deal_escrow_filter(campaign: dict, creator_id: Optional[str]) -> dict:
+    """Mongo filter for the escrow of ONE creator's deal.
+
+    A brief with several hired creators holds one escrow per creator, so a filter on
+    campaign_id alone returns an arbitrary one (in practice the first hired creator's):
+    a dispute would freeze, rule on and pay out the wrong deal. Single-creator briefs
+    keep the plain campaign filter (older escrow docs may not carry a creator_id)."""
+    if creator_id and len(selected_creator_ids(campaign)) > 1:
+        return {"campaign_id": campaign["id"], "creator_id": creator_id}
+    return {"campaign_id": campaign["id"]}
+
+
+async def hold_deal_escrow(campaign: dict, creator_id: Optional[str], when: Optional[str] = None) -> None:
+    """Freeze ONE deal's escrow while it is disputed. On a multi-creator brief it never
+    creates a placeholder escrow (that used to be an id-less, amount-less doc)."""
+    flt = deal_escrow_filter(campaign, creator_id)
+    await db.escrow.update_one(
+        flt, {"$set": {"status": "on_hold", "updated_at": when or now_iso()}}, upsert="creator_id" not in flt)
+
+
 async def find_campaign_by_any_id(any_id: str) -> Optional[dict]:
     """Look a campaign up by its real id, or by the DEAL-#### id the UI displays.
 
@@ -3163,6 +3186,9 @@ async def insert_deal_activity(campaign: dict, actor_type: str, actor_name: str,
         "deal_id": person_deal_id(campaign, creator_id),
         "campaign_id": campaign['id'],
         "creator_id": creator_id,
+        # No creator = about the whole brief: every hired creator sees it. Per-creator
+        # events pass their creator_id and are visible only in that creator's deal.
+        "campaign_wide": creator_id is None,
         "timestamp": now_iso(),
         "actor_type": actor_type,
         "actor_name": actor_name,
@@ -3178,6 +3204,7 @@ async def insert_deal_system_message(campaign: dict, message: str, creator_id: O
         "deal_id": person_deal_id(campaign, creator_id),
         "campaign_id": campaign['id'],
         "creator_id": creator_id,
+        "campaign_wide": creator_id is None,
         "sender_id": "system",
         "sender_name": "System",
         "sender_type": "system",
@@ -3215,17 +3242,22 @@ async def settle_deal_lazily(campaign: dict) -> None:
     now = datetime.now(timezone.utc)
     cid = campaign.get('id')
     # Auto-approve a stale, undisputed submission (PRD 8.4).
-    work = await db.work_submissions.find_one({"campaign_id": cid, "status": WorkStatus.SUBMITTED})
-    if work:
-        submitted = parse_iso(work.get('submitted_at') or work.get('created_at'))
-        if submitted and (now - submitted).days >= int(platform_setting("auto_approval_days", AUTO_APPROVE_DAYS)):
-            cards = await db.deal_action_cards.find({"campaign_id": cid}, {"_id": 0}).to_list(100)
-            disputed = any(c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open' for c in cards)
+    submitted_works = await db.work_submissions.find({"campaign_id": cid, "status": WorkStatus.SUBMITTED}).to_list(50)
+    if submitted_works:
+        cards = await db.deal_action_cards.find({"campaign_id": cid}, {"_id": 0}).to_list(100)
+        for work in submitted_works:
+            submitted = parse_iso(work.get('submitted_at') or work.get('created_at'))
+            if not submitted or (now - submitted).days < int(platform_setting("auto_approval_days", AUTO_APPROVE_DAYS)):
+                continue
+            # Only a dispute on THIS creator's deal (or one with no creator) blocks it.
+            disputed = any(
+                c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open'
+                and (not c.get('creator_id') or c.get('creator_id') == work.get('creator_id'))
+                for c in cards)
             if not disputed:
                 await auto_approve_staged(work, campaign)
-    # Release a due scheduled payout (PRD 8.7).
-    escrow = await db.escrow.find_one({"campaign_id": cid, "payout_status": "scheduled"})
-    if escrow:
+    # Release every due scheduled payout (PRD 8.7) — each escrow pays its own creator.
+    for escrow in await db.escrow.find({"campaign_id": cid, "payout_status": "scheduled"}).to_list(50):
         scheduled = parse_iso(escrow.get('payout_scheduled_at'))
         if scheduled and scheduled <= now:
             await release_scheduled_payout(escrow)
@@ -4900,7 +4932,7 @@ async def checkout_brief(data: CheckoutBriefCreate,
     await insert_deal_system_message(
         campaign_doc,
         f"📩 Booking request from {brand_name} — {q['video_count']} video(s) for ₹{q['subtotal']:,.0f}. "
-        f"Payment is held in escrow. Accept, decline, or propose a different price.",
+        f"Payment is held in escrow. Accept, decline, or propose a different price.", creator_id=data.creator_id
     )
     await notify_user(
         data.creator_id,
@@ -4992,7 +5024,7 @@ async def respond_to_booking(campaign_id: str, data: BookingRespond,
             "accepted_at": now,
             "updated_at": now,
         }})
-        await insert_deal_system_message(campaign, f"✅ {creator_name} accepted the booking. The brand can now send the brief.")
+        await insert_deal_system_message(campaign, f"✅ {creator_name} accepted the booking. The brand can now send the brief.", creator_id=campaign.get("selected_creator"))
         await notify_user(brand_id, "Booking accepted — send your brief",
                           f"{creator_name} accepted '{title}'. Send them the brief to start the work.",
                           link="/dashboard/business/all-campaigns", ntype="success")
@@ -5008,7 +5040,7 @@ async def respond_to_booking(campaign_id: str, data: BookingRespond,
             "decline_reason": data.message or "",
             "updated_at": now,
         }})
-        await insert_deal_system_message(campaign, f"❌ {creator_name} declined the booking. The brand has been refunded in full.")
+        await insert_deal_system_message(campaign, f"❌ {creator_name} declined the booking. The brand has been refunded in full.", creator_id=campaign.get("selected_creator"))
         await notify_user(brand_id, "Booking declined — you've been refunded",
                           f"{creator_name} declined '{title}'. ₹{refunded:,.0f} is back in your wallet."
                           + (f" Reason: {data.message}" if data.message else ""),
@@ -5030,7 +5062,7 @@ async def respond_to_booking(campaign_id: str, data: BookingRespond,
         await insert_deal_system_message(
             campaign,
             f"💬 {creator_name} proposed a new price: ₹{proposed:,.0f} (₹{proposed + fee:,.0f} incl. platform fee)."
-            + (f" — \"{data.message}\"" if data.message else ""),
+            + (f" — \"{data.message}\"" if data.message else ""), creator_id=campaign.get("selected_creator")
         )
         await notify_user(brand_id, "Creator proposed a new price",
                           f"{creator_name} wants ₹{proposed:,.0f} for '{title}'. Accept it or cancel the booking.",
@@ -5058,7 +5090,7 @@ async def decide_booking_price(campaign_id: str, data: BookingPriceDecision,
         await db.campaigns.update_one({"id": campaign_id}, {"$set": {
             "booking_status": "declined", "status": "cancelled", "declined_at": now, "updated_at": now,
         }})
-        await insert_deal_system_message(campaign, "❌ The brand didn't accept the new price. The booking is cancelled and refunded.")
+        await insert_deal_system_message(campaign, "❌ The brand didn't accept the new price. The booking is cancelled and refunded.", creator_id=campaign.get("selected_creator"))
         await notify_user(campaign["selected_creator"], "Booking cancelled",
                           f"The brand didn't accept your price for '{title}'.", link="/my-deals", ntype="warning")
         return {"booking_status": "declined", "refunded": refunded}
@@ -5109,7 +5141,7 @@ async def decide_booking_price(campaign_id: str, data: BookingPriceDecision,
         "updated_at": now,
     }, "$unset": {"proposed_amount": "", "proposed_message": "", "proposed_at": ""}})
 
-    await insert_deal_system_message(campaign, f"✅ The brand accepted ₹{new_subtotal:,.0f}. The booking is confirmed — the brief is next.")
+    await insert_deal_system_message(campaign, f"✅ The brand accepted ₹{new_subtotal:,.0f}. The booking is confirmed — the brief is next.", creator_id=campaign.get("selected_creator"))
     await notify_user(campaign["selected_creator"], "Your price was accepted",
                       f"The brand accepted ₹{new_subtotal:,.0f} for '{title}'. Wait for their brief to start.",
                       link="/my-deals", ntype="success")
@@ -5158,7 +5190,7 @@ async def send_booking_brief(campaign_id: str, data: BookingBriefSend,
         "updated_at": now,
     }, "$unset": {"brief_draft": ""}})
 
-    await insert_deal_system_message(campaign, f"📋 Brief received. The work has started.\n\n{brief_text}")
+    await insert_deal_system_message(campaign, f"📋 Brief received. The work has started.\n\n{brief_text}", creator_id=campaign.get("selected_creator"))
     await notify_user(campaign["selected_creator"], "📋 Brief received — you can start",
                       f"The brand sent the brief for '{campaign.get('title') or 'your booking'}'. The work has officially started.",
                       link="/my-deals", ntype="success")
@@ -8367,7 +8399,9 @@ async def create_chat_action_card(data: ChatActionCardCreate, current_user: dict
     if data.type in ["damage_report", "raise_dispute"] and data.deal_id:
         campaign = await get_campaign_by_deal_id(data.deal_id)
         if campaign:
-            await db.escrow.update_one({"campaign_id": campaign["id"]}, {"$set": {"status": "on_hold", "updated_at": created_at}}, upsert=True)
+            # The creator in this chat is the one whose deal is held — not whoever was hired first.
+            chat_creator = current_user["id"] if current_user.get("role") == UserRole.CREATOR else data.recipient_id
+            await hold_deal_escrow(campaign, chat_creator, created_at)
             await db.campaigns.update_one({"id": campaign["id"]}, {"$set": {"chat_issue_status": data.type, "updated_at": created_at}})
     if data.type in ["damage_report", "escalate_to_admin", "raise_dispute"] or fields.get("notify_admin"):
         await notify_admins("Chat action card needs attention", f"{current_user.get('nickname', current_user['id'])} created {data.type}.")
@@ -8572,8 +8606,8 @@ async def activate_deal_from_card(card: dict) -> Optional[dict]:
     )
 
     await insert_deal_activity(campaign, "system", "UGCAD.IO", "deal_started",
-                               f"Offer accepted — deal opened with ₹{int(amount)} held in escrow.")
-    await insert_deal_system_message(campaign, f"Offer accepted. ₹{int(amount)} is held in escrow and the deal room is now open.")
+                               f"Offer accepted — deal opened with ₹{int(amount)} held in escrow.", creator_id=creator["id"])
+    await insert_deal_system_message(campaign, f"Offer accepted. ₹{int(amount)} is held in escrow and the deal room is now open.", creator_id=creator["id"])
     await notify_confirm_delivery_address(campaign, creator["id"])
     return campaign
 
@@ -8764,8 +8798,8 @@ async def activate_countered_private_deal(card: dict, campaign: dict) -> Optiona
         {"$set": {"deal_campaign_id": campaign["id"], "deal_id": make_deal_id(campaign)}},
     )
     await insert_deal_activity(campaign, "system", "UGCAD.IO", "deal_started",
-                               f"Counter-offer accepted — deal opened at \u20b9{int(amount)} with the funds held in escrow.")
-    await insert_deal_system_message(campaign, f"Counter-offer accepted. \u20b9{int(amount)} is held in escrow and the deal room is now open.")
+                               f"Counter-offer accepted — deal opened at \u20b9{int(amount)} with the funds held in escrow.", creator_id=creator["id"])
+    await insert_deal_system_message(campaign, f"Counter-offer accepted. \u20b9{int(amount)} is held in escrow and the deal room is now open.", creator_id=creator["id"])
     await notify_confirm_delivery_address(campaign, creator["id"])
     return campaign
 
@@ -9499,7 +9533,7 @@ async def ensure_ready_for_content(campaign: dict, creator_id: Optional[str] = N
     On a multi-creator brief, creator_id scopes the shipment/receipt check to that
     one creator's own delivery — omitted, it falls back to the whole campaign
     (single-creator behaviour)."""
-    await ensure_not_disputed(campaign['id'])
+    await ensure_not_disputed(campaign['id'], creator_id)
     if campaign.get('requires_shipment'):
         shipment = await find_shipment(campaign['id'], creator_id) if creator_id else await db.shipments.find_one({"campaign_id": campaign['id']}, {"_id": 0})
         receipt_query = {"campaign_id": campaign['id']}
@@ -9780,7 +9814,7 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
         raise HTTPException(status_code=400, detail="This submission is with UGC.ad's editing team. You can review once the edited cut is ready.")
 
     # PRD 9.3: no approval while a dispute is open.
-    await ensure_not_disputed(work['campaign_id'])
+    await ensure_not_disputed(work['campaign_id'], work.get('creator_id'))
 
     now = now_iso()
     already_approved = work.get('status') == WorkStatus.APPROVED
@@ -9939,7 +9973,7 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
         await insert_deal_system_message(
             campaign,
             f"Deliverable approved ({progress['approved']}/{progress['required']}). "
-            f"The creator has {progress['remaining']} more to submit before the deal completes.",
+            f"The creator has {progress['remaining']} more to submit before the deal completes.", creator_id=work['creator_id']
         )
         await notify_user(
             work['creator_id'], "Deliverable approved",
@@ -10042,11 +10076,15 @@ async def campaign_rollup_status(campaign: dict) -> str:
     if await db.work_submissions.count_documents(
             {"campaign_id": campaign['id'], "status": WorkStatus.AWAITING_EDIT}):
         return CampaignStatus.IN_PROGRESS
-    paid = {e.get('creator_id') for e in await db.escrow.find(
-        {"campaign_id": campaign['id'], "status": "released"}, {"_id": 0, "creator_id": 1}).to_list(None)}
+    settled_rows = await db.escrow.find(
+        {"campaign_id": campaign['id'], "status": {"$in": ["released", "refunded"]}},
+        {"_id": 0, "creator_id": 1, "status": 1}).to_list(None)
+    paid = {e.get('creator_id') for e in settled_rows if e.get('status') == 'released'}
+    # a creator whose deal was refunded by a dispute ruling is finished too
+    settled = {e.get('creator_id') for e in settled_rows}
     if len(hired) <= 1 and paid:
         return CampaignStatus.COMPLETED  # legacy escrows may lack creator_id
-    if len(hired) > 1 and all(cid in paid for cid in hired if cid):
+    if len(hired) > 1 and paid and all(cid in settled for cid in hired if cid):
         return CampaignStatus.COMPLETED
     pending = await db.work_submissions.count_documents(
         {"campaign_id": campaign['id'], "status": WorkStatus.SUBMITTED})
@@ -10296,7 +10334,9 @@ async def auto_approve_stale_submissions() -> int:
             continue
         # Don't auto-approve a deal that's under dispute.
         cards = await db.deal_action_cards.find({"campaign_id": campaign['id']}, {"_id": 0}).to_list(100)
-        if any(c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open' for c in cards):
+        # Only a dispute on THIS creator's deal (or a brief-level one) holds this submission back.
+        if any(c.get('type') in ['raise_dispute', 'escalate_to_admin'] and c.get('status') == 'open'
+               and (not c.get('creator_id') or c.get('creator_id') == work.get('creator_id')) for c in cards):
             continue
         await auto_approve_staged(work, campaign)
         approved += 1
@@ -10361,7 +10401,10 @@ async def waive_late_offense(offense_id: str, current_user: dict = Depends(requi
         raise HTTPException(status_code=404, detail="Offense not found")
     await db.late_offenses.update_one({"id": offense_id}, {"$set": {"waived": True, "waived_by": current_user["id"], "waived_at": now_iso()}})
     # If the payout hasn't released yet, drop the penalty from the escrow.
-    escrow = await db.escrow.find_one({"campaign_id": offense.get("campaign_id"), "payout_status": "scheduled"})
+    escrow = await db.escrow.find_one({
+        "campaign_id": offense.get("campaign_id"), "payout_status": "scheduled",
+        **({"creator_id": offense["creator_id"]} if offense.get("creator_id") else {}),
+    })
     if escrow and float(escrow.get("penalty_amount") or 0) > 0:
         gross = float(escrow.get("gross_amount") or escrow.get("amount") or 0)
         tds = float(escrow.get("tds_amount") or 0)
@@ -10494,7 +10537,7 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
         raise HTTPException(status_code=400, detail="This submission is with UGC.ad's editing team. You can request changes once the edited cut is ready.")
 
     # PRD 9.3: no revision requests while a dispute is open.
-    await ensure_not_disputed(work['campaign_id'])
+    await ensure_not_disputed(work['campaign_id'], work.get('creator_id'))
 
     # PRD 8.5: structured revision items (1-5), each with severity + optional brief ref.
     # Fall back to legacy free-text feedback if no items were sent.
@@ -10929,7 +10972,7 @@ async def submit_deal_receipt(deal_id: str, data: DealReceiptSubmit, current_use
     )
     if data.items_damaged:
         await insert_deal_activity(campaign, "creator", current_user.get('nickname', 'Creator'), "dispute_raised", "Damaged or wrong product reported.", creator_id=current_user['id'])
-        await insert_deal_system_message(campaign, "Damaged or wrong product has been reported by the creator.")
+        await insert_deal_system_message(campaign, "Damaged or wrong product has been reported by the creator.", creator_id=current_user['id'])
     return {"message": "Receipt submitted"}
 
 @api_router.post("/deals/{deal_id}/content")
@@ -11179,8 +11222,9 @@ async def create_deal_action_card(deal_id: str, data: DealActionCardSubmit, curr
     }
     card = {
         "id": str(uuid.uuid4()),
-        "deal_id": make_deal_id(campaign),
+        "deal_id": person_deal_id(campaign, context['creator']['id']),
         "campaign_id": campaign['id'],
+        "creator_id": context['creator']['id'],
         "type": data.type,
         "title": title_map[data.type],
         "status": "open",
@@ -11191,8 +11235,8 @@ async def create_deal_action_card(deal_id: str, data: DealActionCardSubmit, curr
     }
     await db.deal_action_cards.insert_one(card)
     event_type = "dispute_raised" if data.type in ["damage_report", "escalate_to_admin", "raise_dispute"] else "tracking_uploaded"
-    await insert_deal_activity(campaign, map_sender_type(current_user['id'], campaign, context['creator']['id'], current_user.get('role')), current_user.get('nickname', 'User'), event_type, data.message)
-    await insert_deal_system_message(campaign, f"{title_map[data.type]}: {data.message}")
+    await insert_deal_activity(campaign, map_sender_type(current_user['id'], campaign, context['creator']['id'], current_user.get('role')), current_user.get('nickname', 'User'), event_type, data.message, creator_id=context['creator']['id'])
+    await insert_deal_system_message(campaign, f"{title_map[data.type]}: {data.message}", creator_id=context['creator']['id'])
     return {"message": "Action card created", "action_card": {key: value for key, value in card.items() if key != "_id"}}
 
 async def create_issue_action(deal_id: str, current_user: dict, issue_type: str, title: str, activity_message: str, payload: DealIssueSubmit):
@@ -11200,8 +11244,9 @@ async def create_issue_action(deal_id: str, current_user: dict, issue_type: str,
     campaign = context['campaign']
     card = {
         "id": str(uuid.uuid4()),
-        "deal_id": make_deal_id(campaign),
+        "deal_id": person_deal_id(campaign, context['creator']['id']),
         "campaign_id": campaign['id'],
+        "creator_id": context['creator']['id'],
         "type": issue_type,
         "title": title,
         "status": "open",
@@ -11215,15 +11260,15 @@ async def create_issue_action(deal_id: str, current_user: dict, issue_type: str,
     # review. Escrow only holds on a raise_dispute, or a brand/admin escalation.
     is_creator = current_user.get('role') == UserRole.CREATOR
     if issue_type == "raise_dispute" or (issue_type == "escalate_to_admin" and not is_creator):
-        await db.escrow.update_one({"campaign_id": campaign['id']}, {"$set": {"status": "on_hold", "updated_at": now_iso()}}, upsert=True)
+        await hold_deal_escrow(campaign, context['creator']['id'])
     await insert_deal_activity(
         campaign,
         map_sender_type(current_user['id'], campaign, context['creator']['id'], current_user.get('role')),
         current_user.get('nickname', 'User'),
         "escalated_to_admin" if issue_type == "escalate_to_admin" else "dispute_raised",
-        activity_message
+        activity_message, creator_id=context['creator']['id']
     )
-    await insert_deal_system_message(campaign, activity_message)
+    await insert_deal_system_message(campaign, activity_message, creator_id=context['creator']['id'])
     return {"message": title, "action_card": {key: value for key, value in card.items() if key != "_id"}}
 
 @api_router.post("/deals/{deal_id}/dispute")
@@ -11257,7 +11302,8 @@ async def escalate_deal(deal_id: str, data: DealIssueSubmit, current_user: dict 
     dtype = "communication_issue"
     if flagged:
         dtype = "revision_abuse" if flagged.get('response') == 'partial_dispute' else "scope_creep"
-    dispute_id = await open_admin_dispute(campaign, current_user, dtype, data.message or "Escalated to admin — could not resolve with the other party.")
+    dispute_id = await open_admin_dispute(campaign, current_user, dtype, data.message or "Escalated to admin — could not resolve with the other party.",
+                                          creator_id=context['creator']['id'])
     result["dispute_id"] = dispute_id
     return result
 
@@ -11293,23 +11339,31 @@ def dispute_severity(dispute_type: str) -> str:
     return DISPUTE_SEVERITY.get(dispute_type, "low")
 
 
-async def get_open_dispute(campaign_id: str) -> Optional[dict]:
-    return await db.disputes.find_one({"campaign_id": campaign_id, "status": {"$in": ["open", "info_requested", "appealed"]}}, {"_id": 0})
+async def get_open_dispute(campaign_id: str, creator_id: Optional[str] = None) -> Optional[dict]:
+    """The open dispute that applies to this deal. A dispute is about ONE creator's deal;
+    one that names no creator (an admin's brief-level dispute) applies to everybody."""
+    query = {"campaign_id": campaign_id, "status": {"$in": ["open", "info_requested", "appealed"]}}
+    if creator_id:
+        query["$or"] = [{"creator_id": creator_id}, {"creator_id": None}]
+    return await db.disputes.find_one(query, {"_id": 0})
 
 
-async def ensure_not_disputed(campaign_id: str):
-    """PRD 9.3: while a dispute is open, all non-dispute deal actions are paused."""
-    if await get_open_dispute(campaign_id):
+async def ensure_not_disputed(campaign_id: str, creator_id: Optional[str] = None):
+    """PRD 9.3: while a dispute is open, all non-dispute deal actions are paused — for the
+    disputed creator's deal only; the other hired creators carry on."""
+    if await get_open_dispute(campaign_id, creator_id):
         raise HTTPException(status_code=409, detail="This deal is under dispute. Actions are paused until an admin resolves it.")
 
 
-async def open_admin_dispute(campaign: dict, raised_by: dict, dtype: str, reason: str) -> str:
+async def open_admin_dispute(campaign: dict, raised_by: dict, dtype: str, reason: str,
+                             creator_id: Optional[str] = None) -> str:
     """Create the single real admin dispute for a deal (idempotent per campaign),
     pause the deal (hold escrow + drop a dispute card) and notify admin + the other
     party. This is the ONE place a deal reaches the admin Disputes queue now that
     creators can no longer file disputes directly — only escalation gets here.
     Returns the dispute id (the existing open one if a dispute is already open)."""
-    existing = await get_open_dispute(campaign['id'])
+    creator_id = creator_id or campaign.get('selected_creator')
+    existing = await get_open_dispute(campaign['id'], creator_id)
     if existing:
         return existing.get("id")
     severity = dispute_severity(dtype)
@@ -11320,7 +11374,7 @@ async def open_admin_dispute(campaign: dict, raised_by: dict, dtype: str, reason
         "deal_id": make_deal_id(campaign),
         "campaign_id": campaign['id'],
         "business_id": campaign.get('business_id'),
-        "creator_id": campaign.get('selected_creator'),
+        "creator_id": creator_id,
         "raised_by": raised_by['id'],
         "raised_by_role": raised_by.get('role'),
         "dispute_type": dtype,
@@ -11334,10 +11388,10 @@ async def open_admin_dispute(campaign: dict, raised_by: dict, dtype: str, reason
         "created_at": now_iso(),
     }
     await db.disputes.insert_one(dispute)
-    await db.escrow.update_one({"campaign_id": campaign['id']},
-                               {"$set": {"status": "on_hold", "updated_at": now_iso()}}, upsert=True)
+    await hold_deal_escrow(campaign, creator_id)
     await db.deal_action_cards.insert_one({
-        "id": str(uuid.uuid4()), "deal_id": make_deal_id(campaign), "campaign_id": campaign['id'],
+        "id": str(uuid.uuid4()), "deal_id": person_deal_id(campaign, creator_id), "campaign_id": campaign['id'],
+        "creator_id": creator_id,
         "type": "raise_dispute", "title": "Escalated to admin", "status": "open", "created_at": now_iso(),
         "created_by": raised_by['id'], "message": reason, "dispute_id": dispute["id"],
     })
@@ -11346,7 +11400,7 @@ async def open_admin_dispute(campaign: dict, raised_by: dict, dtype: str, reason
         f"{dtype.replace('_', ' ')} on deal {make_deal_id(campaign)} — first response due in {first_hrs}h.",
         link="/dashboard/admin/disputes",
     )
-    other_id = campaign.get('business_id') if raised_by.get('role') == UserRole.CREATOR else campaign.get('selected_creator')
+    other_id = campaign.get('business_id') if raised_by.get('role') == UserRole.CREATOR else creator_id
     if other_id and other_id != raised_by['id']:
         await notify_user(other_id, "This deal was escalated to admin",
                           "Deal activity is paused while our team reviews it.",
@@ -11368,9 +11422,10 @@ async def raise_structured_dispute(deal_id: str, data: DisputeCreate, current_us
     if len(data.evidence_urls) < 1:
         raise HTTPException(status_code=400, detail="At least one piece of evidence is required.")
     # PRD 9.8: no disputes after approval / completion.
-    if campaign.get('status') == CampaignStatus.COMPLETED or (await db.escrow.find_one({"campaign_id": campaign['id'], "payout_status": "released"})):
+    deal_creator = context['creator']['id']
+    if campaign.get('status') == CampaignStatus.COMPLETED or (await db.escrow.find_one({**deal_escrow_filter(campaign, deal_creator), "payout_status": "released"})):
         raise HTTPException(status_code=400, detail="This deal is already approved/complete. Approval is final.")
-    if await get_open_dispute(campaign['id']):
+    if await get_open_dispute(campaign['id'], deal_creator):
         raise HTTPException(status_code=400, detail="A dispute is already open on this deal.")
 
     severity = dispute_severity(data.dispute_type)
@@ -11381,7 +11436,7 @@ async def raise_structured_dispute(deal_id: str, data: DisputeCreate, current_us
         "deal_id": make_deal_id(campaign),
         "campaign_id": campaign['id'],
         "business_id": campaign.get('business_id'),
-        "creator_id": campaign.get('selected_creator'),
+        "creator_id": deal_creator,
         "raised_by": current_user['id'],
         "raised_by_role": current_user.get('role'),
         "dispute_type": data.dispute_type,
@@ -11396,16 +11451,17 @@ async def raise_structured_dispute(deal_id: str, data: DisputeCreate, current_us
     }
     await db.disputes.insert_one(dispute)
     # Pause activity + hold escrow + show Disputed state via a deal action card.
-    await db.escrow.update_one({"campaign_id": campaign['id']}, {"$set": {"status": "on_hold", "updated_at": now_iso()}}, upsert=True)
+    await hold_deal_escrow(campaign, deal_creator)
     await db.deal_action_cards.insert_one({
-        "id": str(uuid.uuid4()), "deal_id": make_deal_id(campaign), "campaign_id": campaign['id'],
+        "id": str(uuid.uuid4()), "deal_id": person_deal_id(campaign, deal_creator), "campaign_id": campaign['id'],
+        "creator_id": deal_creator,
         "type": "raise_dispute", "title": "Dispute raised", "status": "open", "created_at": now_iso(),
         "created_by": current_user['id'], "message": data.description, "dispute_id": dispute["id"],
     })
-    await insert_deal_activity(campaign, map_sender_type(current_user['id'], campaign, campaign.get('selected_creator'), current_user.get('role')), current_user.get('nickname', 'User'), "dispute_raised", f"A {severity} dispute was raised: {data.dispute_type.replace('_', ' ')}.")
+    await insert_deal_activity(campaign, map_sender_type(current_user['id'], campaign, deal_creator, current_user.get('role')), current_user.get('nickname', 'User'), "dispute_raised", f"A {severity} dispute was raised: {data.dispute_type.replace('_', ' ')}.", creator_id=context['creator']['id'])
     # PRD 9.9: admin notified within 5 minutes.
     await notify_admins(f"New {severity} dispute", f"{data.dispute_type.replace('_',' ')} on deal {make_deal_id(campaign)} — first response due in {first_hrs}h.", link="/dashboard/admin/disputes")
-    other_party = campaign.get('selected_creator') if current_user['id'] == campaign.get('business_id') else campaign.get('business_id')
+    other_party = deal_creator if current_user['id'] == campaign.get('business_id') else campaign.get('business_id')
     if other_party:
         await notify_user(other_party, "A dispute was raised on your deal", "Deal activity is paused while our team reviews. You'll be asked for any evidence.", link="/my-deals")
     return {"message": "Dispute raised", "dispute_id": dispute["id"], "severity": severity}
@@ -11563,7 +11619,19 @@ async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict 
     if dispute.get("status") in ["resolved", "closed"]:
         raise HTTPException(status_code=400, detail="This dispute is already resolved.")
     campaign = await db.campaigns.find_one({"id": dispute["campaign_id"]})
-    escrow = await db.escrow.find_one({"campaign_id": dispute["campaign_id"]})
+    multi = bool(campaign) and len(selected_creator_ids(campaign)) > 1
+    # A ruling moves money for ONE creator's deal. On a multi-creator brief the escrow is
+    # looked up by that creator, never "the first one on the campaign".
+    deal_creator = dispute.get("creator_id") or data.creator_id
+    if multi and not deal_creator:
+        raise HTTPException(status_code=400, detail="This dispute is about a brief with several hired creators and names none. Pass creator_id to say whose deal this ruling is for.")
+    if multi and deal_creator not in selected_creator_ids(campaign):
+        raise HTTPException(status_code=400, detail="That creator is not hired on this brief.")
+    if deal_creator and not dispute.get("creator_id"):
+        dispute["creator_id"] = deal_creator
+        await db.disputes.update_one({"id": dispute_id}, {"$set": {"creator_id": deal_creator}})
+    escrow = await db.escrow.find_one(
+        deal_escrow_filter(campaign, deal_creator) if campaign else {"campaign_id": dispute["campaign_id"]})
     held = float((escrow or {}).get("amount") or 0)
 
     # PRD 11.3 role matrix — tiered ruling ceiling keyed on the admin SUB-role
@@ -11621,30 +11689,36 @@ async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict 
     # no sign anything was decided. This was the "nothing happened" bug: only the
     # dispute doc changed, so the Deal Room looked untouched on both sides.
     if campaign:
+        others_open = await db.disputes.count_documents({
+            "campaign_id": campaign["id"], "id": {"$ne": dispute_id},
+            "status": {"$in": ["open", "info_requested", "appealed"]}}) if multi else 0
         campaign_update = {
-            "dispute_status": "resolved",
-            "dispute_ruling": data.ruling,
             "dispute_resolved_at": now_iso(),
             "updated_at": now_iso(),
         }
+        if not others_open:
+            campaign_update.update({"dispute_status": "resolved", "dispute_ruling": data.ruling})
         if data.extension_days:
             # Admin gave more time — the deal continues rather than ending.
             new_deadline = (datetime.now(timezone.utc) + timedelta(days=data.extension_days)).isoformat()
             campaign_update.update({"final_delivery_by": new_deadline, "due_date": new_deadline})
-        elif money_back_to_brand:
+        elif money_back_to_brand and not multi:
             # Brand refunded in full, creator paid nothing → the deal is over.
             campaign_update.update({"status": "cancelled", "cancelled_at": now_iso()})
-        elif creator_amt > 0:
+        elif creator_amt > 0 and not multi:
             # Creator was paid → the deal is finished.
             campaign_update.update({"status": CampaignStatus.COMPLETED.value, "completed_at": now_iso()})
         await db.campaigns.update_one({"id": campaign["id"]}, {"$set": campaign_update})
+        if multi:
+            # One creator's deal ended; the brief is only done when every hired creator is settled.
+            await set_campaign_rollup(campaign, now_iso())
 
         # Put the outcome in the Deal Room so both parties actually see it.
         await insert_deal_system_message(
             campaign,
             f"⚖️ Dispute resolved — ruling: {data.ruling.replace('_', ' ')}.\n"
             f"Refunded to brand: ₹{refund:,.0f} · Released to creator: ₹{creator_amt:,.0f}"
-            + (f"\nReason: {data.reasoning}" if data.reasoning else ""),
+            + (f"\nReason: {data.reasoning}" if data.reasoning else ""), creator_id=dispute.get("creator_id")
         )
 
     await db.disputes.update_one({"id": dispute_id}, {"$set": {
@@ -11654,7 +11728,10 @@ async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict 
         "appeal_deadline_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
     }})
     # Close the open dispute card so the deal unpauses.
-    await db.deal_action_cards.update_many({"campaign_id": dispute["campaign_id"], "type": "raise_dispute", "status": "open"}, {"$set": {"status": "resolved"}})
+    close_cards = {"campaign_id": dispute["campaign_id"], "type": "raise_dispute", "status": "open"}
+    if multi:
+        close_cards["$or"] = [{"creator_id": deal_creator}, {"creator_id": None}]
+    await db.deal_action_cards.update_many(close_cards, {"$set": {"status": "resolved"}})
     # PRD 9.5: record outcome on both users' history.
     for uid, role in [(dispute.get("business_id"), "brand"), (dispute.get("creator_id"), "creator")]:
         if not uid:
@@ -11855,8 +11932,8 @@ async def submit_deal_tracking(deal_id: str, data: DealTrackingSubmit, current_u
         "status": "shipped",
     }
     await db.shipments.update_one(await shipment_match_filter(campaign['id'], creator_id), {"$set": shipment_doc}, upsert=True)
-    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "tracking_uploaded", "Shipment tracking was uploaded.")
-    await insert_deal_system_message(campaign, "Shipment tracking was uploaded by the brand.")
+    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "tracking_uploaded", "Shipment tracking was uploaded.", creator_id=creator_id)
+    await insert_deal_system_message(campaign, "Shipment tracking was uploaded by the brand.", creator_id=creator_id)
     return {"message": "Tracking uploaded"}
 
 @api_router.post("/deals/{deal_id}/delivered")
@@ -11866,8 +11943,8 @@ async def mark_deal_delivered(deal_id: str, current_user: dict = Depends(get_cur
         await shipment_match_filter(campaign['id'], creator_id),
         {"$set": {"courier_status": "delivered", "status": "delivered", "updated_at": now_iso()}},
     )
-    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "delivered", "Shipment was marked delivered.")
-    await insert_deal_system_message(campaign, "Shipment was marked delivered.")
+    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "delivered", "Shipment was marked delivered.", creator_id=creator_id)
+    await insert_deal_system_message(campaign, "Shipment was marked delivered.", creator_id=creator_id)
     return {"message": "Marked delivered"}
 
 
@@ -12145,8 +12222,8 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
     }
     await db.shipments.update_one(await shipment_match_filter(campaign["id"], creator_id), {"$set": shipment_doc}, upsert=True)
     await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "label_generated",
-                               "Shipping label generated. Awaiting courier pickup.")
-    await insert_deal_system_message(campaign, "The brand generated a shipping label. The product will be picked up by the courier shortly.")
+                               "Shipping label generated. Awaiting courier pickup.", creator_id=creator_id)
+    await insert_deal_system_message(campaign, "The brand generated a shipping label. The product will be picked up by the courier shortly.", creator_id=creator_id)
 
     # Brand-safe response: product + tracking + label, but NOT the creator's address.
     return {
@@ -12185,8 +12262,8 @@ async def request_shipment(deal_id: str, data: ShipLabelRequest, current_user: d
     }
     await db.shipments.update_one(await shipment_match_filter(campaign["id"], creator_id), {"$set": shipment_doc}, upsert=True)
     await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "shipment_requested",
-                               "Brand submitted product & pickup details. Awaiting label from the platform.")
-    await insert_deal_system_message(campaign, "The brand submitted shipment details. The platform team will prepare the label shortly.")
+                               "Brand submitted product & pickup details. Awaiting label from the platform.", creator_id=creator_id)
+    await insert_deal_system_message(campaign, "The brand submitted shipment details. The platform team will prepare the label shortly.", creator_id=creator_id)
     return {"message": "Shipment requested", "status": "requested"}
 
 
@@ -12203,8 +12280,8 @@ async def mark_shipment_picked_up(deal_id: str, current_user: dict = Depends(get
         await shipment_match_filter(campaign["id"], creator_id),
         {"$set": {"courier_status": "shipped", "status": "shipped", "shipped_at": now_iso(), "updated_at": now_iso()}},
     )
-    await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "shipped", "Package picked up by courier — shipment is in transit.")
-    await insert_deal_system_message(campaign, "The package has been picked up by the courier and is on its way.")
+    await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "shipped", "Package picked up by courier — shipment is in transit.", creator_id=creator_id)
+    await insert_deal_system_message(campaign, "The package has been picked up by the courier and is on its way.", creator_id=creator_id)
     return {"message": "Marked as shipped"}
 
 @api_router.post("/deals/{deal_id}/approve")
@@ -12626,8 +12703,8 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
         upsert=True
     )
 
-    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "tracking_uploaded", "Shipment tracking was uploaded.")
-    await insert_deal_system_message(campaign, "Shipment tracking was uploaded by the brand.")
+    await insert_deal_activity(campaign, "brand", current_user.get('nickname', 'Brand'), "tracking_uploaded", "Shipment tracking was uploaded.", creator_id=creator_id)
+    await insert_deal_system_message(campaign, "Shipment tracking was uploaded by the brand.", creator_id=creator_id)
 
     # PRD 8.9: late product shipping → ₹200/day to the creator (cap ₹1,000), once.
     ship_by = parse_iso(campaign.get('product_shipping_by'))
@@ -12639,7 +12716,7 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
                 await db.users.update_one({"id": creator_id}, {"$inc": {"balance": fee}})
                 await db.shipments.update_one(match, {"$set": {"late_fee_applied": fee, "late_fee_days": days_late}})
                 await notify_user(creator_id, "Late-shipping fee credited", f"₹{fee} was credited to you because the brand shipped {days_late} day(s) late.", link="/withdrawal")
-                await insert_deal_system_message(campaign, f"Brand shipped {days_late} day(s) late — ₹{fee} late-shipping fee credited to the creator (PRD 8.9).")
+                await insert_deal_system_message(campaign, f"Brand shipped {days_late} day(s) late — ₹{fee} late-shipping fee credited to the creator (PRD 8.9).", creator_id=creator_id)
 
     return {"message": "Shipment details updated"}
 
@@ -12821,7 +12898,7 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
                     f"Both addresses are in for '{campaign.get('title', 'a deal')}'. Print a label and ship it.",
                     link="/dashboard/admin/shipping",
                 )
-                await insert_deal_system_message(campaign, "Both shipping addresses received. The platform team will dispatch the product shortly.")
+                await insert_deal_system_message(campaign, "Both shipping addresses received. The platform team will dispatch the product shortly.", creator_id=target_creator_id)
 
     return {"message": "Address saved", "address": address, "both_ready": both_ready}
 
@@ -13692,10 +13769,13 @@ async def admin_ban_campaign(campaign_id: str, data: CampaignModerationAction,
     }})
 
     # Flag the escrow for manual handling rather than moving any money.
-    escrow = await db.escrow.find_one({"campaign_id": campaign_id}, {"_id": 0, "id": 1, "status": 1})
+    escrow = await db.escrow.find_one({"campaign_id": campaign_id, "status": {"$in": ["reserved", "held"]}},
+                                      {"_id": 0, "id": 1, "status": 1})
+    if not escrow:
+        escrow = await db.escrow.find_one({"campaign_id": campaign_id}, {"_id": 0, "id": 1, "status": 1})
     escrow_note = None
     if escrow and escrow.get("status") in ("reserved", "held"):
-        await db.escrow.update_one({"id": escrow["id"]}, {"$set": {
+        await db.escrow.update_many({"campaign_id": campaign_id, "status": {"$in": ["reserved", "held"]}}, {"$set": {
             "needs_manual_review": True,
             "manual_review_reason": f"campaign_banned: {reason}",
             "updated_at": now,
@@ -16847,12 +16927,28 @@ async def admin_refund_escrow(escrow_id: str, data: Dict[str, Any] = Body(...), 
 # ---- Deal-room shortcuts: release/refund by DEAL (campaign) id -----------------
 # The admin Deals drawer calls these deal-scoped paths; they resolve the escrow
 # for the campaign and delegate to the escrow release/refund logic above.
+async def _admin_deal_escrow(campaign_id: str, data: Optional[dict]) -> dict:
+    """The escrow an admin deal-room action applies to. On a brief with several hired
+    creators there is one per creator, so the admin must say which — guessing "the first"
+    would pay out or refund the wrong creator's money."""
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0}) or {"id": campaign_id}
+    hired = selected_creator_ids(campaign)
+    creator_id = (data or {}).get("creator_id")
+    if len(hired) > 1:
+        if not creator_id:
+            raise HTTPException(status_code=400, detail="This brief has several hired creators — pass creator_id to say whose payment this is.")
+        if creator_id not in hired:
+            raise HTTPException(status_code=400, detail="That creator is not hired on this brief.")
+    escrow = await db.escrow.find_one(deal_escrow_filter(campaign, creator_id), {"_id": 0})
+    if not escrow:
+        raise HTTPException(status_code=404, detail="No escrow found for this deal")
+    return escrow
+
+
 @api_router.post("/admin/deals/{campaign_id}/release-payment")
 async def admin_deal_release_payment(campaign_id: str, data: Dict[str, Any] = Body(default={}),
                                      request: Request = None, current_user: dict = Depends(require_cap("release_payouts"))):
-    escrow = await db.escrow.find_one({"campaign_id": campaign_id}, {"_id": 0})
-    if not escrow:
-        raise HTTPException(status_code=404, detail="No escrow found for this deal")
+    escrow = await _admin_deal_escrow(campaign_id, data)
     body = dict(data or {})
     body.setdefault("reason", "Payment released from the deal room by admin")
     return await admin_release_escrow(escrow["id"], data=body, request=request, current_user=current_user)
@@ -16861,9 +16957,7 @@ async def admin_deal_release_payment(campaign_id: str, data: Dict[str, Any] = Bo
 @api_router.post("/admin/deals/{campaign_id}/refund")
 async def admin_deal_refund(campaign_id: str, data: Dict[str, Any] = Body(default={}),
                             request: Request = None, current_user: dict = Depends(require_cap("release_payouts"))):
-    escrow = await db.escrow.find_one({"campaign_id": campaign_id}, {"_id": 0})
-    if not escrow:
-        raise HTTPException(status_code=404, detail="No escrow found for this deal")
+    escrow = await _admin_deal_escrow(campaign_id, data)
     body = dict(data or {})
     body.setdefault("reason", "Refunded from the deal room by admin")
     return await admin_refund_escrow(escrow["id"], data=body, request=request, current_user=current_user)
@@ -17076,7 +17170,7 @@ async def admin_mark_shipped(campaign_id: str, creator_id: Optional[str] = None,
         await notify_user(campaign["business_id"], "Product shipped", "Your product has been shipped to the creator.", link="/dashboard/business/shipments", category="deal_updates")
     if target_creator_id:
         await notify_user(target_creator_id, "Product on the way", "The brand's product has been shipped to you.", link="/my-deals", email=True, category="deal_updates")
-    await insert_deal_system_message(campaign, "Shipment dispatched by the platform team.")
+    await insert_deal_system_message(campaign, "Shipment dispatched by the platform team.", creator_id=target_creator_id)
     return {"message": "Marked as shipped"}
 
 
@@ -17355,7 +17449,7 @@ async def admin_force_transition(campaign_id: str, data: Dict[str, Any] = Body(.
                            before={"status": before_status}, after={"status": new_status}, reason=reason, request=request)
     msg = f"Admin intervened in this deal. Reason: {reason}. Contact support if you have questions."
     await insert_deal_system_message(campaign, msg)
-    for uid in [campaign.get("business_id"), campaign.get("selected_creator")]:
+    for uid in [campaign.get("business_id"), *(selected_creator_ids(campaign) or [campaign.get("selected_creator")])]:
         if uid:
             await notify_user(uid, "Admin intervened in your deal", msg, link="/my-deals")
     return {"message": "State transition forced", "from": before_status, "to": new_status}
@@ -17392,18 +17486,22 @@ async def admin_raise_dispute(campaign_id: str, data: Dict[str, Any] = Body(...)
     reason = (data.get("reason") or "").strip()
     if not reason:
         raise HTTPException(status_code=400, detail="A reason is required")
+    dispute_creator = data.get("creator_id")
+    if dispute_creator and dispute_creator not in selected_creator_ids(campaign):
+        raise HTTPException(status_code=400, detail="That creator is not hired on this brief.")
     dispute = {
         "id": str(uuid.uuid4()), "campaign_id": campaign_id, "status": "open",
+        "creator_id": dispute_creator, "business_id": campaign.get("business_id"),
         "raised_by": "admin", "reason": reason, "created_at": now_iso(), "updated_at": now_iso(),
     }
-    existing = await db.disputes.find_one({"campaign_id": campaign_id, "status": {"$in": ["open", "info_requested", "appealed"]}})
+    existing = await get_open_dispute(campaign_id, dispute_creator)
     if not existing:
         await db.disputes.insert_one(dispute)
     await db.campaigns.update_one({"id": campaign_id}, {"$set": {"status": "disputed", "updated_at": now_iso()}})
     await log_admin_action(current_user, "deal.raise_dispute", target_type="deal", target_id=campaign_id, reason=reason, request=request)
     msg = f"Support opened a dispute on this deal. Reason: {reason}."
     await insert_deal_system_message(campaign, msg)
-    for uid in [campaign.get("business_id"), campaign.get("selected_creator")]:
+    for uid in [campaign.get("business_id"), *(selected_creator_ids(campaign) or [campaign.get("selected_creator")])]:
         if uid:
             await notify_user(uid, "Dispute opened", msg, link="/my-deals")
     return {"success": True}
@@ -17419,7 +17517,7 @@ async def admin_deal_message(campaign_id: str, data: Dict[str, Any] = Body(...),
         raise HTTPException(status_code=400, detail="A message is required")
     await insert_deal_system_message(campaign, f"[Support] {message}")
     await log_admin_action(current_user, "deal.message", target_type="deal", target_id=campaign_id, request=request)
-    for uid in [campaign.get("business_id"), campaign.get("selected_creator")]:
+    for uid in [campaign.get("business_id"), *(selected_creator_ids(campaign) or [campaign.get("selected_creator")])]:
         if uid:
             await notify_user(uid, "Support posted in your deal room", message[:140], link="/my-deals")
     return {"success": True}
