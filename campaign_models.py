@@ -71,6 +71,9 @@ class BriefSectionsMixin(BaseModel):
     """
     # Section 1: Campaign Basics (extra)
     target_audience: Optional[str] = None
+    # Language the video should be spoken in. Only the private brief asked for it
+    # (and only inside its text), so open campaign briefs reached creators without one.
+    language: Optional[str] = None
     budget_visible: Optional[bool] = None
     # What is being promoted, and the brand's own wording when they pick
     # "Other". Both clients have been sending these since the brief wizard
