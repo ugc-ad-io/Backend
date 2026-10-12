@@ -551,6 +551,7 @@ class BusinessSettingsCompanyUpdate(BaseModel):
     billing_address: str
     city: str
     state: str
+    pincode: Optional[str] = ""   # optional; lets the account address double as the courier pickup
     kyb_status: Optional[str] = None
 
 class BusinessTeamInvite(BaseModel):
@@ -2242,6 +2243,7 @@ def business_company_defaults(user: dict, settings: Optional[dict] = None) -> di
         "billing_address": settings.get("billing_address") or "",
         "city": settings.get("city") or "",
         "state": settings.get("state") or "",
+        "pincode": settings.get("pincode") or "",
         "kyb_status": settings.get("kyb_status") or kyb_status
     }
 
@@ -2856,15 +2858,25 @@ def get_required_assets(campaign: dict) -> dict:
         (d.get('raw_required') if isinstance(d, dict) else getattr(d, 'raw_required', False))
         for d in (campaign.get('deliverable_items') or [])
     )
+    items = campaign.get('deliverable_items') or []
+    edited_wanted = any(
+        (d.get('edited_required') if isinstance(d, dict) else getattr(d, 'edited_required', False))
+        for d in items
+    )
+    # The brand asked for RAW footage only: the single file the creator uploads IS the raw
+    # video. Requiring a separate "final video" AND "raw footage" made the creator see two
+    # slots for one deliverable, and Submit never enabled with only the raw one filled.
+    raw_only = bool(items) and not edited_wanted
     return {
         "final_video": True,
+        "raw_only": raw_only,
         "caption_script": bool(
             checklist.get('caption_script') or
             checklist.get('caption') or
             campaign.get('caption_required')
         ),
         "thumbnail": bool(checklist.get('thumbnail') or campaign.get('thumbnail_required')),
-        "raw_footage": bool(
+        "raw_footage": (not raw_only) and bool(
             checklist.get('raw_footage') or
             checklist.get('raw_files') or
             campaign.get('raw_footage_required') or
@@ -3332,7 +3344,22 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
     }, {"_id": 0}).sort("timestamp", 1).to_list(100)
     deal_messages = await db.deal_messages.find(deal_creator_scope(campaign, creator['id']), {"_id": 0}).sort("created_at", 1).to_list(100)
     messages = []
+    # The 1:1 thread (db.messages) spans EVERY campaign these two people share, so each
+    # deal's chat used to open with the whole history. Keep only what belongs to THIS
+    # campaign: nothing older than the campaign itself, and no other campaign's
+    # "you've been selected for …" notices.
+    campaign_started = str(campaign.get('created_at') or '')
+    campaign_title = str(campaign.get('title') or '')
+    def _belongs_here(msg):
+        sent = str(msg.get('timestamp') or '')
+        if campaign_started and sent and sent < campaign_started:
+            return False
+        if msg.get('system_message') and campaign_title and campaign_title not in str(msg.get('message') or ''):
+            return False
+        return True
     for msg in legacy_messages:
+        if not _belongs_here(msg):
+            continue
         messages.append({
             "id": msg.get('id'),
             "sender_type": map_sender_type(msg.get('sender_id'), campaign, creator['id']),
@@ -4969,6 +4996,7 @@ async def respond_to_booking(campaign_id: str, data: BookingRespond,
         await notify_user(brand_id, "Booking accepted — send your brief",
                           f"{creator_name} accepted '{title}'. Send them the brief to start the work.",
                           link="/dashboard/business/all-campaigns", ntype="success")
+        await notify_confirm_delivery_address(campaign, current_user["id"])
         return {"booking_status": "accepted"}
 
     if data.action == "decline":
@@ -5486,6 +5514,7 @@ async def update_business_settings_company(
 ):
     company_data = data.dict()
     require_non_empty(company_data, ["business_type", "business_category", "country", "billing_address", "city", "state"])
+    company_data["pincode"] = re.sub(r"\D", "", str(company_data.get("pincode") or ""))[:6]
     validate_choice(company_data.get("kyb_status"), ["pending", "verified", "rejected"], "kyb_status")
     if not company_data.get("kyb_status"):
         company_data["kyb_status"] = business_company_defaults(current_user).get("kyb_status", "pending")
@@ -7982,6 +8011,7 @@ You can now communicate directly with {creator_display} to coordinate the work. 
         "created_by": "system"
     }
     await db.in_app_notifications.insert_one(notification_doc)
+    await notify_confirm_delivery_address(campaign, creator_id)
 
     # Notify the brand that their payment is now held in escrow.
     await notify_user(
@@ -8544,6 +8574,7 @@ async def activate_deal_from_card(card: dict) -> Optional[dict]:
     await insert_deal_activity(campaign, "system", "UGCAD.IO", "deal_started",
                                f"Offer accepted — deal opened with ₹{int(amount)} held in escrow.")
     await insert_deal_system_message(campaign, f"Offer accepted. ₹{int(amount)} is held in escrow and the deal room is now open.")
+    await notify_confirm_delivery_address(campaign, creator["id"])
     return campaign
 
 
@@ -8735,6 +8766,7 @@ async def activate_countered_private_deal(card: dict, campaign: dict) -> Optiona
     await insert_deal_activity(campaign, "system", "UGCAD.IO", "deal_started",
                                f"Counter-offer accepted — deal opened at \u20b9{int(amount)} with the funds held in escrow.")
     await insert_deal_system_message(campaign, f"Counter-offer accepted. \u20b9{int(amount)} is held in escrow and the deal room is now open.")
+    await notify_confirm_delivery_address(campaign, creator["id"])
     return campaign
 
 
@@ -10924,6 +10956,8 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         data.raw_footage_url = (await approved_raw_files(campaign['id'], current_user['id'], deliverable_index) or [None])[0]
 
     required = get_required_assets(campaign)
+    if required.get('raw_only') and not stage and data.video_url:
+        data.raw_footage_url = data.video_url   # the one file is the raw video
     missing = []
     if required['final_video'] and not data.video_url:
         missing.append('video_url')
@@ -11837,6 +11871,60 @@ async def mark_deal_delivered(deal_id: str, current_user: dict = Depends(get_cur
     return {"message": "Marked delivered"}
 
 
+_ADDR_REQUIRED = ("full_name", "phone", "line1", "city", "state", "pincode")
+
+
+def account_address_for(user: dict, company: Optional[dict] = None) -> Optional[dict]:
+    """The address already saved on a user's ACCOUNT, in the shape the shipping forms
+    use — so neither side retypes it.
+      creator → KYC residential address, else the flat signup fields;
+      brand   → Settings → Company (billing address / city / state / pincode).
+    Returns None when nothing usable is saved. Never reads another user's data."""
+    user = user or {}
+    profile = user.get("profile") or {}
+    phone = user.get("phone") or profile.get("phone") or user.get("phone_number") or ""
+    if user.get("role") == UserRole.BUSINESS:
+        c = company or {}
+        if not (c.get("billing_address") or c.get("city")):
+            return None
+        return {
+            "full_name": profile.get("contact_person") or person_display_name(user, ""),
+            "phone": str(phone), "line1": c.get("billing_address") or "", "line2": "",
+            "city": c.get("city") or "", "state": c.get("state") or "",
+            "pincode": str(c.get("pincode") or ""), "country": c.get("country") or "India",
+        }
+    kyc = user.get("kyc") or {}
+    k = kyc.get("address") or {}
+    if k.get("line"):
+        return {
+            "full_name": kyc.get("full_legal_name") or profile.get("fullName") or user.get("full_name") or user.get("nickname") or "",
+            "phone": str(phone), "line1": k.get("line") or "", "line2": "",
+            "city": k.get("city") or "", "state": k.get("state") or "",
+            "pincode": str(k.get("pincode") or ""), "country": "India",
+        }
+    return creator_delivery_address(user)
+
+
+def address_missing_fields(address: Optional[dict]) -> list:
+    return [k for k in _ADDR_REQUIRED if not str((address or {}).get(k) or "").strip()]
+
+
+async def notify_confirm_delivery_address(campaign: dict, creator_id: Optional[str]):
+    """Ask the hired creator to confirm where the product should be couriered, in-app and
+    by email, so the UGC.ad team can schedule the delivery. Once per creator per brief."""
+    if not creator_id or not campaign or not campaign.get("requires_shipment"):
+        return
+    link = f"/my-deals?campaign={campaign['id']}"
+    if await db.in_app_notifications.find_one({"user_id": creator_id, "link": link, "category": "delivery_address"}):
+        return
+    await notify_user(
+        creator_id, "Confirm your delivery address",
+        f"'{campaign.get('title', 'Your campaign')}' ships a product to you. Confirm where it should be "
+        "delivered — use the address from your account or enter a new one — so our team can schedule the courier.",
+        link=link, ntype="warning", email=True, category="delivery_address",
+    )
+
+
 def creator_delivery_address(user: dict) -> Optional[dict]:
     """Build a Shiprocket-ready delivery address from a creator's saved profile.
     Defensive: reads from the structured profile.address (set via /shipping/address)
@@ -12014,6 +12102,7 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
     # The creator's delivery address is NOT the brand's concern — don't block the brand on it.
     # If it isn't set yet, proceed anyway; the creator/platform completes it before dispatch.
     delivery = creator_delivery_address(creator)
+    creator_confirmed = bool((await find_shipment(campaign["id"], creator_id) or {}).get("delivery_address"))
 
     dims = (data.dimensions.dict() if data.dimensions else {}) or {}
 
@@ -12043,8 +12132,9 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
         "creator_id": creator_id,
         "product": {"description": data.description, "weight": data.weight, "dimensions": dims},
         "pickup_address": data.pickup_address.dict(),
-        "delivery_address": delivery or {},    # internal only — completed before dispatch
-        "awaiting_creator_address": not delivery,
+        # Not auto-filled from the account: the creator must CONFIRM where it goes (see
+        # save_shipping_address); a prior confirmation on this shipment is left untouched.
+        "awaiting_creator_address": not creator_confirmed,
         "tracking_number": tracking_number,
         "courier_name": courier_name,
         "label_url": label_url,
@@ -12078,7 +12168,7 @@ async def request_shipment(deal_id: str, data: ShipLabelRequest, current_user: d
         raise HTTPException(status_code=400, detail="This deal does not require a shipment")
 
     creator = await db.users.find_one({"id": creator_id}, {"_id": 0}) or {}
-    delivery = creator_delivery_address(creator)
+    creator_confirmed = bool((await find_shipment(campaign["id"], creator_id) or {}).get("delivery_address"))
     dims = (data.dimensions.dict() if data.dimensions else {}) or {}
 
     shipment_doc = {
@@ -12087,8 +12177,7 @@ async def request_shipment(deal_id: str, data: ShipLabelRequest, current_user: d
         "product": {"description": data.description, "weight": data.weight, "dimensions": dims},
         "product_summary": data.description,
         "pickup_address": data.pickup_address.dict(),
-        "delivery_address": delivery or {},          # internal only — stripped from GET responses
-        "awaiting_creator_address": not delivery,
+        "awaiting_creator_address": not creator_confirmed,
         "courier_status": "requested",
         "status": "requested",
         "requested_at": now_iso(),
@@ -12737,6 +12826,17 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
     return {"message": "Address saved", "address": address, "both_ready": both_ready}
 
 
+@api_router.get("/shipping/account-address")
+async def get_account_shipping_address(current_user: dict = Depends(get_current_user)):
+    """The caller's OWN account address (creator: KYC/signup; brand: company settings), in
+    shipping-form shape — used to pre-fill the pickup / delivery forms."""
+    me = await db.users.find_one({"id": current_user["id"]}, {"_id": 0}) or {}
+    company = ((await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0}) or {}).get("company")
+               if current_user.get("role") == UserRole.BUSINESS else None)
+    address = account_address_for(me, company)
+    return {"address": address, "missing": address_missing_fields(address) if address else list(_ADDR_REQUIRED)}
+
+
 @api_router.get("/shipping/address")
 async def get_shipping_address(campaign_id: Optional[str] = None, creator_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     """Return MY saved address (for prefill) and, for a given deal, whether each
@@ -12745,11 +12845,20 @@ async def get_shipping_address(campaign_id: Optional[str] = None, creator_id: Op
 
     On a multi-creator brief, a brand caller passes ?creator_id=<id> to check one
     specific hired creator's readiness (defaults to the first hired creator)."""
-    me = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "profile": 1}) or {}
-    my_address = (me.get("profile") or {}).get("address")
+    me = await db.users.find_one({"id": current_user["id"]}, {"_id": 0}) or {}
+    saved = (me.get("profile") or {}).get("address")
+    # profile.address can be a plain signup string; the form needs the structured dict.
+    my_address = saved if isinstance(saved, dict) else None
+    company = ((await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0}) or {}).get("company")
+               if current_user.get("role") == UserRole.BUSINESS else None)
+    account_address = account_address_for(me, company)
 
     out = {
         "address": my_address,
+        # What's already on the user's account, so the form can offer "use this" instead
+        # of making them retype it. `account_missing` lists fields they still need to add.
+        "account_address": account_address,
+        "account_missing": address_missing_fields(account_address) if account_address else list(_ADDR_REQUIRED),
         "my_role": None,
         "brand_confirmed": False,
         "creator_confirmed": False,
@@ -12780,7 +12889,9 @@ async def get_shipping_address(campaign_id: Optional[str] = None, creator_id: Op
     # (/deals/{id}/request-shipment), which stores it on the SHIPMENT — not on their
     # profile. So that's the source of truth for "the brand has given their details".
     out["brand_confirmed"] = bool(sh.get("pickup_address"))
-    out["creator_confirmed"] = bool((creator.get("profile") or {}).get("address"))
+    # Confirmed = the creator confirmed it FOR THIS DEAL. A bare account/signup address no
+    # longer counts, which made "You confirmed" show before the creator had done anything.
+    out["creator_confirmed"] = bool(sh.get("delivery_address"))
     out["both_ready"] = out["brand_confirmed"] and out["creator_confirmed"]
     out["shipment_status"] = sh.get("status") or sh.get("courier_status")
     out["requires_shipment"] = bool(campaign.get("requires_shipment"))
@@ -16871,7 +16982,9 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
         cid = c.get("id")
         if not cid:
             continue  # legacy campaign without a UUID id — skip rather than 500
-        brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "nickname": 1, "profile": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1}) or {}
+        brand = await db.users.find_one({"id": c.get("business_id")}, {"_id": 0, "id": 1, "role": 1, "phone": 1, "phone_number": 1, "nickname": 1, "profile": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1}) or {}
+        brand_company = ((await db.business_settings.find_one({"business_id": c.get("business_id")}, {"_id": 0}) or {}).get("company"))
+        brand_account_addr = account_address_for(brand, brand_company)
         # One row PER HIRED CREATOR — a multi-creator brief needs a separate label/
         # dispatch/address per creator. Looping only "selected_creator" (singular)
         # meant creators 2..N on the same brief never appeared in the ops queue at
@@ -16879,7 +16992,8 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
         for creator_id in selected_creator_ids(c):
             sh = await find_shipment(cid, creator_id) or {}
             ship_status = sh.get("courier_status") or sh.get("status") or "pending"
-            creator = await db.users.find_one({"id": creator_id}, {"_id": 0, "nickname": 1, "profile": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1}) or {}
+            creator = await db.users.find_one({"id": creator_id}, {"_id": 0, "id": 1, "role": 1, "kyc": 1, "phone": 1, "phone_number": 1, "nickname": 1, "profile": 1, "full_name": 1, "business_name": 1, "name": 1, "username": 1, "email": 1}) or {}
+            creator_account_addr = account_address_for(creator)
             requested = sh.get("requested_at") or c.get("work_started_at") or c.get("updated_at") or c.get("created_at")
             prod = sh.get("product") or {}
             dims = prod.get("dimensions") or {}
@@ -16903,15 +17017,13 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
                 # may not exist yet). Both branches go through _fmt_addr — the fallback
                 # used to return the raw dict, which the admin table rendered as
                 # "[object Object]".
-                "pickup_address": _fmt_addr(sh.get("pickup_address")) or _fmt_addr((brand.get("profile") or {}).get("address")),
-                "ship_address": _fmt_addr(sh.get("delivery_address")) or _fmt_addr((creator.get("profile") or {}).get("address")),
-                "shipping_address": _fmt_addr(sh.get("delivery_address")) or _fmt_addr((creator.get("profile") or {}).get("address")),
-                "ship_city": ((sh.get("delivery_address") or (creator.get("profile") or {}).get("address")) or {}).get("city")
-                             if isinstance(sh.get("delivery_address") or (creator.get("profile") or {}).get("address"), dict) else None,
-                # So ops can see at a glance who still owes an address.
-                "awaiting_creator_address": not bool(
-                    sh.get("delivery_address") or (creator.get("profile") or {}).get("address")
-                ),
+                "pickup_address": _fmt_addr(sh.get("pickup_address")) or _fmt_addr(brand_account_addr),
+                "ship_address": _fmt_addr(sh.get("delivery_address")) or _fmt_addr(creator_account_addr),
+                "shipping_address": _fmt_addr(sh.get("delivery_address")) or _fmt_addr(creator_account_addr),
+                "ship_city": (sh.get("delivery_address") or creator_account_addr or {}).get("city"),
+                # True until the creator has confirmed the address for this deal (the ops
+                # address above is then the one from their account, shown so it isn't blank).
+                "awaiting_creator_address": not bool(sh.get("delivery_address")),
             })
     rows.sort(key=lambda r: r.get("requested_at") or "")
     return rows
@@ -16949,7 +17061,12 @@ async def admin_mark_shipped(campaign_id: str, creator_id: Optional[str] = None,
         raise HTTPException(status_code=404, detail="Deal not found")
     target_creator_id = resolve_shipment_creator_id(campaign, current_user, creator_id)
     update = {"courier_name": data.get("courier"), "courier_status": "shipped", "status": "shipped",
-              "tracking_number": data.get("tracking_number"), "creator_id": target_creator_id, "updated_at": now_iso()}
+              "tracking_number": data.get("tracking_number"), "creator_id": target_creator_id,
+              "shipped_at": now_iso(), "updated_at": now_iso()}
+    # Optional: without it the creator's shipping card reads "expected delivery: not available".
+    expected = str(data.get("expected_delivery_at") or data.get("expected_delivery") or "").strip()
+    if expected:
+        update["expected_delivery_at"] = expected
     if data.get("label_url"):
         update["label_url"] = data["label_url"]
     await db.shipments.update_one(await shipment_match_filter(campaign_id, target_creator_id), {"$set": update}, upsert=True)

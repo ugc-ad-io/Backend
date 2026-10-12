@@ -403,6 +403,12 @@ def to_brand_facing_asset(asset: Dict[str, Any], approved: bool = False) -> Dict
     # Every submitted file, labelled — so the brand sees the raw AND the edited video
     # (the review screens used to play only work_files[0]).
     edited, raw = asset.get("edited_files") or [], asset.get("raw_files") or []
+    # A plain (non-staged) submission sends the final video and the raw footage together,
+    # but `edited_files` is only filled in the raw -> edited flow, so the final video fell
+    # out of the labelled list and the brand could open just one of the two files.
+    lead = asset.get("video_url") or next(iter(asset.get("work_files") or []), None)
+    if not edited and raw and lead and lead not in raw:
+        edited = [lead]
     files = ([{"kind": "edited", "label": "Edited video", "url": u} for u in gate(edited)]
              + [{"kind": "raw", "label": "Raw video", "url": u} for u in gate(raw)])
     if not files:  # older work docs and deal-room version rows
