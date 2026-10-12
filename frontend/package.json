@@ -57,8 +57,8 @@
     "zod": "^3.24.4"
   },
   "scripts": {
-    "start": "node api.js && react-scripts start",
-    "build": "node api.js && react-scripts build",
+    "start": "react-scripts start",
+    "build": "react-scripts build",
     "test": "react-scripts test"
   },
   "browserslist": {
