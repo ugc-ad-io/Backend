@@ -50,6 +50,39 @@ def env(monkeypatch):
 
 
 # ---------------------------------------------------------------- staff roles are not self-service
+@pytest.mark.parametrize("price,quantity,editing,expected", [
+    (5000, 3, 0, 19500),
+    (2000, 2, 0, 6300),
+    (1000, 1, 1000, 2900),
+])
+def test_brief_price_includes_quantity_editing_commission_and_listing(price, quantity, editing, expected):
+    campaign = {"per_video_budget": price, "creators_wanted": 1,
+                "editing_fee_per_video": editing,
+                "deliverable_items": [{"quantity": quantity, "edited_required": bool(editing), "edited_by": "creator"}]}
+    gross = server.campaign_budget_total(campaign)
+    assert gross + server.brand_commission(gross) + server.campaign_listing_fee(campaign) == expected
+    campaign["total_budget"] = gross
+    mapped = server.map_legacy_to_new_fields(campaign)
+    assert mapped["budget_max"] == price
+    assert server.campaign_budget_total(mapped) == gross
+
+
+def test_legacy_welcome_is_repaired_without_rewriting_admin_announcements(env):
+    token, user_id = env.signup("creator")
+    env.run(env.db.in_app_notifications.insert_many([
+        {"id": "legacy-welcome", "user_id": user_id, "title": "cdsnig", "message": "placeholder", "source": "admin"},
+        {"id": "real-announcement", "user_id": user_id, "title": "Campaign update", "message": "Review your brief", "source": "admin"},
+        {"id": "other-user", "user_id": "another-user", "title": "cdsnig", "message": "placeholder"},
+    ]))
+    response = env.call("GET", "/notifications/my-notifications", token)
+    assert response.status_code == 200
+    rows = {row["id"]: row for row in response.json()}
+    assert rows["legacy-welcome"]["title"] == "Welcome to UGCad.io!"
+    assert "Browse open briefs" in rows["legacy-welcome"]["message"]
+    assert rows["real-announcement"]["title"] == "Campaign update"
+    assert env.run(env.db.in_app_notifications.find_one({"id": "other-user"}))["title"] == "cdsnig"
+
+
 @pytest.mark.parametrize("role", ["admin", "campaign_manager", "support_staff"])
 def test_email_signup_cannot_create_staff(env, role):
     r = env.call("POST", "/auth/signup", json={"email": f"evil-{role}@example.com", "password": "Passw0rd!x",

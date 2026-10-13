@@ -82,6 +82,50 @@ def env(monkeypatch):
 
 
 # ------------------------------------------------------------------ a dispute belongs to ONE creator
+def test_paid_revision_credits_only_the_submitting_creator_once(env):
+    work_id = f"w-{env.a[:4]}"
+    env.run(env.db.users.update_one({"id": env.brand}, {"$set": {"balance": 1000}}))
+    env.run(env.db.work_submissions.insert_one({
+        "id": "previous-rounds", "campaign_id": "mc1", "creator_id": env.a,
+        "status": "revision_requested", "revisions": [{"index": 1}, {"index": 2}],
+    }))
+    response = env.call("POST", f"/work/{work_id}/request-revision", env.brand_t,
+                        json={"feedback": "Replace the opening shot"})
+    assert response.status_code == 200, response.text
+    assert response.json()["fee_charged"] == 500
+    assert env.balance(env.brand) == 500
+    assert env.escrow("e-a")["revision_credit_owed"] == 300
+    assert env.escrow("e-b").get("revision_credit_owed", 0) == 0
+    env.run(env.db.work_submissions.update_one({"id": work_id}, {"$set": {"status": "submitted"}}))
+    response = env.call("POST", f"/work/{work_id}/approve", env.brand_t)
+    assert response.status_code == 200, response.text
+    credited = env.balance(env.a)
+    assert credited > 0
+    assert env.escrow("e-a")["revision_credit_paid"] == 300
+    assert env.balance(env.b) == 0
+    assert env.escrow("e-b")["status"] == "held"
+    response = env.call("POST", f"/work/{work_id}/approve", env.brand_t)
+    assert response.status_code == 200
+    assert env.balance(env.a) == credited
+
+
+def test_raw_approval_requires_the_edited_submission_before_payment(env):
+    env.run(env.db.campaigns.update_one({"id": "mc1"}, {"$set": {
+        "deliverable_items": [{"type": "Reel", "quantity": 1, "raw_required": True,
+                               "edited_required": True, "edited_by": "creator"}]
+    }}))
+    work_id = f"w-{env.a[:4]}"
+    env.run(env.db.work_submissions.update_one({"id": work_id}, {"$set": {"stage": "raw"}}))
+    response = env.call("POST", f"/work/{work_id}/approve", env.brand_t)
+    assert response.status_code == 200, response.text
+    assert env.balance(env.a) == 0
+    assert env.balance(env.b) == 0
+    assert env.escrow("e-a")["status"] == "held"
+    campaign = env.run(env.db.campaigns.find_one({"id": "mc1"}))
+    assert env.run(server.edit_stage(campaign, env.a, 0)) == "edited"
+    assert env.run(server.edit_stage(campaign, env.b, 0)) == "raw"
+
+
 def test_a_dispute_is_filed_against_the_creator_of_that_deal(env):
     r = env.raise_dispute(env.b)
     assert r.status_code == 200, r.text

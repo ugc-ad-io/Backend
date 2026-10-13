@@ -206,7 +206,7 @@ def map_legacy_to_new_fields(campaign_data: Dict[str, Any]) -> Dict[str, Any]:
         if not campaign_data.get('budget_min'):
             campaign_data['budget_min'] = campaign_data['per_video_budget']
         if not campaign_data.get('budget_max'):
-            campaign_data['budget_max'] = campaign_data.get('total_budget') or campaign_data['per_video_budget']
+            campaign_data['budget_max'] = campaign_data['per_video_budget']
     
     # Map budget_min/budget_max to per_video_budget if missing
     if not campaign_data.get('per_video_budget'):

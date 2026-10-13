@@ -2284,6 +2284,8 @@ def campaign_per_asset_budget(campaign: dict) -> float:
     per_video_budget / budget_max (it sends the same figure for both)."""
     if campaign.get("budget"):
         return to_float(campaign.get("budget"))
+    if campaign.get("per_video_budget"):
+        return to_float(campaign.get("per_video_budget"))
     budget_min = to_float(campaign.get("budget_min"))
     budget_max = to_float(campaign.get("budget_max"))
     if budget_min and budget_max:
@@ -10125,7 +10127,9 @@ async def edit_stage(campaign: dict, creator_id: str, deliverable_index: int = 0
         return None
     raw_ok = await db.work_submissions.find_one({
         "campaign_id": campaign['id'], "creator_id": creator_id,
-        "deliverable_index": deliverable_index, "stage": "raw", "status": WorkStatus.APPROVED,
+        **({"$or": [{"deliverable_index": 0}, {"deliverable_index": {"$exists": False}}]}
+           if deliverable_index == 0 else {"deliverable_index": deliverable_index}),
+        "stage": "raw", "status": WorkStatus.APPROVED,
     }, {"_id": 0, "id": 1})
     if not raw_ok:
         return 'raw'
@@ -10145,7 +10149,9 @@ async def approved_raw_files(campaign_id: str, creator_id: str, deliverable_inde
     """The approved raw video(s) for this deliverable — shown to the brand next to the
     edited cut so they can compare both (approved content is no longer watermark-gated)."""
     raw = await db.work_submissions.find_one({
-        "campaign_id": campaign_id, "creator_id": creator_id, "deliverable_index": deliverable_index,
+        "campaign_id": campaign_id, "creator_id": creator_id,
+        **({"$or": [{"deliverable_index": 0}, {"deliverable_index": {"$exists": False}}]}
+           if deliverable_index == 0 else {"deliverable_index": deliverable_index}),
         "stage": "raw", "status": WorkStatus.APPROVED,
     }, {"_id": 0, "raw_files": 1, "work_files": 1}, sort=[("submitted_at", -1)])
     return (raw or {}).get("raw_files") or (raw or {}).get("work_files") or []
@@ -15541,6 +15547,16 @@ async def get_my_notifications(current_user: dict = Depends(get_current_user)):
         if not n.get("source") and n.get("created_by") in admin_ids:
             n["source"] = "admin"
             n.setdefault("sender_label", "Admin")
+        # The legacy onboarding broadcast used this placeholder title. Repair
+        # only that known placeholder; real admin announcements stay intact.
+        if str(n.get("title") or "").strip().lower() == "cdsnig":
+            tip = ("Browse open briefs and complete your profile to start getting matched with brands."
+                   if current_user.get("role") == UserRole.CREATOR
+                   else "Post your first brief to start getting matched with creators.")
+            welcome = {"title": "Welcome to UGCad.io!", "message": tip, "category": "system"}
+            n.update(welcome)
+            await db.in_app_notifications.update_one(
+                {"id": n["id"], "user_id": current_user["id"]}, {"$set": welcome})
     return notifications
 
 @api_router.get("/notifications/unread-count")
