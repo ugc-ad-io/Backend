@@ -106,7 +106,7 @@ function getAssetUrl(url) {
 
 function getPrimaryAction(deal) {
   if (!deal) return { label: 'No deal selected', type: 'none', disabled: true };
-  if (isState(deal, 'Accepted - Awaiting Shipment')) return { label: 'Upload Tracking ID', type: 'tracking', disabled: false };
+  if (isState(deal, 'Accepted - Awaiting Shipment')) return { label: 'Generate Shipping Label', type: 'tracking', disabled: false };
   if (isState(deal, 'Shipped - In Transit')) return { label: 'Mark Delivered', type: 'delivered', disabled: false };
   if (isState(deal, 'Content Submitted - Awaiting Review')) return { label: 'Review Content', type: 'review', disabled: false };
   if (isState(deal, 'Paid - Complete')) return { label: 'Archive Deal', type: 'archive', disabled: false };
@@ -182,6 +182,12 @@ export default function BrandDealRoom() {
       setBusy(false);
     }
   };
+
+  const handleGenerateLabel = () =>
+    act(async () => {
+      await axios.post(`${API}/deals/${selectedDeal.deal_id}/generate-label`);
+      toast.success('Delhivery shipment created using the saved shipping details');
+    });
 
   const handleUploadTracking = () =>
     act(async () => {
@@ -415,9 +421,16 @@ export default function BrandDealRoom() {
                   <p><small>Courier Status</small><strong>{selectedDeal.shipment.courier_status || 'Not available'}</strong></p>
                   <p><small>Expected Delivery</small><strong>{formatDate(selectedDeal.shipment.expected_delivery_at)}</strong></p>
                   <p><small>Date Received</small><strong>{formatDate(selectedDeal.receipt?.received_at)}</strong></p>
+                  {selectedDeal.shipment.label_url && <p><a href={getAssetUrl(selectedDeal.shipment.label_url)} target="_blank" rel="noreferrer">Download shipping label</a></p>}
                 </div>
               ) : isState(selectedDeal, 'Accepted - Awaiting Shipment') ? (
                 <div className="deal-tracking-form">
+                  <p>Generate a Delhivery shipment using the confirmed pickup and delivery addresses and saved product details.</p>
+                  {selectedDeal.shipment.label_error && <p role="alert">{selectedDeal.shipment.label_error}</p>}
+                  <button type="button" className="deal-submit" disabled={busy} onClick={handleGenerateLabel}>
+                    <Truck size={16} /> {busy ? 'Generating...' : 'Generate Delhivery Label'}
+                  </button>
+                  <p>Already shipped with another courier? Enter its tracking details below.</p>
                   <label>Tracking ID *</label>
                   <input value={trackingId} onChange={(e) => setTrackingId(e.target.value)} placeholder="e.g. DELHIVERY-12345678" />
                   <label>Courier</label>
