@@ -2939,6 +2939,8 @@ def normalize_shipment(campaign: dict, shipment: Optional[dict]) -> dict:
         "required": bool(campaign.get('requires_shipment')),
         "tracking_id": shipment.get('tracking_id') or shipment.get('tracking_number'),
         "courier_name": shipment.get('courier_name') or shipment.get('courier'),
+        "label_url": shipment.get('label_url'),
+        "label_error": shipment.get('label_error'),
         "courier_tracking_url": shipment.get('courier_tracking_url') or shipment.get('tracking_url'),
         "courier_status": status_map.get(raw_status, raw_status),
         "expected_delivery_at": shipment.get('expected_delivery_at') or shipment.get('expected_delivery'),
@@ -12184,8 +12186,13 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
     creator = await db.users.find_one({"id": creator_id}, {"_id": 0}) or {}
     # The creator's delivery address is NOT the brand's concern — don't block the brand on it.
     # If it isn't set yet, proceed anyway; the creator/platform completes it before dispatch.
-    delivery = creator_delivery_address(creator)
-    creator_confirmed = bool((await find_shipment(campaign["id"], creator_id) or {}).get("delivery_address"))
+    existing = await find_shipment(campaign["id"], creator_id) or {}
+    delivery = existing.get("delivery_address")
+    creator_confirmed = bool(delivery)
+    if existing.get("tracking_number"):
+        return {"message": "Label already generated", "tracking_number": existing["tracking_number"],
+                "courier_name": existing.get("courier_name"), "label_url": existing.get("label_url"),
+                "status": existing.get("status")}
 
     dims = (data.dimensions.dict() if data.dimensions else {}) or {}
 
@@ -12221,6 +12228,7 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
         "tracking_number": tracking_number,
         "courier_name": courier_name,
         "label_url": label_url,
+        "label_error": None,
         "courier_status": "label_generated",
         "status": "awaiting_pickup",
         "label_generated_at": now_iso(),
@@ -12239,6 +12247,58 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
         "label_url": label_url,
         "status": "awaiting_pickup",
     }
+
+
+async def generate_saved_shipping_label(campaign: dict, creator_id: str):
+    """Manifest confirmed deal details, without exposing the recipient to the brand."""
+    sh = await find_shipment(campaign["id"], creator_id) or {}
+    if sh.get("tracking_number"):
+        return {"tracking_number": sh["tracking_number"], "label_url": sh.get("label_url"),
+                "courier_name": sh.get("courier_name")}
+    if not delhivery_token():
+        raise HTTPException(status_code=503, detail="Delhivery is not configured on the server")
+    if not sh.get("delivery_address") or not sh.get("pickup_address"):
+        raise HTTPException(status_code=400, detail="Both parties must confirm their shipping addresses first")
+    product = sh.get("product") or {}
+    if not product.get("description") or not product.get("weight"):
+        raise HTTPException(status_code=400, detail="The brand must submit the product description and weight first")
+    data = ShipLabelRequest(**product, pickup_address=sh["pickup_address"])
+    brand = await db.users.find_one({"id": campaign["business_id"]}, {"_id": 0})
+    if not brand:
+        raise HTTPException(status_code=400, detail="Brand account not found")
+    match = await shipment_match_filter(campaign["id"], creator_id)
+    claim = await db.shipments.update_one(
+        {"$and": [match, {"label_generating": {"$ne": True}},
+                  {"tracking_number": {"$in": [None, ""]}}]},
+        {"$set": {"label_generating": True}},
+    )
+    if not claim.modified_count:
+        raise HTTPException(status_code=409, detail="A shipping label is already being generated. Refresh the deal shortly.")
+    try:
+        return await create_shipping_label(person_deal_id(campaign, creator_id), data, brand)
+    finally:
+        await db.shipments.update_one(match, {"$unset": {"label_generating": ""}})
+
+
+async def auto_generate_shipping_label(campaign: dict, creator_id: str):
+    sh = await find_shipment(campaign["id"], creator_id) or {}
+    if not delhivery_token() or sh.get("tracking_number") or not all(
+        sh.get(key) for key in ("pickup_address", "delivery_address", "product")
+    ):
+        return None
+    try:
+        return await generate_saved_shipping_label(campaign, creator_id)
+    except HTTPException as exc:
+        # Keep the submitted details available for a retry after a courier rejection.
+        await db.shipments.update_one(await shipment_match_filter(campaign["id"], creator_id),
+                                      {"$set": {"label_error": str(exc.detail), "updated_at": now_iso()}})
+        return {"label_error": str(exc.detail)}
+
+
+@api_router.post("/deals/{deal_id}/generate-label")
+async def generate_deal_label(deal_id: str, current_user: dict = Depends(get_current_user)):
+    campaign, creator_id = await get_brand_deal_context(deal_id, current_user)
+    return await generate_saved_shipping_label(campaign, creator_id)
 
 
 @api_router.post("/deals/{deal_id}/request-shipment")
@@ -12270,7 +12330,8 @@ async def request_shipment(deal_id: str, data: ShipLabelRequest, current_user: d
     await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "shipment_requested",
                                "Brand submitted product & pickup details. Awaiting label from the platform.", creator_id=creator_id)
     await insert_deal_system_message(campaign, "The brand submitted shipment details. The platform team will prepare the label shortly.", creator_id=creator_id)
-    return {"message": "Shipment requested", "status": "requested"}
+    generated = await auto_generate_shipping_label(campaign, creator_id)
+    return {"message": "Shipment requested", "status": "requested", **(generated or {})}
 
 
 @api_router.post("/deals/{deal_id}/mark-picked-up")
@@ -12906,7 +12967,10 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
                 )
                 await insert_deal_system_message(campaign, "Both shipping addresses received. The platform team will dispatch the product shortly.", creator_id=target_creator_id)
 
-    return {"message": "Address saved", "address": address, "both_ready": both_ready}
+    generated = None
+    if data.campaign_id and campaign and both_ready and not in_flight:
+        generated = await auto_generate_shipping_label(campaign, target_creator_id)
+    return {"message": "Address saved", "address": address, "both_ready": both_ready, **(generated or {})}
 
 
 @api_router.get("/shipping/account-address")
@@ -17137,6 +17201,21 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
             })
     rows.sort(key=lambda r: r.get("requested_at") or "")
     return rows
+
+
+@api_router.post("/admin/shipping/{campaign_id}/generate-label")
+async def admin_generate_shipping_label(campaign_id: str, creator_id: Optional[str] = None,
+                                       current_user: dict = Depends(require_cap("manage_shipping"))):
+    if current_user["role"] not in OPS_ROLES:
+        raise HTTPException(status_code=403, detail="Only ops/admin can generate labels")
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    target_creator_id = resolve_shipment_creator_id(campaign, current_user, creator_id)
+    result = await generate_saved_shipping_label(campaign, target_creator_id)
+    await log_admin_action(current_user, "shipping.label_generated", target_type="deal", target_id=campaign_id,
+                           after={"creator_id": target_creator_id, "tracking_number": result.get("tracking_number")})
+    return result
 
 
 @api_router.post("/admin/shipping/{campaign_id}/label")
