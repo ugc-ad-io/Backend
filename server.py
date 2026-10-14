@@ -8904,6 +8904,20 @@ async def respond_chat_action_card(card_id: str, data: ChatActionCardRespond, cu
             },
         )
 
+    if (data.action == "reject" and card.get("type") == "private_invitation"
+            and current_user.get("role") == UserRole.CREATOR):
+        campaign = await get_campaign_by_deal_id(card["deal_id"]) if card.get("deal_id") else None
+        link = (f"/dashboard/business/campaign/{campaign['id']}?creator={current_user['id']}"
+                if campaign else "/messages")
+        creator_name = person_display_name(current_user, "The creator")
+        title = (campaign or {}).get("title") or (card.get("fields") or {}).get("campaign_name") or "your private brief"
+        reason = str(decline_reason or "").replace("_", " ")
+        await notify_user(
+            card["sender_id"], "Creator rejected your private brief",
+            f"{creator_name} rejected '{title}'. Reason: {reason}." + (f" {data.note}" if data.note else ""),
+            link=link, ntype="warning", email=True, category="deal_updates",
+        )
+
     # Bridge to the deal layer: accepting an offer creates/activates the deal,
     # holds escrow, and opens the deal room.
     deal = None

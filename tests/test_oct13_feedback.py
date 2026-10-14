@@ -42,6 +42,29 @@ async def test_counteroffer_without_campaign_opens_messages(isolated, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_private_brief_rejection_notifies_brand_once_with_reason(isolated, monkeypatch):
+    monkeypatch.setattr(server, 'record_match_event', AsyncMock())
+    monkeypatch.setattr(server, 'get_campaign_by_deal_id', AsyncMock(return_value={'id': 'private', 'title': 'Product brief'}))
+    await isolated.chat_action_cards.insert_one({
+        'id': 'invitation', 'type': 'private_invitation', 'status': 'open',
+        'sender_id': 'brand', 'recipient_id': 'creator', 'participants': ['brand', 'creator'],
+        'deal_id': 'deal', 'available_actions': ['reject'], 'created_at': server.now_iso(),
+    })
+    response = server.ChatActionCardRespond(action='reject', decline_reason=server.DECLINE_REASONS[0])
+    creator = {'id': 'creator', 'role': 'creator', 'nickname': 'Arushi'}
+    await server.respond_chat_action_card('invitation', response, creator)
+    args, kwargs = server.notify_user.call_args
+    assert args[0] == 'brand'
+    assert args[1] == 'Creator rejected your private brief'
+    assert 'Product brief' in args[2]
+    assert kwargs['link'] == '/dashboard/business/campaign/private?creator=creator'
+    assert kwargs['email'] is True
+    with pytest.raises(server.HTTPException):
+        await server.respond_chat_action_card('invitation', response, creator)
+    assert server.notify_user.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_profile_and_directory_expose_all_nested_portfolio_videos(isolated):
     first = {"videoUrl": "https://cdn.example.com/first.mp4", "price": 1000, "category": "Beauty"}
     second = {"videoUrl": "https://cdn.example.com/second.mp4", "delivery": 3}
