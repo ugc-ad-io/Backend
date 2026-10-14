@@ -1,4 +1,4 @@
-import { TrendingUp, FileText, Users, Briefcase, DollarSign, Download, UserPlus, BarChart, Handshake, MessagesSquare, ShieldAlert } from 'lucide-react';
+import { TrendingUp, FileText, Users, Briefcase, DollarSign, Download, UserPlus, BarChart, Handshake, MessagesSquare, ShieldAlert, Bell } from 'lucide-react';
 
 function AdminSidebar({ activeTab, onTabClick, user }) {
   const adminTabs = [
@@ -15,6 +15,7 @@ function AdminSidebar({ activeTab, onTabClick, user }) {
     { id: 'disputes', label: 'Disputes', icon: ShieldAlert, testId: 'tab-disputes', slug: 'disputes' },
     { id: 'users', label: 'Users', icon: Users, testId: 'tab-users', slug: 'users' },
     { id: 'assignments', label: 'Assignments', icon: UserPlus, testId: 'tab-assignments', slug: 'assignments' },
+    { id: 'templates', label: 'Notifications', icon: Bell, testId: 'tab-templates', slug: 'notification-templates' },
     { id: 'analytics', label: 'Analytics', icon: BarChart, testId: 'tab-analytics', slug: 'analytics' },
   ];
 

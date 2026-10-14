@@ -6,6 +6,7 @@ import axios from 'axios';
 import { toast } from 'sonner';
 import { Users, Briefcase, LogOut, CheckCircle, XCircle, TrendingUp, MessageSquare, CreditCard, DollarSign, Bell, Mail, Phone, UserPlus, BarChart, Download, FileText } from 'lucide-react';
 import AdminSidebar from '../components/AdminSidebar';
+import AdminNotificationTemplates from '../components/AdminNotificationTemplates';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
@@ -27,6 +28,7 @@ export default function AdminDashboard() {
     payments: 'payments',
     notifications: 'notifications',
     broadcast: 'broadcast',
+    'notification-templates': 'templates',
     staff: 'staff',
     analytics: 'analytics'
   };
@@ -1689,6 +1691,8 @@ export default function AdminDashboard() {
               </div>
             </div>
           )}
+
+          {activeTab === 'templates' && user?.role === 'admin' && <AdminNotificationTemplates />}
 
           {activeTab === 'broadcast' && user?.role === 'admin' && (
             <div className="broadcast-section fade-in">
