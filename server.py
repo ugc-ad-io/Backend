@@ -5070,7 +5070,7 @@ async def respond_to_booking(campaign_id: str, data: BookingRespond,
         )
         await notify_user(brand_id, "Creator proposed a new price",
                           f"{creator_name} wants ₹{proposed:,.0f} for '{title}'. Accept it or cancel the booking.",
-                          link="/dashboard/business/all-campaigns", ntype="info")
+                          link=f"/dashboard/business/campaign/{campaign_id}?creator={current_user['id']}", ntype="info", category="deal_updates")
         return {"booking_status": "price_revision", "proposed_amount": proposed, "new_total": round(proposed + fee, 2)}
 
     raise HTTPException(status_code=400, detail="action must be accept, decline or revise")
@@ -8413,6 +8413,17 @@ async def create_chat_action_card(data: ChatActionCardCreate, current_user: dict
         await record_match_event("custom_offer_sent", data.recipient_id, current_user["id"], card_id=card["id"])
     elif data.type == "counter_offer":
         await record_match_event("counter_sent", None, None, card_id=card["id"])
+        if current_user.get("role") == UserRole.CREATOR:
+            campaign = await find_countered_private_campaign(card)
+            if not campaign and data.deal_id:
+                campaign = await get_campaign_by_deal_id(data.deal_id)
+            link = (f"/dashboard/business/campaign/{campaign['id']}?creator={current_user['id']}"
+                    if campaign else "/messages")
+            await notify_user(
+                data.recipient_id, "Creator sent a counteroffer",
+                f"{current_user.get('nickname') or 'A creator'} proposed ₹{parse_money(fields.get('modified_price')):,.0f}. Open the offer to review and respond.",
+                link=link, ntype="info", category="deal_updates",
+            )
     return {"message": "Action card created", "action_card": {key: value for key, value in card.items() if key != "_id"}}
 
 # Offer cards that, when accepted, should create/activate a funded deal.

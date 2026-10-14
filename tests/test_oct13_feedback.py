@@ -15,6 +15,33 @@ def isolated(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_creator_counteroffer_notifies_brand_with_campaign_room_link(isolated, monkeypatch):
+    monkeypatch.setattr(server, 'validate_chat_access', AsyncMock())
+    monkeypatch.setattr(server, 'validate_action_card_payload', AsyncMock(return_value={'modified_price': 1500}))
+    monkeypatch.setattr(server, 'record_match_event', AsyncMock())
+    monkeypatch.setattr(server, 'find_countered_private_campaign', AsyncMock(return_value={'id': 'private-campaign'}))
+    data = server.ChatActionCardCreate(recipient_id='brand', type='counter_offer', fields={'modified_price': 1500})
+    await server.create_chat_action_card(data, {'id': 'creator', 'role': 'creator', 'nickname': 'Arushi'})
+    args, kwargs = server.notify_user.call_args
+    assert args[0] == 'brand'
+    assert args[1] == 'Creator sent a counteroffer'
+    assert '1,500' in args[2]
+    assert kwargs['link'] == '/dashboard/business/campaign/private-campaign?creator=creator'
+    assert server.notify_user.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_counteroffer_without_campaign_opens_messages(isolated, monkeypatch):
+    monkeypatch.setattr(server, 'validate_chat_access', AsyncMock())
+    monkeypatch.setattr(server, 'validate_action_card_payload', AsyncMock(return_value={'modified_price': 1500}))
+    monkeypatch.setattr(server, 'record_match_event', AsyncMock())
+    monkeypatch.setattr(server, 'find_countered_private_campaign', AsyncMock(return_value=None))
+    data = server.ChatActionCardCreate(recipient_id='brand', type='counter_offer', fields={'modified_price': 1500})
+    await server.create_chat_action_card(data, {'id': 'creator', 'role': 'creator'})
+    assert server.notify_user.call_args.kwargs['link'] == '/messages'
+
+
+@pytest.mark.asyncio
 async def test_profile_and_directory_expose_all_nested_portfolio_videos(isolated):
     first = {"videoUrl": "https://cdn.example.com/first.mp4", "price": 1000, "category": "Beauty"}
     second = {"videoUrl": "https://cdn.example.com/second.mp4", "delivery": 3}
