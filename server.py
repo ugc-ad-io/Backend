@@ -4403,6 +4403,8 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
         # Identity-verified (admin-approved KYC) — drives the "Verified" badge. Only the
         # boolean is exposed; the KYC documents themselves never leave the backend.
         "kyc_verified": bool(creator.get("kyc_verified")),
+        # Picked by the UGCad team (admin switch). Drives the brand side "Meet Creators Approved by Our UGCAD Team" collection.
+        "ugcad_approved": bool(creator.get("ugcad_approved")),
         "name": display_name,
         "nickname": creator.get("nickname") or "",
         "profile_photo": first_non_empty(creator.get("profile_photo"), creator.get("profile_picture"), profile.get("profile_photo"), profile.get("profile_picture")),
@@ -14424,6 +14426,27 @@ async def admin_message_user(data: Dict[str, Any] = Body(...), current_user: dic
             logger.error(f"[user/message] email failed: {e}")
 
     return {"message": "Message sent"}
+
+@api_router.post("/admin/user/ugcad-approved")
+async def admin_set_ugcad_approved(data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("user_management"))):
+    """Pick (or un-pick) a creator for the "Meet Creators Approved by Our UGCAD Team"
+    collection that brands see on Browse Creators. Every directory creator is already
+    profile-approved; this is the team's own hand-picked shortlist on top of that."""
+    user_id = data.get("user_id")
+    approved = bool(data.get("approved"))
+    user = await _admin_target(user_id, current_user)
+    if user.get("role") != UserRole.CREATOR:
+        raise HTTPException(status_code=400, detail="Only creators can be marked as UGCad approved")
+    now = now_iso()
+    if approved:
+        change = {"$set": {"ugcad_approved": True, "ugcad_approved_at": now, "ugcad_approved_by": current_user["id"], "updated_at": now}}
+    else:
+        change = {"$set": {"ugcad_approved": False, "updated_at": now}, "$unset": {"ugcad_approved_at": "", "ugcad_approved_by": ""}}
+    await db.users.update_one({"id": user_id}, change)
+    await log_admin_action(current_user, "user.ugcad_approved" if approved else "user.ugcad_unapproved",
+                           target_type="user", target_id=user_id,
+                           before={"ugcad_approved": bool(user.get("ugcad_approved"))}, after={"ugcad_approved": approved})
+    return {"message": "Marked as UGCad approved" if approved else "Removed from UGCad approved", "ugcad_approved": approved}
 
 @api_router.post("/admin/user/level")
 async def admin_set_level(data: Dict[str, Any] = Body(...), current_user: dict = Depends(require_cap("user_management"))):
