@@ -7210,6 +7210,9 @@ async def deliver_private_invitation(campaign: dict) -> bool:
     })
     await notify_event(invited, "private_brief_received", {"brand_name": brand_label},
                        link="/messages", ntype="info", category="deal_updates")
+    await notify_user(campaign['business_id'], "Private brief sent",
+                      f"'{campaign.get('title', 'Your private brief')}' has been sent to the creator. You'll be notified when they respond.",
+                      link=f"/dashboard/business/campaign/{campaign_id}?creator={invited}", category="deal_updates")
     return True
 
 
@@ -8540,6 +8543,9 @@ async def create_chat_action_card(data: ChatActionCardCreate, current_user: dict
                 f"{current_user.get('nickname') or 'A creator'} proposed ₹{parse_money(fields.get('modified_price')):,.0f}. Open the offer to review and respond.",
                 link=link, ntype="info", category="deal_updates",
             )
+            await notify_user(current_user['id'], "Counteroffer sent",
+                              "Your counteroffer has been sent to the brand. You'll be notified when they respond.",
+                              link="/messages", category="deal_updates")
     return {"message": "Action card created", "action_card": {key: value for key, value in card.items() if key != "_id"}}
 
 # Offer cards that, when accepted, should create/activate a funded deal.
@@ -8932,6 +8938,30 @@ async def activate_countered_private_deal(card: dict, campaign: dict) -> Optiona
     return campaign
 
 
+async def notify_private_offer_response(card: dict, action: str, current_user: dict, campaign: Optional[dict] = None):
+    if card.get('type') not in ['private_invitation', 'counter_offer'] or action not in ['accept', 'reject', 'counter']:
+        return
+    if not campaign and card.get('deal_id'):
+        campaign = await get_campaign_by_deal_id(card['deal_id'])
+    users = await db.users.find({'id': {'$in': card.get('participants', [])}}, {'_id': 0}).to_list(2)
+    creator = next((user for user in users if user.get('role') == UserRole.CREATOR), None)
+    creator_id = (creator or {}).get('id') or (current_user['id'] if current_user.get('role') == UserRole.CREATOR else card.get('sender_id'))
+    subject = 'Counteroffer' if card.get('type') == 'counter_offer' else 'Private brief'
+    verb = {'accept': 'accepted', 'reject': 'rejected', 'counter': 'counteroffer requested'}[action]
+    title = f"{subject} {verb}"
+    actor = person_display_name(current_user, 'The other party')
+    message = f"{actor}: {subject.lower()} {verb}. Open the offer to review the details."
+    for user in users:
+        # Rejection already sends the brand a detailed reason notification above.
+        if action == 'reject' and card.get('type') == 'private_invitation' and user['id'] == card.get('sender_id') and current_user.get('role') == UserRole.CREATOR:
+            continue
+        link = '/messages'
+        if campaign:
+            link = (f"/dashboard/business/campaign/{campaign['id']}?creator={creator_id}"
+                    if user.get('role') == UserRole.BUSINESS else f"/my-deals?campaign={campaign['id']}")
+        await notify_user(user['id'], title, message, link=link, category='deal_updates', ntype='warning' if action == 'reject' else 'info')
+
+
 @api_router.post("/chat/action-cards/{card_id}/respond")
 async def respond_chat_action_card(card_id: str, data: ChatActionCardRespond, current_user: dict = Depends(get_current_user)):
     card = await db.chat_action_cards.find_one({"id": card_id}, {"_id": 0})
@@ -9056,6 +9086,8 @@ async def respond_chat_action_card(card_id: str, data: ChatActionCardRespond, cu
         except Exception:
             logger.exception("Failed to activate deal from accepted card %s", card_id)
 
+    if data.action != 'accept' or deal:
+        await notify_private_offer_response(card, data.action, current_user, deal)
     updated = await db.chat_action_cards.find_one({"id": card_id}, {"_id": 0})
     result = {"message": "Action card response saved", "action_card": updated}
     if deal:

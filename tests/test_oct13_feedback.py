@@ -22,12 +22,12 @@ async def test_creator_counteroffer_notifies_brand_with_campaign_room_link(isola
     monkeypatch.setattr(server, 'find_countered_private_campaign', AsyncMock(return_value={'id': 'private-campaign'}))
     data = server.ChatActionCardCreate(recipient_id='brand', type='counter_offer', fields={'modified_price': 1500})
     await server.create_chat_action_card(data, {'id': 'creator', 'role': 'creator', 'nickname': 'Arushi'})
-    args, kwargs = server.notify_user.call_args
+    args, kwargs = server.notify_user.call_args_list[0]
     assert args[0] == 'brand'
     assert args[1] == 'Creator sent a counteroffer'
     assert '1,500' in args[2]
     assert kwargs['link'] == '/dashboard/business/campaign/private-campaign?creator=creator'
-    assert server.notify_user.call_count == 1
+    assert server.notify_user.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -38,7 +38,20 @@ async def test_counteroffer_without_campaign_opens_messages(isolated, monkeypatc
     monkeypatch.setattr(server, 'find_countered_private_campaign', AsyncMock(return_value=None))
     data = server.ChatActionCardCreate(recipient_id='brand', type='counter_offer', fields={'modified_price': 1500})
     await server.create_chat_action_card(data, {'id': 'creator', 'role': 'creator'})
-    assert server.notify_user.call_args.kwargs['link'] == '/messages'
+    assert all(call.kwargs['link'] == '/messages' for call in server.notify_user.call_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind,action', [('private_invitation', 'accept'), ('private_invitation', 'counter'), ('counter_offer', 'accept'), ('counter_offer', 'reject')])
+async def test_private_offer_response_notifies_both_parties(isolated, kind, action):
+    await isolated.users.insert_many([{'id': 'brand', 'role': 'business'}, {'id': 'creator', 'role': 'creator'}])
+    card = {'type': kind, 'participants': ['brand', 'creator'], 'sender_id': 'creator' if kind == 'counter_offer' else 'brand'}
+    actor = {'id': 'brand', 'role': 'business'} if kind == 'counter_offer' else {'id': 'creator', 'role': 'creator'}
+    await server.notify_private_offer_response(card, action, actor, {'id': 'private'})
+    calls = server.notify_user.call_args_list
+    assert {call.args[0] for call in calls} == {'brand', 'creator'}
+    assert next(call.kwargs['link'] for call in calls if call.args[0] == 'brand') == '/dashboard/business/campaign/private?creator=creator'
+    assert next(call.kwargs['link'] for call in calls if call.args[0] == 'creator') == '/my-deals?campaign=private'
 
 
 @pytest.mark.asyncio
@@ -51,10 +64,11 @@ async def test_private_brief_rejection_notifies_brand_once_with_reason(isolated,
         'deal_id': 'deal', 'available_actions': ['reject'], 'created_at': server.now_iso(),
     })
     await isolated.campaigns.insert_one({'id': 'private', 'status': 'active', 'business_id': 'brand'})
+    await isolated.users.insert_many([{'id': 'brand', 'role': 'business'}, {'id': 'creator', 'role': 'creator'}])
     response = server.ChatActionCardRespond(action='reject', decline_reason=server.DECLINE_REASONS[0])
     creator = {'id': 'creator', 'role': 'creator', 'nickname': 'Arushi'}
     await server.respond_chat_action_card('invitation', response, creator)
-    args, kwargs = server.notify_user.call_args
+    args, kwargs = server.notify_user.call_args_list[0]
     assert args[0] == 'brand'
     assert args[1] == 'Creator rejected your private brief'
     assert 'Product brief' in args[2]
@@ -65,7 +79,8 @@ async def test_private_brief_rejection_notifies_brand_once_with_reason(isolated,
     assert campaign['booking_status'] == 'declined'
     with pytest.raises(server.HTTPException):
         await server.respond_chat_action_card('invitation', response, creator)
-    assert server.notify_user.call_count == 1
+    assert {call.args[0] for call in server.notify_user.call_args_list} == {'brand', 'creator'}
+    assert server.notify_user.call_count == 2
 
 
 @pytest.mark.asyncio
