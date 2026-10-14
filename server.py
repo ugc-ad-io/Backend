@@ -8907,6 +8907,16 @@ async def respond_chat_action_card(card_id: str, data: ChatActionCardRespond, cu
     if (data.action == "reject" and card.get("type") == "private_invitation"
             and current_user.get("role") == UserRole.CREATOR):
         campaign = await get_campaign_by_deal_id(card["deal_id"]) if card.get("deal_id") else None
+        if campaign:
+            await db.campaigns.update_one({"id": campaign["id"]}, {"$set": {
+                "status": CampaignStatus.REJECTED.value,
+                "booking_status": "declined",
+                "declined_by": current_user["id"],
+                "decline_reason": decline_reason,
+                "declined_at": response["responded_at"],
+                "updated_at": response["responded_at"],
+            }})
+            await refund_campaign_reservation(campaign["id"], reason="creator_declined_private_brief")
         link = (f"/dashboard/business/campaign/{campaign['id']}?creator={current_user['id']}"
                 if campaign else "/messages")
         creator_name = person_display_name(current_user, "The creator")
@@ -12771,6 +12781,9 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
     campaign = await db.campaigns.find_one({"id": data.campaign_id})
     if not campaign or campaign['business_id'] != _brand_ws_id(current_user):
         raise HTTPException(status_code=403, detail="Not authorized")
+
+    if campaign.get('status') in ['rejected', 'cancelled', 'banned'] or campaign.get('booking_status') == 'declined':
+        raise HTTPException(status_code=409, detail="Shipping is unavailable for a rejected or closed brief")
 
     creator_id = resolve_shipment_creator_id(campaign, current_user, data.creator_id)
     shipment_doc = {

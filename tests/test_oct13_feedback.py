@@ -50,6 +50,7 @@ async def test_private_brief_rejection_notifies_brand_once_with_reason(isolated,
         'sender_id': 'brand', 'recipient_id': 'creator', 'participants': ['brand', 'creator'],
         'deal_id': 'deal', 'available_actions': ['reject'], 'created_at': server.now_iso(),
     })
+    await isolated.campaigns.insert_one({'id': 'private', 'status': 'active', 'business_id': 'brand'})
     response = server.ChatActionCardRespond(action='reject', decline_reason=server.DECLINE_REASONS[0])
     creator = {'id': 'creator', 'role': 'creator', 'nickname': 'Arushi'}
     await server.respond_chat_action_card('invitation', response, creator)
@@ -59,6 +60,9 @@ async def test_private_brief_rejection_notifies_brand_once_with_reason(isolated,
     assert 'Product brief' in args[2]
     assert kwargs['link'] == '/dashboard/business/campaign/private?creator=creator'
     assert kwargs['email'] is True
+    campaign = await isolated.campaigns.find_one({'id': 'private'})
+    assert campaign['status'] == 'rejected'
+    assert campaign['booking_status'] == 'declined'
     with pytest.raises(server.HTTPException):
         await server.respond_chat_action_card('invitation', response, creator)
     assert server.notify_user.call_count == 1
