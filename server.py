@@ -4135,7 +4135,6 @@ async def forgot_password(data: ForgotPasswordRequest):
         {"id": user["id"]},
         {"$set": {"reset_code": _reset_code_hash(code), "reset_code_expires": expires}},
     )
-    logger.info(f"[forgot-password] reset code for {email}: {code}")
     try:
         from urllib.parse import quote
         html = _email_base_template("Password reset", f"""
@@ -5808,7 +5807,6 @@ async def invite_business_settings_team_member(
         )
     except Exception as e:
         logger.error(f"[team/invite] email failed: {e}")
-    logger.info(f"[team/invite] {email} invited to workspace {owner_id}: {link}")
 
     return await _team_payload(owner_id)
 
