@@ -12004,7 +12004,7 @@ async def notify_confirm_delivery_address(campaign: dict, creator_id: Optional[s
             link=link, ntype="warning", email=True, category="delivery_address",
         )
     brand_id = campaign.get('business_id')
-    brand_link = f"/my-deals?deal={person_deal_id(campaign, creator_id)}"
+    brand_link = f"/dashboard/business/campaign/{campaign['id']}?creator={creator_id}"
     if brand_id and not await db.in_app_notifications.find_one(
             {"user_id": brand_id, "link": brand_link, "category": "delivery_address"}):
         await notify_user(

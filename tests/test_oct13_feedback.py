@@ -52,7 +52,7 @@ async def test_address_notifications_reach_both_parties_and_open_the_exact_deal(
     assert len(calls) == 2
     assert {uid for uid, _ in calls} == {"brand", "creator-a"}
     brand = next(kwargs for uid, kwargs in calls if uid == "brand")
-    assert brand["link"] == f"/my-deals?deal={server.person_deal_id(campaign, 'creator-a')}"
+    assert brand["link"] == "/dashboard/business/campaign/campaign?creator=creator-a"
     assert all(kwargs["email"] for _, kwargs in calls)
     await server.notify_confirm_delivery_address({**campaign, "requires_shipment": False}, "creator-b")
     assert len(calls) == 2
