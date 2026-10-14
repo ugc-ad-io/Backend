@@ -148,7 +148,11 @@ async def test_one_combined_bid_covers_raw_and_edited_for_each_video(isolated):
         "business_id": "brand", "budget_max": 1000, "editing_fee_per_video": 500,
         "deliverable_items": [{"quantity": 2, "raw_required": True, "edited_required": True, "edited_by": "creator"}]})
     await server.submit_bid("combined", server.BidCreate(campaign_id="combined", amount=1500, proposal="I will deliver both files", estimated_delivery_days=3),
-        {"id": "creator", "nickname": "Creator", "role": "creator", "approval_status": "approved", "kyc": {"status": "verified"}})
+        {"id": "creator", "nickname": "Creator", "role": "creator", "approval_status": "approved", "kyc": {"status": "verified"},
+         # a creator must have a complete profile before bidding (creator_profile_missing)
+         "profile_photo": "/uploads/me.jpg", "intro_video": "/uploads/intro.mp4",
+         "profile": {"age": 24, "gender": "female", "bodyType": "slim", "skinTone": "medium",
+                     "city": "Indore", "state": "MP", "pincode": "452010", "languages": ["Hindi"]}})
     campaign = await isolated.campaigns.find_one({"id": "combined"})
     bid = campaign["bids"][0]
     assert bid["amount"] == 3000

@@ -7798,6 +7798,56 @@ async def get_campaign(campaign_id: str, current_user: dict = Depends(get_curren
 
     return campaign
 
+# What a creator must have filled in before they can bid. Mirrors the website's
+# getProfileChecklist() mandatory items (src/utils/creatorProfileCompletion.js) — keep the
+# two in step. `profile_completed` is NOT this: onboarding sets it, and it says nothing
+# about the photo / location / languages / intro video brands look at.
+def _filled(*values) -> bool:
+    return any(v not in (None, "", [], {}) for v in values)
+
+
+def creator_profile_missing(user: dict) -> List[str]:
+    """Human labels of the mandatory profile items this creator hasn't filled in yet."""
+    user = user or {}
+    p = user.get("profile") or {}
+    missing = []
+    if not _filled(user.get("profile_picture"), user.get("profile_photo"), user.get("avatar"),
+                   p.get("profile_picture"), p.get("profile_photo")):
+        missing.append("a profile picture")
+    if not all(_filled(p.get(k)) for k in ("age", "gender", "bodyType", "skinTone")):
+        missing.append("your age, gender, body type and skin tone")
+    if not all(_filled(p.get(k)) for k in ("city", "state", "pincode")):
+        missing.append("your city, state and pincode")
+    if not (isinstance(p.get("languages"), list) and p["languages"]):
+        missing.append("the languages you create in")
+    # Onboarding saves the first portfolio video as the intro, so any portfolio item counts.
+    if not _filled(user.get("intro_video"), p.get("intro_video"), user.get("portfolio"), p.get("portfolio_items")):
+        missing.append("an intro video")
+    return missing
+
+
+def profile_incomplete_message(missing: List[str]) -> str:
+    return "Complete your profile before bidding. Still to add: " + ", ".join(missing) + "."
+
+
+@api_router.get("/creator/bid-readiness")
+async def get_bid_readiness(current_user: dict = Depends(get_current_user)):
+    """Can this creator bid right now, and what does UGC.ad keep from a bid?
+
+    One call for the bid forms: `missing` drives the "complete your profile" pop-up,
+    `commission_percent` is the live platform fee shown before they bid."""
+    if current_user["role"] != UserRole.CREATOR:
+        raise HTTPException(status_code=403, detail="Only creators can bid")
+    missing = creator_profile_missing(current_user)
+    return {
+        "can_bid": not missing,
+        "missing": missing,
+        "message": profile_incomplete_message(missing) if missing else "",
+        # Deducted from the creator's payout when the work is approved (see creator_commission).
+        "commission_percent": commission_percent(),
+    }
+
+
 @api_router.post("/campaigns/{campaign_id}/bid")
 async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
@@ -7805,6 +7855,13 @@ async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Dep
     
     if current_user.get('approval_status') != ApprovalStatus.APPROVED:
         raise HTTPException(status_code=403, detail="Your profile must be approved first")
+
+    # A half-filled profile can't bid: brands decide on the photo, location, languages and
+    # intro video, so a bid without them wastes the brand's time. Enforced here, not just
+    # in the UI, so the app and direct API calls can't skip it.
+    missing = creator_profile_missing(current_user)
+    if missing:
+        raise HTTPException(status_code=403, detail=profile_incomplete_message(missing))
 
     if kyc_status_of(current_user) != "verified":
         raise HTTPException(status_code=403, detail="Complete KYC verification before bidding on campaigns")
