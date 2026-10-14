@@ -50,6 +50,7 @@ from campaign_helpers import (
     creator_editing_fee,
 )
 import admin_caps
+from portfolio_helpers import creator_portfolio
 from review_helpers import received_review_query, review_summary
 
 ROOT_DIR = Path(__file__).parent
@@ -788,7 +789,7 @@ def create_delegated_brand_token(brand: dict, admin: dict) -> str:
 def _send_email_sync(to, subject: str, html: str, text: Optional[str] = None) -> dict:
     api_key = os.environ.get('RESEND_API_KEY', '')
     if not api_key:
-        logger.warning(f"[email] RESEND_API_KEY not set — skipping send to {to} (\"{subject}\")")
+        logger.warning(f"[email] RESEND_API_KEY not set - skipping send to {to} (\"{subject}\")")
         return {"skipped": True}
     from_addr = os.environ.get('EMAIL_FROM', 'UGCad.io <onboarding@resend.dev>')
     reply_to = os.environ.get('EMAIL_REPLY_TO') or None
@@ -900,7 +901,7 @@ _NON_NAME_LOCALPARTS = {
 
 
 def _is_placeholder_nickname(handle: str) -> bool:
-    """True if `handle` looks like generate_nickname() output — a name drawn at
+    """True if `handle` looks like generate_nickname() output - a name drawn at
     random from PLACEHOLDER_FIRST_NAMES plus a 2-digit suffix. Such a nickname is
     assigned by the server, not chosen by the user, so it must not be used to
     address them by name in email."""
@@ -993,7 +994,7 @@ _VALIDATE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KH
 
 def _host_is_public(host: str) -> bool:
     """Resolve host and reject private/loopback ranges (SSRF guard). Returns False
-    if DNS doesn't resolve — which is exactly how we detect a fake domain."""
+    if DNS doesn't resolve - which is exactly how we detect a fake domain."""
     import ipaddress
     import socket
     try:
@@ -1149,7 +1150,7 @@ _GST_STATE_CODES = {f"{i:02d}" for i in range(1, 39)} | {"97"}
 
 
 def gstin_checksum_ok(gstin: str) -> bool:
-    """Verify the 15th character — GSTIN's built-in mod-36 check digit.
+    """Verify the 15th character - GSTIN's built-in mod-36 check digit.
 
     This is real validation, not a regex: a mistyped or invented number fails here,
     so we catch bad GSTINs offline without paying for a lookup API.
@@ -1170,13 +1171,13 @@ def validate_gstin(raw: str) -> tuple[bool, str]:
     if not gstin:
         return False, "Enter your GSTIN."
     if len(gstin) != 15:
-        return False, f"A GSTIN is 15 characters — you entered {len(gstin)}."
+        return False, f"A GSTIN is 15 characters - you entered {len(gstin)}."
     if not GSTIN_RE.match(gstin):
         return False, "That doesn't look like a valid GSTIN (format: 22AAAAA0000A1Z5)."
     if gstin[:2] not in _GST_STATE_CODES:
         return False, f"'{gstin[:2]}' is not a valid GST state code."
     if not gstin_checksum_ok(gstin):
-        return False, "GSTIN check digit failed — please re-check the number."
+        return False, "GSTIN check digit failed - please re-check the number."
     return True, ""
 
 
@@ -1192,7 +1193,7 @@ def kyc_status_of(user: dict) -> str:
 
 
 def person_display_name(user: Optional[dict], fallback: str = "Someone") -> str:
-    """Single source of truth for a person's shown NAME — never the "@handle".
+    """Single source of truth for a person's shown NAME - never the "@handle".
     Mirrors the frontend displayName() util: prefer the real name / business name,
     strip any leading "@", and only fall back to the nickname handle when no real
     name exists. Used anywhere the backend bakes a name into text (notifications,
@@ -1222,7 +1223,7 @@ def first_name_of(user: dict, fallback: str = "there") -> str:
       chose, 4. the email local-part but only when it clearly splits into a name.
     Anything less certain returns `fallback` and callers drop the name from the
     copy. A server-assigned placeholder nickname (generate_nickname(), e.g.
-    'Zoya13') is never used — it is random, so greeting by it addresses the person
+    'Zoya13') is never used - it is random, so greeting by it addresses the person
     as someone else. Mirrors the frontend firstName() util so greetings read
     'Hi Meet!' not 'Hi Meet Jain!'.
     Pass fallback="" wherever the greeting is optional."""
@@ -1460,7 +1461,7 @@ FILTER_RULES_TTL_SECONDS = 30.0
 
 def _compile_filter_rule(rule: dict):
     """Turn a stored rule into a compiled matcher. A pattern that won't compile is
-    dropped rather than raised — one bad rule must never take chat down."""
+    dropped rather than raised - one bad rule must never take chat down."""
     try:
         if rule.get("type") == "regex":
             return {"id": rule.get("id"), "label": rule.get("label") or rule.get("id"),
@@ -1495,7 +1496,7 @@ async def refresh_filter_rules(force: bool = False):
 
 async def seed_filter_rules():
     """Persist the built-in defaults once, so they're editable rows like any other
-    (they used to be merged into the API response but never stored — which is why
+    (they used to be merged into the API response but never stored - which is why
     switching one off or deleting it 404'd: there was no row to act on)."""
     try:
         for rule in DEFAULT_FILTER_RULES:
@@ -1577,7 +1578,7 @@ def check_contact_info_policy(message: str, allowed_domains: Optional[List[str]]
 
 async def notify_admins(title: str, message: str, link: Optional[str] = None):
     """Alert the ops team. Fans out to a per-admin in-app notification (keyed on
-    user_id) so it actually shows in each admin's bell — the notification list
+    user_id) so it actually shows in each admin's bell - the notification list
     queries by user_id, so a single target_roles doc was invisible."""
     now = now_iso()
     # Keep the audit copy.
@@ -1620,7 +1621,7 @@ def _notification_email_html(title: str, message: str, link: Optional[str], name
         f'<p style="font-size:15px;line-height:1.6">{message}</p>'
         f'{cta}'
         '<hr style="border:none;border-top:1px solid #eee;margin:24px 0">'
-        '<p style="font-size:12px;color:#888">UGCad.io — where brands meet real creators.</p>'
+        '<p style="font-size:12px;color:#888">UGCad.io - where brands meet real creators.</p>'
         '</div>'
     )
 
@@ -1665,7 +1666,7 @@ async def _email_category_allowed(user: dict, category: Optional[str]) -> bool:
 
 async def notify_user(user_id: str, title: str, message: str, link: Optional[str] = None, ntype: str = "info", email: bool = False, critical: bool = False, category: Optional[str] = None):
     """Send an in-app notification to a single user. Set email=True to ALSO send an
-    email (best-effort — a mail failure never breaks the in-app notification/action).
+    email (best-effort - a mail failure never breaks the in-app notification/action).
     Set critical=True for SLA/security emails that must bypass quiet hours + prefs.
     Set category to honor the recipient's per-category email preference."""
     await db.in_app_notifications.insert_one({
@@ -1698,7 +1699,7 @@ async def notify_user(user_id: str, title: str, message: str, link: Optional[str
                 if isinstance(res, dict) and (res.get("skipped") or res.get("error")):
                     logger.error(f"[email] NOT delivered to {addr} ('{title}'): {res}")
             else:
-                logger.warning(f"[email] user {user_id} has no email on file — '{title}' not sent")
+                logger.warning(f"[email] user {user_id} has no email on file - '{title}' not sent")
         except Exception as e:
             logger.exception(f"[email] failed sending '{title}' to user {user_id}: {e}")
 
@@ -1916,9 +1917,9 @@ async def log_chat_violation(current_user: dict, recipient_id: Optional[str], or
     # either brand or creator. Save it as a warning notification too.
     strike_titles = {
         "warning": "Policy warning issued",
-        "paused": "Chat paused — policy strike",
-        "action_cards_only": "Action Cards only — policy strike",
-        "suspended": "Account suspended — policy strike",
+        "paused": "Chat paused - policy strike",
+        "action_cards_only": "Action Cards only - policy strike",
+        "suspended": "Account suspended - policy strike",
     }
     await notify_user(
         current_user["id"],
@@ -1984,17 +1985,17 @@ async def validate_message_attachments(attachment_urls: List[str]):
 def strip_private_fields(user_doc: dict, requester_role: Optional[str]) -> dict:
     """Remove fields that should not leak to other roles.
 
-    Username is a creator's private internal handle — only visible to the creator
+    Username is a creator's private internal handle - only visible to the creator
     themselves and admin/staff. Brands continue to see the auto-generated nickname.
 
     Email is stripped for EVERY non-admin viewer, not just brands. Restricting
     it to brands left the address readable by any signed-in creator hitting
-    /api/profile/{id} with someone else's id — which defeats the social-link
+    /api/profile/{id} with someone else's id - which defeats the social-link
     hiding a few lines up: there is no point withholding an Instagram handle
     from someone who can read the account's email address instead.
 
     KYC identity + payout details (PAN, Aadhaar, address, document URLs, bank
-    account, UPI) are NEVER exposed to another user — only the `kyc_verified`
+    account, UPI) are NEVER exposed to another user - only the `kyc_verified`
     boolean survives, so a viewer can see the "Verified" badge without the PII.
 
     The only caller already excludes the user viewing their own profile, so
@@ -2372,7 +2373,7 @@ def campaign_listing_fee(campaign: dict) -> float:
       11+ creators                 -> listing_fee_large_campaign     (₹3,000)
 
     "Deliverables" is the TOTAL number of assets requested (the sum of every
-    deliverable row's quantity — the same count escrow and delivery use), so a
+    deliverable row's quantity - the same count escrow and delivery use), so a
     brief asking one creator for 3 Reels is a 3-deliverable brief, not a 1.
     """
     creators = campaign_creators_wanted(campaign)
@@ -2389,7 +2390,7 @@ def campaign_listing_fee(campaign: dict) -> float:
 async def charge_listing_fee(user: dict, campaign_doc: dict) -> float:
     """Charge the brand the platform listing fee on publish.
 
-    The fee is tiered by brief size — see campaign_listing_fee(). It is charged
+    The fee is tiered by brief size - see campaign_listing_fee(). It is charged
     ONCE per published brief and never multiplied by the creator count.
     """
     fee = campaign_listing_fee(campaign_doc)
@@ -2440,7 +2441,7 @@ def campaign_category(campaign: dict) -> str:
     )
 
 def selected_bid_amount(campaign: dict) -> float:
-    """Total of the accepted bids — every hired creator, not just the first pick."""
+    """Total of the accepted bids - every hired creator, not just the first pick."""
     hired = set(selected_creator_ids(campaign))
     return sum(to_float(bid.get("amount")) for bid in campaign.get("bids", []) if bid.get("creator_id") in hired)
 
@@ -2580,7 +2581,7 @@ async def issue_wallet_receipt(transaction: dict, reference: str, amount: float,
     """Save a payment receipt and email it to the brand.
 
     A wallet recharge is PREPAID CREDIT, not a taxable supply, so this is a payment
-    receipt — NOT a GST tax invoice. (GST would apply to the platform commission on a
+    receipt - NOT a GST tax invoice. (GST would apply to the platform commission on a
     completed deal, which is invoiced separately.)
     """
     user = await db.users.find_one({"id": transaction.get("user_id")}, {"_id": 0}) or {}
@@ -2625,7 +2626,7 @@ async def issue_wallet_receipt(transaction: dict, reference: str, amount: float,
       <h1 style="margin:0 0 6px;font-size:22px;color:#1f2340;">Payment receipt</h1>
       <p style="margin:0 0 18px;font-size:14px;color:#8a90a6;">{receipt_no} &nbsp;·&nbsp; {now[:10]}</p>
       <p style="margin:0 0 18px;font-size:15px;color:#4a4f74;">
-        Thanks{(' ' + receipt['business_name']) if receipt['business_name'] else ''} — your payment was successful
+        Thanks{(' ' + receipt['business_name']) if receipt['business_name'] else ''} - your payment was successful
         and your wallet has been credited.
       </p>
       <table width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;border-top:1px solid #eceef5;">
@@ -2637,7 +2638,7 @@ async def issue_wallet_receipt(transaction: dict, reference: str, amount: float,
       </table>
       <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:18px;font-size:13px;color:#8a90a6;">
         <tr><td style="padding:4px 0;">Payment method</td><td align="right">Razorpay</td></tr>
-        <tr><td style="padding:4px 0;">Payment ID</td><td align="right">{reference or '—'}</td></tr>
+        <tr><td style="padding:4px 0;">Payment ID</td><td align="right">{reference or '-'}</td></tr>
         <tr><td style="padding:4px 0;">Status</td><td align="right" style="color:#16a34a;font-weight:600;">Paid</td></tr>
       </table>
       <p style="margin:20px 0 0;font-size:12px;color:#9aa0b4;">
@@ -2645,7 +2646,7 @@ async def issue_wallet_receipt(transaction: dict, reference: str, amount: float,
         Wallet credits are non-refundable.
       </p>"""
 
-    await send_email(to_email, f"Your UGCad.io payment receipt — {receipt_no}",
+    await send_email(to_email, f"Your UGCad.io payment receipt - {receipt_no}",
                      _email_base_template("Payment receipt", content))
     await notify_user(transaction.get("user_id"), "Wallet credited",
                       f"{inr(credited_amount)} added to your wallet. Receipt {receipt_no} emailed to you.",
@@ -2811,7 +2812,7 @@ def person_deal_id(campaign: dict, creator_id: Optional[str]) -> str:
     return f"{base}{DEAL_CREATOR_SEP}{creator_id}"
 
 def split_deal_id(deal_id: str) -> tuple:
-    """(base_deal_id, creator_override|None) — pull the per-creator suffix off a deal id."""
+    """(base_deal_id, creator_override|None) - pull the per-creator suffix off a deal id."""
     if deal_id and DEAL_CREATOR_SEP in str(deal_id):
         base, _, creator = str(deal_id).partition(DEAL_CREATOR_SEP)
         return base, (creator or None)
@@ -2852,7 +2853,7 @@ async def find_campaign_by_any_id(any_id: str) -> Optional[dict]:
     """Look a campaign up by its real id, or by the DEAL-#### id the UI displays.
 
     make_deal_id() DERIVES "DEAL-4466" from the campaign's uuid and stores it
-    nowhere — so a `{"deal_id": ...}` query can never match, and callers that pass
+    nowhere - so a `{"deal_id": ...}` query can never match, and callers that pass
     the id shown on screen (the Deal Room does) got a 404. Recompute the derived id
     over the candidate campaigns instead of trusting a field that doesn't exist.
     """
@@ -2973,7 +2974,7 @@ def normalize_receipt(shipment: Optional[dict], receipt: Optional[dict]) -> dict
 def normalize_escrow(escrow: Optional[dict], my_bid: Optional[dict], state: Optional[str] = None) -> dict:
     escrow = escrow or {}
     amount = float(escrow.get('amount') or escrow.get('held_amount') or (my_bid or {}).get('amount') or 0)
-    status_value = escrow.get('status') or ("released" if state == "Paid — Complete" else "held")
+    status_value = escrow.get('status') or ("released" if state == "Paid - Complete" else "held")
     status_map = {
         "held": "held",
         "released": "released",
@@ -3039,7 +3040,7 @@ async def deal_revision_history(campaign_id: str, creator_id: Optional[str] = No
 
     Revisions must be counted PER DEAL. Each resubmission inserts a *new*
     work_submissions doc whose `revisions` list starts empty, so counting off the
-    latest doc alone reset the tally to 0 every round — the 2-free-then-₹500 rule
+    latest doc alone reset the tally to 0 every round - the 2-free-then-₹500 rule
     never fired and the brand could revise forever for free.
     """
     query = {"campaign_id": campaign_id}
@@ -3108,38 +3109,38 @@ def compute_deal_state(campaign: dict, shipment: Optional[dict], receipt: dict, 
         state, party, action = "Disputed", "admin", "Await admin resolution"
         started = now_iso()
     elif work_status == WorkStatus.AWAITING_EDIT:
-        state, party, action = "Raw Approved — UGC.ad Editing", "admin", "UGC.ad is editing the video"
+        state, party, action = "Raw Approved - UGC.ad Editing", "admin", "UGC.ad is editing the video"
         started = (work or {}).get('submitted_at')
     elif work_status == WorkStatus.APPROVED and (work or {}).get('stage') == 'raw' and edit_mode(campaign) == 'creator':
-        state, party, action = "Raw Approved — Edited Video Due", "creator", "Submit edited video"
+        state, party, action = "Raw Approved - Edited Video Due", "creator", "Submit edited video"
         started = (work or {}).get('approved_at')
     elif escrow_status == "released" and (work_status == WorkStatus.APPROVED or (single_creator and campaign.get('status') == CampaignStatus.COMPLETED)):
-        state, party, action = "Paid — Complete", "system", "Deal complete"
+        state, party, action = "Paid - Complete", "system", "Deal complete"
         started = (escrow or {}).get('released_at') or (work or {}).get('approved_at')
     elif work_status == WorkStatus.APPROVED or (single_creator and campaign.get('status') == CampaignStatus.COMPLETED):
-        state, party, action = "Approved — Payment Processing", "system", "Process payout"
+        state, party, action = "Approved - Payment Processing", "system", "Process payout"
         started = (work or {}).get('approved_at') or campaign.get('updated_at')
     elif work_status == WorkStatus.REVISION_REQUESTED:
         state, party, action = "Revision Requested", "creator", "Submit revised content"
         revisions = (work or {}).get('revisions') or []
         started = (revisions[-1] if revisions else {}).get('requested_at') or (work or {}).get('submitted_at')
     elif work_status == WorkStatus.SUBMITTED or (single_creator and campaign.get('status') == "work_submitted"):
-        state, party, action = "Content Submitted — Awaiting Review", "brand", "Review submitted content"
+        state, party, action = "Content Submitted - Awaiting Review", "brand", "Review submitted content"
         started = (work or {}).get('submitted_at')
     elif receipt.get('received_at') or shipment_status == "received":
-        state, party, action = "Received — Content in Progress", "creator", "Submit content"
+        state, party, action = "Received - Content in Progress", "creator", "Submit content"
         started = receipt.get('received_at') or (shipment or {}).get('received_at')
     elif shipment_status == "delivered":
-        state, party, action = "Delivered — Awaiting Receipt Confirmation", "creator", "Confirm receipt"
+        state, party, action = "Delivered - Awaiting Receipt Confirmation", "creator", "Confirm receipt"
         started = (shipment or {}).get('delivered_at') or (shipment or {}).get('updated_at')
     elif shipment_status in ["shipped", "in_transit"]:
-        state, party, action = "Shipped — In Transit", "creator", "Track shipment"
+        state, party, action = "Shipped - In Transit", "creator", "Track shipment"
         started = (shipment or {}).get('updated_at')
     elif campaign.get('requires_shipment'):
-        state, party, action = "Accepted — Awaiting Shipment", "brand", "Upload shipment tracking"
+        state, party, action = "Accepted - Awaiting Shipment", "brand", "Upload shipment tracking"
         started = campaign.get('work_started_at') or campaign.get('created_at')
     else:
-        state, party, action = "Received — Content in Progress", "creator", "Submit content"
+        state, party, action = "Received - Content in Progress", "creator", "Submit content"
         started = campaign.get('work_started_at') or campaign.get('created_at')
 
     next_deadline = (
@@ -3362,7 +3363,7 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
     # previews (PRD Section 8). Creators and admins always see their own assets.
     work_approved = (context['work'] or {}).get('status') == WorkStatus.APPROVED or campaign.get('status') == CampaignStatus.COMPLETED
     # Creator-edits flow: an approved RAW isn't paid for yet — keep it watermarked.
-    if state['current_state'] == "Raw Approved — Edited Video Due":
+    if state['current_state'] == "Raw Approved - Edited Video Due":
         work_approved = False
     if viewer.get('id') == brand.get('id') and viewer.get('role') == UserRole.BUSINESS:
         content_submission["versions"] = [
@@ -3481,9 +3482,9 @@ async def build_deal_response(context: dict, viewer: dict) -> dict:
     )
     can_mark_received = viewer.get('role') == UserRole.CREATOR and _has_shipment_record and normalized_shipment.get('courier_status') in ['delivered', 'shipped', 'in_transit'] and not normalized_receipt.get('received_at')
     can_submit_content = viewer.get('role') == UserRole.CREATOR and creator['id'] == viewer['id'] and state['active_party'] == 'creator' and state['current_state'] in [
-        "Received — Content in Progress",
+        "Received - Content in Progress",
         "Revision Requested",
-        "Raw Approved — Edited Video Due",
+        "Raw Approved - Edited Video Due",
     ]
     # Raw → edited flow: which file the creator uploads next and when each is due.
     mode = edit_mode(campaign)
@@ -3712,7 +3713,7 @@ def _verify_google_id_token(credential: str) -> Optional[dict]:
 async def google_auth(data: GoogleAuthRequest, totp_token: Optional[str] = None):
     """Sign in / sign up with Google. The client sends the ID token (credential)
     from Google Identity Services; we verify it, find-or-create the user, then
-    issue our own JWT — same response shape as /auth/login."""
+    issue our own JWT - same response shape as /auth/login."""
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=500, detail="Google sign-in is not configured on the server")
 
@@ -3868,7 +3869,7 @@ async def apple_auth(data: AppleAuthRequest, totp_token: Optional[str] = None):
       * The email is only in the token the FIRST time, and may be a private
         relay address (@privaterelay.appleid.com). We therefore key on `sub`
         (stable and always present) and treat email as a bonus.
-      * The name never appears in the token at all — Apple hands it to the
+      * The name never appears in the token at all - Apple hands it to the
         client once, at first authorization, so it arrives in `full_name`.
     """
     try:
@@ -4073,10 +4074,8 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         me.update(await review_summary(db, me))
     # Back-compat: older creators had their signup portfolio stored only under
     # `profile.portfolio`; surface it at the top level the Portfolio page reads.
-    if not me.get("portfolio"):
-        nested = (me.get("profile") or {}).get("portfolio")
-        if nested:
-            me["portfolio"] = nested
+    if me.get("role") == UserRole.CREATOR:
+        me["portfolio"] = creator_portfolio(me)
     # True once the user has accepted the CURRENT agreement version — both the web
     # and the app read this to decide whether to show the one-time consent gate, so
     # accepting on one surface satisfies the other.
@@ -4290,6 +4289,7 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
         "deliverables_completed": deliverables_completed,
         "portfolio_preview": portfolio_preview or "",
         "portfolio_video": portfolio_video or "",
+        "portfolio": creator_portfolio(creator),
         "content_style": first_non_empty(creator.get("content_style"), profile.get("content_style")) or "",
         "budget_range": first_non_empty(
             creator.get("budget_range"),
@@ -4768,7 +4768,7 @@ def creator_plan_price(creator: dict) -> float:
     Prefers the flat rate_card (set by the app onboarding + Settings). Falls back to
     the cheapest published portfolio-card price, because the WEB onboarding form
     (CreatorProfileSetup.js) only stores per-card prices under portfolio[].price and
-    never writes rate_card — without this fallback those creators read as ₹0 and
+    never writes rate_card - without this fallback those creators read as ₹0 and
     can't be direct-booked at all.
     """
     profile = creator.get("profile") or {}
@@ -4935,13 +4935,13 @@ async def checkout_brief(data: CheckoutBriefCreate,
 
     await insert_deal_system_message(
         campaign_doc,
-        f"📩 Booking request from {brand_name} — {q['video_count']} video(s) for ₹{q['subtotal']:,.0f}. "
+        f"📩 Booking request from {brand_name} - {q['video_count']} video(s) for ₹{q['subtotal']:,.0f}. "
         f"Payment is held in escrow. Accept, decline, or propose a different price.", creator_id=data.creator_id
     )
     await notify_user(
         data.creator_id,
         "📩 New booking request",
-        f"{brand_name} booked you for '{title}' — ₹{q['subtotal']:,.0f} is already held in escrow. "
+        f"{brand_name} booked you for '{title}' - ₹{q['subtotal']:,.0f} is already held in escrow. "
         f"Accept it, decline it, or propose a different price.",
         link="/my-deals?tab=requested",
         ntype="info",
@@ -4950,7 +4950,7 @@ async def checkout_brief(data: CheckoutBriefCreate,
         current_user["id"],
         "Payment held in escrow",
         f"₹{total:,.0f} was paid from your credits for '{title}'. "
-        f"It's held until {creator_name} accepts — you'll be refunded in full if they decline.",
+        f"It's held until {creator_name} accepts - you'll be refunded in full if they decline.",
         link="/dashboard/business/wallet",
         ntype="success",
     )
@@ -5029,7 +5029,7 @@ async def respond_to_booking(campaign_id: str, data: BookingRespond,
             "updated_at": now,
         }})
         await insert_deal_system_message(campaign, f"✅ {creator_name} accepted the booking. The brand can now send the brief.", creator_id=campaign.get("selected_creator"))
-        await notify_user(brand_id, "Booking accepted — send your brief",
+        await notify_user(brand_id, "Booking accepted - send your brief",
                           f"{creator_name} accepted '{title}'. Send them the brief to start the work.",
                           link="/dashboard/business/all-campaigns", ntype="success")
         await notify_confirm_delivery_address(campaign, current_user["id"])
@@ -5045,7 +5045,7 @@ async def respond_to_booking(campaign_id: str, data: BookingRespond,
             "updated_at": now,
         }})
         await insert_deal_system_message(campaign, f"❌ {creator_name} declined the booking. The brand has been refunded in full.", creator_id=campaign.get("selected_creator"))
-        await notify_user(brand_id, "Booking declined — you've been refunded",
+        await notify_user(brand_id, "Booking declined - you've been refunded",
                           f"{creator_name} declined '{title}'. ₹{refunded:,.0f} is back in your wallet."
                           + (f" Reason: {data.message}" if data.message else ""),
                           link="/dashboard/business/wallet", ntype="warning", email=True, category="payments")
@@ -5066,7 +5066,7 @@ async def respond_to_booking(campaign_id: str, data: BookingRespond,
         await insert_deal_system_message(
             campaign,
             f"💬 {creator_name} proposed a new price: ₹{proposed:,.0f} (₹{proposed + fee:,.0f} incl. platform fee)."
-            + (f" — \"{data.message}\"" if data.message else ""), creator_id=campaign.get("selected_creator")
+            + (f" - \"{data.message}\"" if data.message else ""), creator_id=campaign.get("selected_creator")
         )
         await notify_user(brand_id, "Creator proposed a new price",
                           f"{creator_name} wants ₹{proposed:,.0f} for '{title}'. Accept it or cancel the booking.",
@@ -5145,7 +5145,7 @@ async def decide_booking_price(campaign_id: str, data: BookingPriceDecision,
         "updated_at": now,
     }, "$unset": {"proposed_amount": "", "proposed_message": "", "proposed_at": ""}})
 
-    await insert_deal_system_message(campaign, f"✅ The brand accepted ₹{new_subtotal:,.0f}. The booking is confirmed — the brief is next.", creator_id=campaign.get("selected_creator"))
+    await insert_deal_system_message(campaign, f"✅ The brand accepted ₹{new_subtotal:,.0f}. The booking is confirmed - the brief is next.", creator_id=campaign.get("selected_creator"))
     await notify_user(campaign["selected_creator"], "Your price was accepted",
                       f"The brand accepted ₹{new_subtotal:,.0f} for '{title}'. Wait for their brief to start.",
                       link="/my-deals", ntype="success")
@@ -5164,7 +5164,7 @@ async def decide_booking_price(campaign_id: str, data: BookingPriceDecision,
 @api_router.post("/bookings/{campaign_id}/brief")
 async def send_booking_brief(campaign_id: str, data: BookingBriefSend,
                              current_user: dict = Depends(get_approved_business_user)):
-    """Brand sends the brief. Only possible once the creator has accepted — this is
+    """Brand sends the brief. Only possible once the creator has accepted - this is
     what actually starts the work."""
     campaign = await get_booking(campaign_id, current_user, role="brand")
     status = campaign.get("booking_status")
@@ -5195,7 +5195,7 @@ async def send_booking_brief(campaign_id: str, data: BookingBriefSend,
     }, "$unset": {"brief_draft": ""}})
 
     await insert_deal_system_message(campaign, f"📋 Brief received. The work has started.\n\n{brief_text}", creator_id=campaign.get("selected_creator"))
-    await notify_user(campaign["selected_creator"], "📋 Brief received — you can start",
+    await notify_user(campaign["selected_creator"], "📋 Brief received - you can start",
                       f"The brand sent the brief for '{campaign.get('title') or 'your booking'}'. The work has officially started.",
                       link="/my-deals", ntype="success")
     return {"brief_sent": True, "brief_text": brief_text}
@@ -5977,8 +5977,8 @@ def _apply_reapplication_fields(current_user: dict, update_fields: dict, now_str
     """If this submit is a REAPPLICATION after a rejection, archive the previous
     decision instead of letting the next `review` write silently overwrite it.
 
-    The person keeps the same account and the same email — /profile/creator and
-    /profile/business already flip approval_status back to PENDING — so without
+    The person keeps the same account and the same email - /profile/creator and
+    /profile/business already flip approval_status back to PENDING - so without
     this the only record of *why* they were rejected is destroyed the moment an
     admin decides again. `review_history` keeps every past decision, and
     `application_attempts` lets a reviewer see at a glance that this is a second
@@ -6001,7 +6001,7 @@ def _is_established_member(user: dict) -> bool:
     Editing an approved profile must apply straight away: nothing goes back to
     "in review" and no admin has anything to approve. Besides APPROVED itself this
     covers a brand that an earlier version of /profile/business knocked back to
-    PENDING on every edit — its record still carries the admin's approval decision
+    PENDING on every edit - its record still carries the admin's approval decision
     (`review.decided_by`, no rejection `reason_code`), so it is restored instead of
     being stuck "in review" for something nobody can approve a second time.
     """
@@ -6428,7 +6428,7 @@ async def submit_kyc(data: Dict[str, Any] = Body(...), current_user: dict = Depe
     holder = str(bank.get("account_holder_name") or "").strip()
     has_bank = bool(acct and ifsc)
     if not upi and not has_bank:
-        raise HTTPException(status_code=400, detail="Add a payout method — a UPI ID or a bank account with IFSC.")
+        raise HTTPException(status_code=400, detail="Add a payout method - a UPI ID or a bank account with IFSC.")
     if upi and not UPI_RE.match(upi):
         raise HTTPException(status_code=400, detail="That UPI ID doesn't look right (e.g. name@bank).")
     if has_bank:
@@ -6682,10 +6682,7 @@ async def get_profile(user_id: str, current_user: dict = Depends(get_current_use
         # Same back-compat as /auth/me: a creator's signup portfolio can live only
         # under profile.portfolio, but the profile modal reads the TOP-LEVEL
         # `portfolio`. Without surfacing it here, saved work showed as "add work".
-        if not user.get('portfolio'):
-            nested = (user.get('profile') or {}).get('portfolio')
-            if nested:
-                user['portfolio'] = nested
+        user['portfolio'] = creator_portfolio(user)
 
     return user
 
@@ -6848,7 +6845,7 @@ async def update_campaign_route(campaign_id: str, data: CampaignUpdate, current_
 async def delete_campaign_route(campaign_id: str, current_user: dict = Depends(get_current_user)):
     """Delete a draft (or rejected) campaign the brand owns.
 
-    Only un-published briefs can be removed — a draft/rejected campaign never held
+    Only un-published briefs can be removed - a draft/rejected campaign never held
     escrow and was never shown to creators, so deletion is safe. Anything that has
     gone live (or beyond) must be cancelled through the normal flow instead.
     """
@@ -7784,7 +7781,7 @@ async def decline_bid(campaign_id: str, bid_id: str, current_user: dict = Depend
         await notify_user(
             creator_id,
             "Your bid was declined",
-            f"The brand declined your bid on '{campaign.get('title', 'a campaign')}'. Keep an eye out — plenty of other briefs are open.",
+            f"The brand declined your bid on '{campaign.get('title', 'a campaign')}'. Keep an eye out - plenty of other briefs are open.",
             link="/browse-briefs",
             ntype="warning",
         )
@@ -8106,7 +8103,7 @@ async def finish_hiring(campaign_id: str, current_user: dict = Depends(get_curre
     if not hired:
         raise HTTPException(status_code=400, detail="No creator is hired yet. Cancel the brief instead of finishing it.")
     if len(hired) >= wanted:
-        raise HTTPException(status_code=400, detail="This brief is already fully staffed — nothing to close.")
+        raise HTTPException(status_code=400, detail="This brief is already fully staffed - nothing to close.")
 
     # Refund the pool that was still reserved for the slots you're not filling.
     reservation = await db.escrow.find_one({"campaign_id": campaign_id, "status": "reserved"}, {"_id": 0})
@@ -8123,7 +8120,7 @@ async def finish_hiring(campaign_id: str, current_user: dict = Depends(get_curre
                 "amount": refunded,
                 "direction": "credit",
                 "status": "success",
-                "note": f"Unfilled creator slots refunded — hired {len(hired)} of {wanted}.",
+                "note": f"Unfilled creator slots refunded - hired {len(hired)} of {wanted}.",
                 "created_at": datetime.now(timezone.utc).isoformat(),
             })
         # Mark the pool refunded (kept, not deleted, so it shows as a "Budget Refund"
@@ -8610,7 +8607,7 @@ async def activate_deal_from_card(card: dict) -> Optional[dict]:
     )
 
     await insert_deal_activity(campaign, "system", "UGCAD.IO", "deal_started",
-                               f"Offer accepted — deal opened with ₹{int(amount)} held in escrow.", creator_id=creator["id"])
+                               f"Offer accepted - deal opened with ₹{int(amount)} held in escrow.", creator_id=creator["id"])
     await insert_deal_system_message(campaign, f"Offer accepted. ₹{int(amount)} is held in escrow and the deal room is now open.", creator_id=creator["id"])
     await notify_confirm_delivery_address(campaign, creator["id"])
     return campaign
@@ -8802,7 +8799,7 @@ async def activate_countered_private_deal(card: dict, campaign: dict) -> Optiona
         {"$set": {"deal_campaign_id": campaign["id"], "deal_id": make_deal_id(campaign)}},
     )
     await insert_deal_activity(campaign, "system", "UGCAD.IO", "deal_started",
-                               f"Counter-offer accepted — deal opened at \u20b9{int(amount)} with the funds held in escrow.", creator_id=creator["id"])
+                               f"Counter-offer accepted - deal opened at \u20b9{int(amount)} with the funds held in escrow.", creator_id=creator["id"])
     await insert_deal_system_message(campaign, f"Counter-offer accepted. \u20b9{int(amount)} is held in escrow and the deal room is now open.", creator_id=creator["id"])
     await notify_confirm_delivery_address(campaign, creator["id"])
     return campaign
@@ -9479,17 +9476,17 @@ async def propose_filter_rule(data: FilterRulePropose, current_user: dict = Depe
     await refresh_filter_rules(force=True)
     await notify_admins(
         "New filter rule added",
-        f"{current_user.get('nickname', current_user['id'])} added a {data.type} rule \"{data.label}\" — it is now live.",
+        f"{current_user.get('nickname', current_user['id'])} added a {data.type} rule \"{data.label}\" - it is now live.",
         link="/dashboard/admin/flagged",
     )
-    return {"message": "Rule added — live from the next message.", "rule": {k: v for k, v in rule.items() if k != "_id"}}
+    return {"message": "Rule added - live from the next message.", "rule": {k: v for k, v in rule.items() if k != "_id"}}
 
 
 @api_router.post("/admin/filter-rules/{rule_id}/toggle")
 async def toggle_filter_rule(rule_id: str, data: FilterRuleToggle,
                              current_user: dict = Depends(require_cap("content_moderation"))):
     """Switch a rule on or off. This is what promotes an older 'Awaiting review'
-    rule to live — and it takes effect immediately, not after the cache TTL."""
+    rule to live - and it takes effect immediately, not after the cache TTL."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Admin access required")
     # The built-in defaults used to be virtual — merged into the list response but
@@ -9535,7 +9532,7 @@ async def ensure_ready_for_content(campaign: dict, creator_id: Optional[str] = N
     first; and no submissions while a dispute is open.
 
     On a multi-creator brief, creator_id scopes the shipment/receipt check to that
-    one creator's own delivery — omitted, it falls back to the whole campaign
+    one creator's own delivery - omitted, it falls back to the whole campaign
     (single-creator behaviour)."""
     await ensure_not_disputed(campaign['id'], creator_id)
     if campaign.get('requires_shipment'):
@@ -9577,7 +9574,7 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
     await ensure_not_delivered(data.campaign_id, current_user['id'], 0)
     stage = await edit_stage(campaign, current_user['id'], 0)
     if stage == 'ugc_editing':
-        raise HTTPException(status_code=400, detail="Your raw video is approved — UGC.ad's team is editing it. There's nothing more to submit.")
+        raise HTTPException(status_code=400, detail="Your raw video is approved - UGC.ad's team is editing it. There's nothing more to submit.")
     files = [f for f in (data.work_files or []) if f]
     if stage == 'raw':
         raw_files, edited_files = (data.raw_files or files), []
@@ -9734,13 +9731,13 @@ async def download_work(
     current_user: dict = Depends(get_current_user),
 ):
     """Download the delivered file. Allowed for the brand on the campaign, the
-    creator, or an admin — and (for the brand) only once the work is approved.
+    creator, or an admin - and (for the brand) only once the work is approved.
 
     Default: 302 to the file (kept for old clients). With ?as_link=1 the answer is
     JSON {url, forced, ...} instead. The website must use that: a browser XHR that
     follows a redirect to S3 is sent with `Origin: null`, which the bucket's CORS rules
     reject, so the old redirect could never be fetched as a blob from ugcad.io. The
-    browser instead navigates to `url` — a presigned S3 link that says "save as" — which
+    browser instead navigates to `url` - a presigned S3 link that says "save as" - which
     needs no CORS. `name` is only a filename hint; the extension comes from the file."""
     # The Work Review card passes a CAMPAIGN id, not a work_submission id (same shape as
     # the approve fix). Resolve either: try the work id first, then fall back to the
@@ -9908,9 +9905,9 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
         due = campaign.get('final_delivery_by')
         await insert_deal_activity(campaign, "brand", brand_name, "content_approved",
                                    "Raw video approved. The creator is editing it next.", creator_id=work['creator_id'])
-        await insert_deal_system_message(campaign, "Raw video approved — the creator can now submit the edited video.", creator_id=work['creator_id'])
+        await insert_deal_system_message(campaign, "Raw video approved - the creator can now submit the edited video.", creator_id=work['creator_id'])
         await notify_user(
-            work['creator_id'], "Raw video approved — submit the edited video",
+            work['creator_id'], "Raw video approved - submit the edited video",
             f"Your raw video for '{campaign.get('title', 'the campaign')}' was approved. Edit it and submit the edited video"
             + (f" by {due[:10]}." if due else "."),
             link="/my-deals", ntype="success", email=True, category="deal_updates",
@@ -9938,12 +9935,12 @@ async def approve_work(work_id: str, current_user: dict = Depends(get_current_us
                                           {"$set": {"work_submission.status": "awaiting_edit"}})
             await notify_admins(
                 "Editing queue: raw video approved",
-                f"The brand approved the raw video for '{campaign.get('title', 'a campaign')}' — it's ready for UGC.ad's edit.",
+                f"The brand approved the raw video for '{campaign.get('title', 'a campaign')}' - it's ready for UGC.ad's edit.",
                 link="/dashboard/admin/editing",
             )
             await notify_user(
                 campaign['business_id'], "UGC.ad is editing your video",
-                f"You approved the raw video for '{campaign.get('title', 'your campaign')}'. UGC.ad's editors are cutting the final version — you'll be asked to review it.",
+                f"You approved the raw video for '{campaign.get('title', 'your campaign')}'. UGC.ad's editors are cutting the final version - you'll be asked to review it.",
                 link="/dashboard/business/work-review", ntype="info",
             )
         # Fall through to the normal payout gate, counting raw approvals.
@@ -10120,10 +10117,10 @@ def edit_mode(campaign: dict, deliverable_index: Optional[int] = None) -> Option
 
 async def edit_stage(campaign: dict, creator_id: str, deliverable_index: int = 0) -> Optional[str]:
     """Where this creator's deliverable is in the raw → edited flow:
-    'raw'         — raw video still to be submitted/approved (step 1, raw due date);
-    'edited'      — raw approved, the creator now submits the edited cut (step 2);
-    'ugc_editing' — raw approved, UGC.ad's editors cut it (creator's part is done);
-    None          — no edited file on this brief: a single ordinary submission."""
+    'raw'         - raw video still to be submitted/approved (step 1, raw due date);
+    'edited'      - raw approved, the creator now submits the edited cut (step 2);
+    'ugc_editing' - raw approved, UGC.ad's editors cut it (creator's part is done);
+    None          - no edited file on this brief: a single ordinary submission."""
     mode = edit_mode(campaign, deliverable_index)
     if not mode:
         return None
@@ -10144,11 +10141,11 @@ async def ensure_not_delivered(campaign_id: str, creator_id: str, deliverable_in
         "campaign_id": campaign_id, "creator_id": creator_id, "deliverable_index": deliverable_index,
         "stage": {"$ne": "raw"}, "status": WorkStatus.APPROVED,
     }, {"_id": 0, "id": 1}):
-        raise HTTPException(status_code=400, detail="This deliverable is already approved — there's nothing more to submit.")
+        raise HTTPException(status_code=400, detail="This deliverable is already approved - there's nothing more to submit.")
 
 
 async def approved_raw_files(campaign_id: str, creator_id: str, deliverable_index: int = 0) -> List[str]:
-    """The approved raw video(s) for this deliverable — shown to the brand next to the
+    """The approved raw video(s) for this deliverable - shown to the brand next to the
     edited cut so they can compare both (approved content is no longer watermark-gated)."""
     raw = await db.work_submissions.find_one({
         "campaign_id": campaign_id, "creator_id": creator_id,
@@ -10162,10 +10159,10 @@ async def approved_raw_files(campaign_id: str, creator_id: str, deliverable_inde
 async def deliverables_progress(campaign: dict, creator_id: str, stage: Optional[str] = None) -> dict:
     """How many of a brief's required assets currently have an APPROVED submission
     FROM THIS CREATOR. Every hired creator on a multi-creator brief must independently
-    deliver the full required set — this must never be counted campaign-wide, or one
+    deliver the full required set - this must never be counted campaign-wide, or one
     creator's approval would complete the gate for every other hired creator too.
 
-    Counts DISTINCT deliverable_index values, not rows — v1/v2/v3 of the same asset
+    Counts DISTINCT deliverable_index values, not rows - v1/v2/v3 of the same asset
     are revisions and must only ever count once. Submissions written before this field
     existed have no deliverable_index and collapse to index 0, so a legacy single-asset
     deal reads as 1-of-1 complete exactly as it did before.
@@ -10209,7 +10206,7 @@ async def deliverables_progress(campaign: dict, creator_id: str, stage: Optional
 
 async def release_payout_now(campaign: dict, work: dict, source: str = "approval") -> dict:
     """Instant funding: compute the payout (TDS/penalty/net + invoice) and release it
-    to the creator's wallet immediately — no hold period. Guards against paying twice."""
+    to the creator's wallet immediately - no hold period. Guards against paying twice."""
     progress = await deliverables_progress(campaign, work['creator_id'])
     if not progress['complete']:
         return {"released": False, "net_payable": 0, "deliverables": progress}
@@ -10639,7 +10636,7 @@ async def request_revision(work_id: str, data: RevisionRequestIn = Body(...), cu
         {"$set": {"status": WorkStatus.REVISION_REQUESTED}, "$push": {"revisions": revision}}
     )
     if claim.modified_count == 0:
-        raise HTTPException(status_code=409, detail="This submission is no longer awaiting review — it was just approved or revised. Refresh to see the latest state.")
+        raise HTTPException(status_code=409, detail="This submission is no longer awaiting review - it was just approved or revised. Refresh to see the latest state.")
 
     # Clear the creator's response to the PREVIOUS revision round — it's keyed only by
     # (campaign_id, creator_id), not by round, so without this the tracker kept showing
@@ -10822,8 +10819,8 @@ def _brief_amount(fields: dict):
 
 @api_router.get("/business/briefs")
 async def get_business_briefs(current_user: dict = Depends(get_current_user)):
-    """Every brief/offer that involves this brand's workspace — private
-    invitations, custom offers and counter offers — with its lifecycle status
+    """Every brief/offer that involves this brand's workspace - private
+    invitations, custom offers and counter offers - with its lifecycle status
     (sent / accepted / declined / countered / expired / revoked) so the brand can
     see in one place everything it sent, accepted or rejected. Sourced from
     db.chat_action_cards, which every send path writes to."""
@@ -10999,7 +10996,7 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
     await ensure_not_delivered(campaign['id'], current_user['id'], deliverable_index)
     stage = await edit_stage(campaign, current_user['id'], deliverable_index)
     if stage == 'ugc_editing':
-        raise HTTPException(status_code=400, detail="Your raw video is approved — UGC.ad's team is editing it. There's nothing more to submit.")
+        raise HTTPException(status_code=400, detail="Your raw video is approved - UGC.ad's team is editing it. There's nothing more to submit.")
     if stage == 'raw':
         data.raw_footage_url = data.raw_footage_url or data.video_url
         data.video_url = data.raw_footage_url
@@ -11027,7 +11024,7 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
     if not 0 <= deliverable_index < required_total:
         raise HTTPException(
             status_code=400,
-            detail=f"deliverable_index {deliverable_index} is out of range — this brief requires {required_total} deliverable(s).",
+            detail=f"deliverable_index {deliverable_index} is out of range - this brief requires {required_total} deliverable(s).",
         )
 
     existing_versions = await db.deal_content_submissions.count_documents({
@@ -11160,7 +11157,7 @@ async def submit_revision_response(deal_id: str, data: DealRevisionResponseSubmi
         await notify_user(
             campaign['business_id'],
             "Creator responded to your revision request",
-            (f"The creator {label}. Work it out together in the deal chat — if you "
+            (f"The creator {label}. Work it out together in the deal chat - if you "
              "can't agree, it can be escalated to admin.") if pushed_back else f"The creator {label}.",
             link="/dashboard/business/all-campaigns",
             ntype="warning" if pushed_back else "info",
@@ -11310,7 +11307,7 @@ async def escalate_deal(deal_id: str, data: DealIssueSubmit, current_user: dict 
     dtype = "communication_issue"
     if flagged:
         dtype = "revision_abuse" if flagged.get('response') == 'partial_dispute' else "scope_creep"
-    dispute_id = await open_admin_dispute(campaign, current_user, dtype, data.message or "Escalated to admin — could not resolve with the other party.",
+    dispute_id = await open_admin_dispute(campaign, current_user, dtype, data.message or "Escalated to admin - could not resolve with the other party.",
                                           creator_id=context['creator']['id'])
     result["dispute_id"] = dispute_id
     return result
@@ -11357,7 +11354,7 @@ async def get_open_dispute(campaign_id: str, creator_id: Optional[str] = None) -
 
 
 async def ensure_not_disputed(campaign_id: str, creator_id: Optional[str] = None):
-    """PRD 9.3: while a dispute is open, all non-dispute deal actions are paused — for the
+    """PRD 9.3: while a dispute is open, all non-dispute deal actions are paused - for the
     disputed creator's deal only; the other hired creators carry on."""
     if await get_open_dispute(campaign_id, creator_id):
         raise HTTPException(status_code=409, detail="This deal is under dispute. Actions are paused until an admin resolves it.")
@@ -11368,7 +11365,7 @@ async def open_admin_dispute(campaign: dict, raised_by: dict, dtype: str, reason
     """Create the single real admin dispute for a deal (idempotent per campaign),
     pause the deal (hold escrow + drop a dispute card) and notify admin + the other
     party. This is the ONE place a deal reaches the admin Disputes queue now that
-    creators can no longer file disputes directly — only escalation gets here.
+    creators can no longer file disputes directly - only escalation gets here.
     Returns the dispute id (the existing open one if a dispute is already open)."""
     creator_id = creator_id or campaign.get('selected_creator')
     existing = await get_open_dispute(campaign['id'], creator_id)
@@ -11405,7 +11402,7 @@ async def open_admin_dispute(campaign: dict, raised_by: dict, dtype: str, reason
     })
     await notify_admins(
         f"New {severity} dispute",
-        f"{dtype.replace('_', ' ')} on deal {make_deal_id(campaign)} — first response due in {first_hrs}h.",
+        f"{dtype.replace('_', ' ')} on deal {make_deal_id(campaign)} - first response due in {first_hrs}h.",
         link="/dashboard/admin/disputes",
     )
     other_id = campaign.get('business_id') if raised_by.get('role') == UserRole.CREATOR else creator_id
@@ -11468,7 +11465,7 @@ async def raise_structured_dispute(deal_id: str, data: DisputeCreate, current_us
     })
     await insert_deal_activity(campaign, map_sender_type(current_user['id'], campaign, deal_creator, current_user.get('role')), current_user.get('nickname', 'User'), "dispute_raised", f"A {severity} dispute was raised: {data.dispute_type.replace('_', ' ')}.", creator_id=context['creator']['id'])
     # PRD 9.9: admin notified within 5 minutes.
-    await notify_admins(f"New {severity} dispute", f"{data.dispute_type.replace('_',' ')} on deal {make_deal_id(campaign)} — first response due in {first_hrs}h.", link="/dashboard/admin/disputes")
+    await notify_admins(f"New {severity} dispute", f"{data.dispute_type.replace('_',' ')} on deal {make_deal_id(campaign)} - first response due in {first_hrs}h.", link="/dashboard/admin/disputes")
     other_party = deal_creator if current_user['id'] == campaign.get('business_id') else campaign.get('business_id')
     if other_party:
         await notify_user(other_party, "A dispute was raised on your deal", "Deal activity is paused while our team reviews. You'll be asked for any evidence.", link="/my-deals")
@@ -11486,7 +11483,7 @@ def _business_days_from(start: datetime, days: int) -> datetime:
 
 @api_router.get("/admin/disputes")
 async def list_disputes(status: Optional[str] = None, dispute_type: Optional[str] = None, current_user: dict = Depends(require_cap("rule_disputes"))):
-    """PRD 9.4: admin dispute dashboard — all disputes sorted by age with SLA countdown."""
+    """PRD 9.4: admin dispute dashboard - all disputes sorted by age with SLA countdown."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view disputes")
     query = {}
@@ -11506,7 +11503,7 @@ async def list_disputes(status: Optional[str] = None, dispute_type: Optional[str
 
 @api_router.get("/admin/disputes/{dispute_id}")
 async def get_dispute_detail(dispute_id: str, current_user: dict = Depends(require_cap("rule_disputes"))):
-    """PRD 9.4: full evidence review panel — brief, timeline, chat, content, shipping, prior disputes."""
+    """PRD 9.4: full evidence review panel - brief, timeline, chat, content, shipping, prior disputes."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin can view disputes")
     dispute = await db.disputes.find_one({"id": dispute_id}, {"_id": 0})
@@ -11724,7 +11721,7 @@ async def rule_dispute(dispute_id: str, data: DisputeRuling, current_user: dict 
         # Put the outcome in the Deal Room so both parties actually see it.
         await insert_deal_system_message(
             campaign,
-            f"⚖️ Dispute resolved — ruling: {data.ruling.replace('_', ' ')}.\n"
+            f"⚖️ Dispute resolved - ruling: {data.ruling.replace('_', ' ')}.\n"
             f"Refunded to brand: ₹{refund:,.0f} · Released to creator: ₹{creator_amt:,.0f}"
             + (f"\nReason: {data.reasoning}" if data.reasoning else ""), creator_id=dispute.get("creator_id")
         )
@@ -11791,7 +11788,7 @@ async def appeal_dispute(dispute_id: str, data: DisputeAppeal, current_user: dic
         "status": "appealed", "appealed": True, "appeal_by": current_user["id"],
         "appeal_grounds": data.grounds, "appeal_evidence_urls": data.new_evidence_urls, "appealed_at": now_iso(),
     }})
-    await notify_admins("Dispute appealed", f"Dispute {dispute_id} was appealed — senior review required. Second ruling is final.", link="/dashboard/admin/disputes")
+    await notify_admins("Dispute appealed", f"Dispute {dispute_id} was appealed - senior review required. Second ruling is final.", link="/dashboard/admin/disputes")
     return {"message": "Appeal submitted. A senior admin will review; the second ruling is final.", "dispute_id": dispute_id}
 
 
@@ -11803,7 +11800,7 @@ async def get_my_disputes(current_user: dict = Depends(get_current_user)):
 
 @api_router.get("/disputes/{dispute_id}")
 async def get_my_dispute_detail(dispute_id: str, current_user: dict = Depends(get_current_user)):
-    """A party's own view of one dispute — powers the creator/brand dispute page.
+    """A party's own view of one dispute - powers the creator/brand dispute page.
     Only the two parties (and admins) may read it; everyone else gets a 404 so a
     dispute id can't be probed."""
     dispute = await db.disputes.find_one({"id": dispute_id}, {"_id": 0})
@@ -11917,7 +11914,7 @@ async def get_brand_deal_context(deal_id: str, current_user: dict) -> tuple:
     """Like get_brand_deal_campaign, but also resolves WHICH hired creator this
     deal id addresses (person_deal_id's "~<creator_id>" suffix for creator 2..N on
     a multi-creator brief; the bare id for the first/only creator). Shipment
-    endpoints need this — get_brand_deal_campaign alone discards the suffix, so
+    endpoints need this - get_brand_deal_campaign alone discards the suffix, so
     every shipment action landed on whichever creator happened to be first."""
     campaign = await get_brand_deal_campaign(deal_id, current_user)
     _, suffix_creator = split_deal_id(deal_id)
@@ -11961,7 +11958,7 @@ _ADDR_REQUIRED = ("full_name", "phone", "line1", "city", "state", "pincode")
 
 def account_address_for(user: dict, company: Optional[dict] = None) -> Optional[dict]:
     """The address already saved on a user's ACCOUNT, in the shape the shipping forms
-    use — so neither side retypes it.
+    use - so neither side retypes it.
       creator → KYC residential address, else the flat signup fields;
       brand   → Settings → Company (billing address / city / state / pincode).
     Returns None when nothing usable is saved. Never reads another user's data."""
@@ -12000,14 +11997,21 @@ async def notify_confirm_delivery_address(campaign: dict, creator_id: Optional[s
     if not creator_id or not campaign or not campaign.get("requires_shipment"):
         return
     link = f"/my-deals?campaign={campaign['id']}"
-    if await db.in_app_notifications.find_one({"user_id": creator_id, "link": link, "category": "delivery_address"}):
-        return
-    await notify_user(
-        creator_id, "Confirm your delivery address",
-        f"'{campaign.get('title', 'Your campaign')}' ships a product to you. Confirm where it should be "
-        "delivered — use the address from your account or enter a new one — so our team can schedule the courier.",
-        link=link, ntype="warning", email=True, category="delivery_address",
-    )
+    if not await db.in_app_notifications.find_one({"user_id": creator_id, "link": link, "category": "delivery_address"}):
+        await notify_user(
+            creator_id, "Confirm your delivery address",
+            f"'{campaign.get('title', 'Your campaign')}' ships a product to you. Open the deal room and confirm your delivery address so our team can schedule the courier.",
+            link=link, ntype="warning", email=True, category="delivery_address",
+        )
+    brand_id = campaign.get('business_id')
+    brand_link = f"/my-deals?deal={person_deal_id(campaign, creator_id)}"
+    if brand_id and not await db.in_app_notifications.find_one(
+            {"user_id": brand_id, "link": brand_link, "category": "delivery_address"}):
+        await notify_user(
+            brand_id, "Confirm product pickup and delivery details",
+            f"A creator has been selected for '{campaign.get('title', 'Your campaign')}'. Open the deal room and confirm your pickup address and delivery instructions so our team can arrange shipment.",
+            link=brand_link, ntype="warning", email=True, category="delivery_address",
+        )
 
 
 def creator_delivery_address(user: dict) -> Optional[dict]:
@@ -12075,7 +12079,7 @@ def delhivery_register_pickup(pickup: dict) -> str:
     """Delhivery only picks up from pre-registered 'client warehouses'. Register the
     brand's pickup address on first use. The warehouse name is a hash of the address,
     so a changed address registers as a fresh warehouse, and re-registering the same
-    one ('already exists') counts as success — idempotent, nothing stored our side."""
+    one ('already exists') counts as success - idempotent, nothing stored our side."""
     key = "|".join(str(pickup.get(k) or "").strip().lower() for k in ("line1", "line2", "city", "pincode"))
     name = "ugcad-" + hashlib.md5(key.encode()).hexdigest()[:10]
     address = ", ".join(filter(None, [pickup.get("line1"), pickup.get("line2")]))
@@ -12175,7 +12179,7 @@ def delhivery_track_status(awb: str) -> Optional[str]:
 async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_user: dict = Depends(get_current_user)):
     """Brand submits product details + pickup address; the platform generates a
     pre-paid shipping label. The creator's delivery address is pulled from their
-    profile here and passed to the courier — it is NEVER exposed to the brand.
+    profile here and passed to the courier - it is NEVER exposed to the brand.
 
     PHASE 1: label + tracking are MOCKED. Replace the marked block below with a
     real Shiprocket 'create order + generate label' call when the API is wired in."""
@@ -12347,7 +12351,7 @@ async def mark_shipment_picked_up(deal_id: str, current_user: dict = Depends(get
         await shipment_match_filter(campaign["id"], creator_id),
         {"$set": {"courier_status": "shipped", "status": "shipped", "shipped_at": now_iso(), "updated_at": now_iso()}},
     )
-    await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "shipped", "Package picked up by courier — shipment is in transit.", creator_id=creator_id)
+    await insert_deal_activity(campaign, "brand", current_user.get("nickname", "Brand"), "shipped", "Package picked up by courier - shipment is in transit.", creator_id=creator_id)
     await insert_deal_system_message(campaign, "The package has been picked up by the courier and is on its way.", creator_id=creator_id)
     return {"message": "Marked as shipped"}
 
@@ -12430,7 +12434,7 @@ async def get_work_by_campaign(campaign_id: str, creator_id: Optional[str] = Non
     """Resolve the work submission for a campaign.
 
     The creator sees their own submission. The BRAND that owns the campaign needs it
-    too — approve / request-revision / download are all keyed by work_id, and the
+    too - approve / request-revision / download are all keyed by work_id, and the
     brand has no other way to learn it (it used to send the campaign id, which 404'd).
 
     On a multi-creator brief the brand passes ?creator_id=<id> to resolve a SPECIFIC
@@ -12517,7 +12521,7 @@ async def get_work_pending_review(current_user: dict = Depends(get_current_user)
 @api_router.get("/business/work-review")
 async def get_business_work_review(current_user: dict = Depends(get_current_user)):
     """Every submission across the business's campaigns, one row per (campaign,
-    creator) — ALL statuses, for the Work Review tabs (approved / pending / revision).
+    creator) - ALL statuses, for the Work Review tabs (approved / pending / revision).
 
     campaign.work_submission is a single field overwritten on every /work/submit call,
     so on a multi-creator brief a second hired creator's submission silently replaces
@@ -12729,7 +12733,7 @@ async def get_creator_reviews(creator_id: str):
 @api_router.get("/reviews/business/{business_id}")
 async def get_business_reviews(business_id: str):
     """Reviews creators left for a brand (reviewee_role == 'business'). Powers the
-    brand profile card a creator opens from Messages — mirror of the creator route."""
+    brand profile card a creator opens from Messages - mirror of the creator route."""
     business = await db.users.find_one({"id": business_id}, {"_id": 0, "id": 1, "team_of": 1})
     reviews = await db.reviews.find(
         received_review_query({**(business or {"id": business_id}), "role": "business"}), {"_id": 0}
@@ -12783,7 +12787,7 @@ async def update_shipment(data: ShipmentUpdate, current_user: dict = Depends(get
                 await db.users.update_one({"id": creator_id}, {"$inc": {"balance": fee}})
                 await db.shipments.update_one(match, {"$set": {"late_fee_applied": fee, "late_fee_days": days_late}})
                 await notify_user(creator_id, "Late-shipping fee credited", f"₹{fee} was credited to you because the brand shipped {days_late} day(s) late.", link="/withdrawal")
-                await insert_deal_system_message(campaign, f"Brand shipped {days_late} day(s) late — ₹{fee} late-shipping fee credited to the creator (PRD 8.9).", creator_id=creator_id)
+                await insert_deal_system_message(campaign, f"Brand shipped {days_late} day(s) late - ₹{fee} late-shipping fee credited to the creator (PRD 8.9).", creator_id=creator_id)
 
     return {"message": "Shipment details updated"}
 
@@ -12889,7 +12893,7 @@ async def get_shipment(campaign_id: str, creator_id: Optional[str] = None, curre
 @api_router.post("/shipping/address")
 async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict = Depends(get_current_user)):
     """Brand (pickup) or creator (delivery) saves their address for a shipment.
-    Stored on the user's profile.address — the admin shipping queue reads it from there.
+    Stored on the user's profile.address - the admin shipping queue reads it from there.
     When both parties' addresses are present, the deal is flagged ready-to-dispatch
     and the ops team is notified to print a label and ship it."""
     address = {
@@ -12976,7 +12980,7 @@ async def save_shipping_address(data: ShippingAddressSubmit, current_user: dict 
 @api_router.get("/shipping/account-address")
 async def get_account_shipping_address(current_user: dict = Depends(get_current_user)):
     """The caller's OWN account address (creator: KYC/signup; brand: company settings), in
-    shipping-form shape — used to pre-fill the pickup / delivery forms."""
+    shipping-form shape - used to pre-fill the pickup / delivery forms."""
     me = await db.users.find_one({"id": current_user["id"]}, {"_id": 0}) or {}
     company = ((await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0}) or {}).get("company")
                if current_user.get("role") == UserRole.BUSINESS else None)
@@ -12988,7 +12992,7 @@ async def get_account_shipping_address(current_user: dict = Depends(get_current_
 async def get_shipping_address(campaign_id: Optional[str] = None, creator_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
     """Return MY saved address (for prefill) and, for a given deal, whether each
     side has confirmed. Masked-shipping safe: never returns the OTHER party's
-    address — only a boolean that they've confirmed.
+    address - only a boolean that they've confirmed.
 
     On a multi-creator brief, a brand caller passes ?creator_id=<id> to check one
     specific hired creator's readiness (defaults to the first hired creator)."""
@@ -13231,7 +13235,7 @@ async def get_payout_receipts(current_user: dict = Depends(get_current_user)):
     """All payout receipts (earnings + withdrawals) for the current creator.
 
     Every earning says who paid it and for which campaign. Receipts written before
-    the payer was stamped on carry only a campaign uuid, so resolve those here —
+    the payer was stamped on carry only a campaign uuid, so resolve those here -
     otherwise the creator's history shows an amount with no idea where it came from.
     """
     receipts = await db.payout_receipts.find(
@@ -13489,7 +13493,7 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
         if data.action == "approve" and status == CampaignStatus.AWAITING_BRAND_CONFIRMATION:
             await notify_user(
                 brand_id,
-                "📝 Your script is ready — review and confirm",
+                "📝 Your script is ready - review and confirm",
                 (f"UGC.ad has written the script for '{title}'. Read it and confirm to send the "
                  "brief to creators, or request changes if it misses the mark."),
                 link=link, ntype="info", email=True, category="deal_updates",
@@ -13498,10 +13502,10 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
             await notify_user(
                 brand_id,
                 "✅ Your brief is approved and live",
-                (f"'{title}' has been approved and sent to the creator you picked — "
+                (f"'{title}' has been approved and sent to the creator you picked - "
                  "you'll be notified when they accept or decline."
                  if is_private else
-                 f"'{title}' has been approved and is now live — creators can start applying."),
+                 f"'{title}' has been approved and is now live - creators can start applying."),
                 link=link, ntype="success", email=True, category="deal_updates",
             )
         else:
@@ -13509,7 +13513,7 @@ async def approve_campaign(data: ApprovalAction, current_user: dict = Depends(re
             await notify_user(
                 brand_id,
                 "Your brief was not approved",
-                f"'{title}' was not approved{f' — {reason}' if reason else ''}. "
+                f"'{title}' was not approved{f' - {reason}' if reason else ''}. "
                 "Your reserved budget has been refunded to your wallet.",
                 link=link, ntype="warning", email=True, category="deal_updates",
             )
@@ -13555,10 +13559,10 @@ async def brand_script_confirmation(campaign_id: str, data: ScriptConfirmationIn
             await deliver_private_invitation({**campaign, "status": CampaignStatus.ACTIVE})
         await notify_admins(
             "Brand confirmed the script",
-            f"'{title}' — the brand confirmed UGC.ad's script; the brief is now live.",
+            f"'{title}' - the brand confirmed UGC.ad's script; the brief is now live.",
             link="/dashboard/admin/campaigns",
         )
-        return {"message": "Script confirmed — your brief is now live", "status": CampaignStatus.ACTIVE}
+        return {"message": "Script confirmed - your brief is now live", "status": CampaignStatus.ACTIVE}
 
     note = (data.note or "").strip()
     await db.campaigns.update_one(
@@ -13571,7 +13575,7 @@ async def brand_script_confirmation(campaign_id: str, data: ScriptConfirmationIn
     )
     await notify_admins(
         "Brand requested script changes",
-        f"'{title}' — the brand wants the script revised{f': {note}' if note else ''}. "
+        f"'{title}' - the brand wants the script revised{f': {note}' if note else ''}. "
         "Update the script and approve again.",
         link="/dashboard/admin/campaigns",
     )
@@ -13667,7 +13671,7 @@ async def admin_editing_complete(work_id: str, data: EditingCompleteIn, current_
         "original_url": url, "creator_note": "Edited by UGC.ad", "submitted_at": now, "status": "submitted",
     })
 
-    await insert_deal_system_message(campaign, "UGC.ad finished editing — the edited video is now with the brand for review.", creator_id=work.get("creator_id"))
+    await insert_deal_system_message(campaign, "UGC.ad finished editing - the edited video is now with the brand for review.", creator_id=work.get("creator_id"))
     if campaign.get("business_id"):
         await notify_user(
             campaign["business_id"],
@@ -13679,12 +13683,12 @@ async def admin_editing_complete(work_id: str, data: EditingCompleteIn, current_
         await notify_user(
             work["creator_id"],
             "Your footage was edited and sent for review",
-            f"UGC.ad finished editing your submission for '{campaign.get('title', 'a campaign')}' — it's now with the brand.",
+            f"UGC.ad finished editing your submission for '{campaign.get('title', 'a campaign')}' - it's now with the brand.",
             link="/my-deals", ntype="info",
         )
     await log_admin_action(current_user, "editing.completed", target_type="work", target_id=work_id,
                            after={"edited_file_url": url})
-    return {"message": "Edited cut attached — the brand can now review", "work_id": work_id}
+    return {"message": "Edited cut attached - the brand can now review", "work_id": work_id}
 
 
 # -- Admin campaign moderation: pause / resume / ban / delete -----------------
@@ -14052,13 +14056,20 @@ async def get_admin_stats(current_user: dict = Depends(get_current_user)):
     pending_campaigns = await db.campaigns.count_documents({"status": CampaignStatus.PENDING_APPROVAL})
     active_campaigns = await db.campaigns.count_documents({"status": CampaignStatus.ACTIVE})
     pending_withdrawals = await db.withdrawals.count_documents({"status": WithdrawalStatus.PENDING})
+    pending_kyc = await db.users.count_documents({"role": UserRole.CREATOR, "kyc.status": "pending"})
+    pending_gst = await db.users.count_documents({"role": UserRole.BUSINESS, "gst.status": "pending"})
+    shipping_rows = await admin_shipping_requests(current_user) if admin_caps.can(current_user, "manage_shipping") else []
+    pending_shipping = sum(row.get("status", "pending") in {"pending", "requested", "label_generated", "awaiting_pickup"} for row in shipping_rows)
     
     return {
         "total_users": total_users,
         "pending_profiles": pending_profiles,
         "pending_campaigns": pending_campaigns,
         "active_campaigns": active_campaigns,
-        "pending_withdrawals": pending_withdrawals
+        "pending_withdrawals": pending_withdrawals,
+        "pending_kyc": pending_kyc,
+        "pending_gst": pending_gst,
+        "pending_shipments": pending_shipping,
     }
 
 @api_router.get("/admin/users")
@@ -14217,7 +14228,7 @@ async def admin_unsuspend_user(data: Dict[str, Any] = Body(...), current_user: d
     await _admin_target(user_id, current_user)
     await db.users.update_one({"id": user_id}, {"$set": {
         "suspended": False, "status": "active", "suspended_until": None, "suspended_reason": None, "updated_at": now_iso()}})
-    await notify_user(user_id, "Suspension lifted", "Your account suspension has been lifted — you can log in again.", ntype="info")
+    await notify_user(user_id, "Suspension lifted", "Your account suspension has been lifted - you can log in again.", ntype="info")
     await log_admin_action(current_user, "user.unsuspended", target_type="user", target_id=user_id)
     return {"message": "Suspension lifted"}
 
@@ -15163,7 +15174,7 @@ async def razorpay_webhook(request: Request):
     """Handle Razorpay webhook notifications.
 
     SECURITY: the RAW body is HMAC-SHA256 verified against the Razorpay webhook secret
-    before anything is credited. This endpoint is public and unauthenticated — without
+    before anything is credited. This endpoint is public and unauthenticated - without
     the check, anyone could POST a fake `payment.captured` and top up a wallet for free.
     Fails CLOSED: if no webhook_secret is configured we reject rather than trust the body.
     """
@@ -15174,14 +15185,14 @@ async def razorpay_webhook(request: Request):
 
         webhook_secret = gateway.get("webhook_secret")
         if not webhook_secret:
-            logger.error("[razorpay-webhook] no webhook_secret configured — rejecting call")
+            logger.error("[razorpay-webhook] no webhook_secret configured - rejecting call")
             raise HTTPException(status_code=503, detail="Webhook secret not configured")
 
         raw = await request.body()
         signature = request.headers.get("X-Razorpay-Signature") or ""
         expected = hmac.new(webhook_secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
         if not signature or not hmac.compare_digest(expected, signature):
-            logger.warning("[razorpay-webhook] invalid signature — rejected")
+            logger.warning("[razorpay-webhook] invalid signature - rejected")
             raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
         body = await request.json()
@@ -15333,7 +15344,7 @@ SHOWCASE_DEAL_ESCROW_STATUSES = ["released", "held", "on_hold", "disputed"]
 
 async def _creator_earnings_totals() -> dict:
     """Deal value + count per creator for the showcase, keyed by the escrow's OWN
-    creator_id (a deal is now per-creator, so this is the source of truth) — falling
+    creator_id (a deal is now per-creator, so this is the source of truth) - falling
     back to the campaign's selected_creator only for legacy rows without a creator_id.
 
     Counts EVERY deal the creator was hired for (held + released, not just paid-out),
@@ -15586,7 +15597,7 @@ async def get_my_notifications(current_user: dict = Depends(get_current_user)):
     stamps. But notifications created BEFORE that tagging existed (or by any other
     admin-authored path) have no `source`, so they showed as plain system events for
     both brands and creators. Derive the tag here from `created_by`: if an admin
-    authored it, surface it as an admin message — retroactively, with no migration.
+    authored it, surface it as an admin message - retroactively, with no migration.
     """
     notifications = await db.in_app_notifications.find(
         {"user_id": current_user['id']},
@@ -16000,7 +16011,7 @@ async def admin_set_staff_role(data: Dict[str, Any] = Body(...), request: Reques
             subject = "You've been added as an admin on UGCad.io"
             heading = "You're now an admin"
             intro = (f"You've been added to the UGCad.io admin team as <strong>{role_label}</strong>. "
-                     "Sign in with this email address — your password was set by the founder who added you.")
+                     "Sign in with this email address - your password was set by the founder who added you.")
         else:
             subject = "Your UGCad.io admin role was updated"
             heading = "Your admin role changed"
@@ -16446,7 +16457,7 @@ def payout_delay_for(level) -> int:
 
 
 def revision_fee_for(used: int) -> float:
-    """Fee for the brand's next revision — free up to the limit, then `revision_price`."""
+    """Fee for the brand's next revision - free up to the limit, then `revision_price`."""
     if used < cf.FREE_REVISION_LIMIT:
         return 0.0
     return to_float(platform_setting("revision_price", cf.PAID_REVISION_FEE))
@@ -16535,7 +16546,7 @@ async def admin_review_gst(user_id: str, data: AdminGSTReview,
     }})
 
     if action == "approve":
-        await notify_user(user_id, "GST verified — you can now add funds",
+        await notify_user(user_id, "GST verified - you can now add funds",
                           f"Your GSTIN {gst['gstin']} has been verified. You can now recharge your wallet and start booking creators.",
                           link="/dashboard/business/wallet", ntype="success", email=True)
     else:
@@ -16550,7 +16561,7 @@ async def admin_review_gst(user_id: str, data: AdminGSTReview,
 @api_router.get("/admin/email/health")
 async def admin_email_health(current_user: dict = Depends(require_cap("edit_settings"))):
     """Is transactional email actually configured ON THIS SERVER? Without this the only
-    symptom of a missing RESEND_API_KEY is silence — the send is skipped and nothing
+    symptom of a missing RESEND_API_KEY is silence - the send is skipped and nothing
     surfaces. Reports config (never the key itself) plus the quiet-hours window."""
     key = os.environ.get("RESEND_API_KEY", "")
     return {
@@ -16560,7 +16571,7 @@ async def admin_email_health(current_user: dict = Depends(require_cap("edit_sett
         "reply_to": os.environ.get("EMAIL_REPLY_TO") or None,
         "frontend_url": os.environ.get("FRONTEND_URL") or None,
         "in_quiet_hours": _in_quiet_hours(),
-        "note": ("Email is DISABLED — RESEND_API_KEY is not set on this server, so every send is "
+        "note": ("Email is DISABLED - RESEND_API_KEY is not set on this server, so every send is "
                  "silently skipped. Add it to the environment and redeploy."
                  if not key else "Email is configured."),
     }
@@ -16575,12 +16586,12 @@ async def admin_email_test(data: Dict[str, Any] = Body(...),
     if not to:
         raise HTTPException(status_code=400, detail="Provide a 'to' address")
     result = await send_email(
-        to, "UGCad.io — test email",
+        to, "UGCad.io - test email",
         _email_base_template("Test email", "<p>If you're reading this, transactional email works.</p>"),
         "If you're reading this, transactional email works.",
     )
     if result.get("skipped"):
-        raise HTTPException(status_code=503, detail="RESEND_API_KEY is not set on this server — email is disabled.")
+        raise HTTPException(status_code=503, detail="RESEND_API_KEY is not set on this server - email is disabled.")
     if result.get("error"):
         raise HTTPException(status_code=502, detail=f"Provider rejected the send: {result['error']}")
     return {"sent": True, "to": to, "provider_id": result.get("id")}
@@ -16732,7 +16743,7 @@ def _csv_response(rows: List[dict], fieldnames: List[str], filename: str):
 
 @api_router.get("/admin/financials/tds/export")
 async def export_tds(current_user: dict = Depends(require_cap("export_tax"))):
-    """PRD 11.11: TDS certificate prep (Form 16A) — one row per creator earning."""
+    """PRD 11.11: TDS certificate prep (Form 16A) - one row per creator earning."""
     if current_user["role"] not in OPS_ROLES:
         raise HTTPException(status_code=403, detail="Only ops/admin/finance can export tax docs")
     invoices = await db.invoices.find({}, {"_id": 0}).to_list(20000)
@@ -17009,14 +17020,14 @@ async def admin_refund_escrow(escrow_id: str, data: Dict[str, Any] = Body(...), 
 # for the campaign and delegate to the escrow release/refund logic above.
 async def _admin_deal_escrow(campaign_id: str, data: Optional[dict]) -> dict:
     """The escrow an admin deal-room action applies to. On a brief with several hired
-    creators there is one per creator, so the admin must say which — guessing "the first"
+    creators there is one per creator, so the admin must say which - guessing "the first"
     would pay out or refund the wrong creator's money."""
     campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0}) or {"id": campaign_id}
     hired = selected_creator_ids(campaign)
     creator_id = (data or {}).get("creator_id")
     if len(hired) > 1:
         if not creator_id:
-            raise HTTPException(status_code=400, detail="This brief has several hired creators — pass creator_id to say whose payment this is.")
+            raise HTTPException(status_code=400, detail="This brief has several hired creators - pass creator_id to say whose payment this is.")
         if creator_id not in hired:
             raise HTTPException(status_code=400, detail="That creator is not hired on this brief.")
     escrow = await db.escrow.find_one(deal_escrow_filter(campaign, creator_id), {"_id": 0})
@@ -17173,7 +17184,7 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
             dims = prod.get("dimensions") or {}
             dim_str = (f"{dims.get('length') or '?'}×{dims.get('width') or '?'}×{dims.get('height') or '?'} cm"
                        if any(dims.get(k) for k in ("length", "width", "height")) else None)
-            product_name = sh.get("product_summary") or prod.get("description") or c.get("product_name") or "—"
+            product_name = sh.get("product_summary") or prod.get("description") or c.get("product_name") or "-"
             rows.append({
                 "id": cid, "deal_id": cid, "creator_id": creator_id, "campaign_title": c.get("title"),
                 "brand": person_display_name(brand, "Brand"), "creator": person_display_name(creator, "Creator"),
@@ -17433,7 +17444,7 @@ async def admin_open_brand_workspace(
 
 @api_router.get("/admin/business/{business_id}/campaigns")
 async def admin_business_campaigns(business_id: str, current_user: dict = Depends(require_cap("manage_deals"))):
-    """Every campaign a brand has posted — live and completed — for the admin
+    """Every campaign a brand has posted - live and completed - for the admin
     user-detail drawer's Campaigns tab. Read straight from db.campaigns by
     business_id so it includes campaigns with no selected creator yet, which
     /admin/deals filters out (that route only lists matched deals)."""
@@ -17646,7 +17657,7 @@ def _user_category(u: dict) -> str:
 @api_router.get("/admin/my-assigned")
 async def admin_my_assigned(current_user: dict = Depends(require_cap("my_users"))):
     """Creators & brands (profile-completed) in the categories assigned to this ops
-    admin — Founder/Senior see all; ops_regular is scoped to assigned categories."""
+    admin - Founder/Senior see all; ops_regular is scoped to assigned categories."""
     users = await db.users.find(
         {"profile_completed": True, "role": {"$in": ["creator", "business"]}},
         {"_id": 0, "password": 0},
@@ -17688,7 +17699,7 @@ async def admin_review_kyc(user_id: str, data: Dict[str, Any] = Body(...),
     if action == "approve":
         set_fields = {"kyc.status": "verified", "kyc.verified_at": now,
                       "kyc.reviewed_by": current_user["id"], "kyc_verified": True}
-        title, msg, ntype = "KYC verified ✅", "Your KYC has been verified — you can now withdraw your earnings.", "success"
+        title, msg, ntype = "KYC verified ✅", "Your KYC has been verified - you can now withdraw your earnings.", "success"
     else:
         reason = str(data.get("reason") or "").strip()
         if not reason:
@@ -17705,7 +17716,7 @@ async def admin_review_kyc(user_id: str, data: Dict[str, Any] = Body(...),
 @api_router.get("/reviews")
 async def list_my_reviews(current_user: dict = Depends(get_current_user)):
     """The signed-in user's own reviews, so the Reviews page (web + app) shows a
-    real list and star breakdown. Was a stub returning [] — which is why the
+    real list and star breakdown. Was a stub returning [] - which is why the
     page read 'No reviews yet' and 0% per star even when the aggregate showed a
     rating. Creator sees reviews left for them; a brand sees reviews left for it."""
     reviews = await db.reviews.find(
@@ -17775,7 +17786,7 @@ async def live_revision(current_user: dict = Depends(get_current_user)):
 
 
 from live_updates import LiveUpdatesMiddleware
-app.add_middleware(LiveUpdatesMiddleware, database=db)
+app.add_middleware(LiveUpdatesMiddleware, database=lambda: db)
 
 app.include_router(api_router)
 
@@ -17941,8 +17952,8 @@ import traceback as _traceback
 @app.exception_handler(CloudStorageError)
 async def _cloud_storage_error_handler(request: Request, exc: CloudStorageError):
     """Cloudinary rejected an upload (quota/size). One handler covers every
-    persist_file() callsite — profile photos, logos, chat files, work
-    submissions — so the uploader always gets the real reason instead of a
+    persist_file() callsite - profile photos, logos, chat files, work
+    submissions - so the uploader always gets the real reason instead of a
     silent fallback that loses the file on the next deploy."""
     origin = request.headers.get("origin") or "*"
     return _JSONResponse(
@@ -17957,8 +17968,8 @@ async def _cloud_storage_error_handler(request: Request, exc: CloudStorageError)
 
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
-    """Catch-all so unhandled errors (a) carry CORS headers — otherwise the browser
-    reports a misleading 'CORS policy' error instead of the real 500 — and (b) surface
+    """Catch-all so unhandled errors (a) carry CORS headers - otherwise the browser
+    reports a misleading 'CORS policy' error instead of the real 500 - and (b) surface
     the actual cause for debugging."""
     try:
         logger.error("Unhandled error on %s:\n%s", request.url.path, _traceback.format_exc())
@@ -18031,15 +18042,15 @@ def _onboarding_reminder_email(user: dict, stage: str) -> tuple:
         subject = f"Still pending: your UGCad.io {what}"
         content = f"""
             <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">Your {what} is still unfinished{f", {name}" if name else ""}</h1>
-            <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">You created your UGCad.io account a couple of days ago, but the profile form was never submitted &mdash; so your account is not live yet and cannot be reviewed.</p>
+            <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">You created your UGCad.io account a couple of days ago, but the profile form was never submitted - so your account is not live yet and cannot be reviewed.</p>
             <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">It takes a few minutes. Once it is submitted and approved you can {next_step}.</p>
             {cta}
             <p style="margin:22px 0 0;font-size:13px;color:#9296ba;">Already finished it? You can ignore this email.</p>"""
     else:
-        subject = f"You are one step away &mdash; finish your UGCad.io {what}"
+        subject = f"You are one step away - finish your UGCad.io {what}"
         content = f"""
             <h1 style="margin:0 0 12px;font-size:22px;color:#1f2340;">{f"Almost there, {name}!" if name else "Almost there!"}</h1>
-            <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">Thanks for signing up to UGCad.io. Your account is created, but your {what} form has not been submitted yet &mdash; that is the last step before we can review and activate you.</p>
+            <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">Thanks for signing up to UGCad.io. Your account is created, but your {what} form has not been submitted yet - that is the last step before we can review and activate you.</p>
             <p style="margin:0 0 16px;font-size:15px;line-height:1.6;color:#4a4f74;">Finish it now and you can {next_step}.</p>
             {cta}
             <p style="margin:22px 0 0;font-size:13px;color:#9296ba;">Already finished it? You can ignore this email.</p>"""

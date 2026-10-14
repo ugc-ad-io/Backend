@@ -290,7 +290,7 @@ def validate_portfolio(items: List[Any]) -> Tuple[bool, str]:
 # Watermark-protected previews (PRD 2.7 / Section 8)
 # ---------------------------------------------------------------------------
 
-WATERMARK_TEXT = "UGCAD.IO — Sample Only"
+WATERMARK_TEXT = "UGCAD.IO - Sample Only"
 
 
 def _is_local_upload(url: Optional[str]) -> Optional[str]:
@@ -309,7 +309,7 @@ def _is_local_upload(url: Optional[str]) -> Optional[str]:
 def apply_image_watermark(src_path: str, dest_path: str) -> bool:
     """Burn a diagonal sample watermark into a local image. Returns True on
     success. No-op (returns False) when Pillow is unavailable or the source is
-    not a readable image — callers fall back to player-overlay watermarking."""
+    not a readable image - callers fall back to player-overlay watermarking."""
     try:
         from PIL import Image, ImageDraw, ImageFont  # type: ignore
     except Exception:

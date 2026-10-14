@@ -18,7 +18,8 @@ class LiveUpdatesMiddleware(BaseHTTPMiddleware):
                 and not path.startswith(("/api/auth/", "/api/live/"))
                 and "typing" not in path and "read" not in path.split("/")):
             try:
-                await self.database.live_updates.update_one(
+                database = self.database() if callable(self.database) else self.database
+                await database.live_updates.update_one(
                     {"_id": "revision"}, {"$set": {"version": uuid.uuid4().hex}}, upsert=True
                 )
             except Exception:

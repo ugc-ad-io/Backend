@@ -1,5 +1,5 @@
 """
-reset_demo.py — Make ONLY test@gmail.com (creator) and testbrand@test.com (brand)
+reset_demo.py - Make ONLY test@gmail.com (creator) and testbrand@test.com (brand)
 hold demo data. Everything else is cleaned:
 
   • all campaigns / escrow / shipments / work_submissions / reviews / wallet_ledger
@@ -57,7 +57,7 @@ def brief_text(product, handle):
     return "\n".join([
         f"Campaign: {product} Launch Push", f"Brand: @{handle}", "Category: Beauty",
         f"Product: {product}", f"Product description: A hero {product.lower()} that hydrates and protects.",
-        "Hook: Stop scrolling — your skin will thank you.", "Key message: Visible results in 7 days.",
+        "Hook: Stop scrolling - your skin will thank you.", "Key message: Visible results in 7 days.",
         "Objectives: Awareness, Conversions", "Target audience: Urban women 22-35 into clean skincare.",
         "Budget visibility: Visible to creators", "", "Deliverables:",
         "1. 1 x Reel (9:16, under 30s); duration 20s; ratios 9:16; raw files not required", "",
@@ -158,7 +158,7 @@ async def main():
                 "business_nickname": bhandle, "brand_name": bname, "brand_handle": bhandle, "brand_logo_url": blogo,
                 "title": title, "status": status, "requires_shipment": True, "shipment_required": True,
                 "product_name": product, "product_category": "Beauty",
-                "product_description": f"A hero {product.lower()} — the star of this campaign.",
+                "product_description": f"A hero {product.lower()} - the star of this campaign.",
                 "brief_text": brief_text(product, bhandle), "objectives": ["Awareness", "Conversions"],
                 "industry_type": "skincare", "category": "Beauty",
                 "target_audience": "Urban women 22-35 into clean skincare.",
@@ -209,12 +209,12 @@ async def main():
         "received_at": days_ago(14), "unboxing_video": VIDS[0], "unboxing_video_url": VIDS[0],
         "shipment_checklist": {"sealed": True, "correct_item": True, "working": True}, "updated_at": iso()})
     await db.work_submissions.insert_one({"id": str(uuid.uuid4()), "seed_dummy": True, "campaign_id": dn["id"],
-        "creator_id": creator["id"], "work_files": [VIDS[1]], "description": "Final reel per brief — hook, product, CTA.",
+        "creator_id": creator["id"], "work_files": [VIDS[1]], "description": "Final reel per brief - hook, product, CTA.",
         "status": "approved", "submitted_at": days_ago(5), "approved_at": days_ago(2), "created_at": days_ago(5), "revisions": []})
     await db.reviews.insert_many([
         {"id": str(uuid.uuid4()), "seed_dummy": True, "campaign_id": dn["id"], "creator_id": creator["id"],
          "business_id": brand["id"], "reviewer_id": brand["id"], "reviewee_role": "creator", "rating": 5,
-         "review": "Fantastic to work with — nailed the brief and delivered early!", "created_at": days_ago(1)},
+         "review": "Fantastic to work with - nailed the brief and delivered early!", "created_at": days_ago(1)},
         {"id": str(uuid.uuid4()), "seed_dummy": True, "campaign_id": dn["id"], "creator_id": creator["id"],
          "business_id": brand["id"], "reviewer_id": creator["id"], "reviewee_role": "business", "rating": 5,
          "review": "Clear brief, fast approvals and prompt payment. Great brand.", "created_at": days_ago(1)}])
@@ -236,7 +236,7 @@ async def main():
         "created_by": "system"} for i, (uid, t, m, ty, lk) in enumerate(notes)])
 
     print("✓ Seeded deal flow between the two accounts (open bid + shipped deal + completed deal + reviews + payout)")
-    print("✓ Done — only test@gmail.com and testbrand@test.com have demo data now.")
+    print("✓ Done - only test@gmail.com and testbrand@test.com have demo data now.")
 
 
 if __name__ == "__main__":

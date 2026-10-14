@@ -1,5 +1,5 @@
 """
-seed_dummy.py — Populate existing creator & brand profiles with rich dummy data
+seed_dummy.py - Populate existing creator & brand profiles with rich dummy data
 and build a full deal flow (campaigns, bids, an active shipped deal, a completed
 deal with review, notifications, wallet balances) so every screen has data to test.
 
@@ -117,8 +117,8 @@ def build_brief_text(product, brand_handle):
         f"Brand: @{brand_handle}",
         "Category: Beauty",
         f"Product: {product}",
-        f"Product description: A hero {product.lower()} that hydrates and protects — the star of this campaign.",
-        "Hook: Stop scrolling — your skin will thank you.",
+        f"Product description: A hero {product.lower()} that hydrates and protects - the star of this campaign.",
+        "Hook: Stop scrolling - your skin will thank you.",
         "Key message: Visible results in 7 days, clinically tested.",
         "Objectives: Awareness, Conversions",
         "Target audience: Urban women 22-35 who care about clean, effective skincare.",
@@ -285,7 +285,7 @@ async def main():
             "shipment_required": True,
             "product_name": product,
             "product_category": "Beauty",
-            "product_description": f"A hero {product.lower()} — the star of this campaign.",
+            "product_description": f"A hero {product.lower()} - the star of this campaign.",
             "brief_text": build_brief_text(product, bhandle),
             "objectives": ["Awareness", "Conversions"],
             "industry_type": "skincare",
@@ -376,7 +376,7 @@ async def main():
     })
     await db.work_submissions.insert_one({
         "id": str(uuid.uuid4()), "seed_dummy": True, "campaign_id": done["id"], "creator_id": c2["id"],
-        "work_files": [SAMPLE_VIDEOS[1]], "description": "Final reel as per brief — hook, product shots, CTA.",
+        "work_files": [SAMPLE_VIDEOS[1]], "description": "Final reel as per brief - hook, product shots, CTA.",
         "status": "approved", "submitted_at": days_ago(5), "approved_at": days_ago(2),
         "created_at": days_ago(5), "revisions": [],
     })
@@ -384,7 +384,7 @@ async def main():
     await db.reviews.insert_many([
         {"id": str(uuid.uuid4()), "seed_dummy": True, "campaign_id": done["id"], "creator_id": c2["id"],
          "business_id": brand["id"], "reviewer_id": brand["id"], "reviewee_role": "creator", "rating": 5,
-         "review": "Fantastic to work with — nailed the brief and delivered early. Highly recommend!",
+         "review": "Fantastic to work with - nailed the brief and delivered early. Highly recommend!",
          "created_at": days_ago(1)},
         {"id": str(uuid.uuid4()), "seed_dummy": True, "campaign_id": done["id"], "creator_id": c2["id"],
          "business_id": brand["id"], "reviewer_id": c2["id"], "reviewee_role": "business", "rating": 5,
