@@ -11,6 +11,7 @@ import server
 def database(monkeypatch):
     db = AsyncMongoMockClient()["address_prompts"]
     monkeypatch.setattr(server, "db", db)
+    monkeypatch.setattr(server, "_address_recovery_ran_at", {})
     monkeypatch.setattr(server, "send_email", AsyncMock(return_value={"skipped": True}))
     monkeypatch.setattr(server, "insert_deal_system_message", AsyncMock())
     return db
@@ -160,3 +161,21 @@ async def test_concurrent_recovery_cannot_duplicate_prompts(database, monkeypatc
         server.get_my_notifications({"id": "brand", "role": "business"}),
     )
     await assert_both_prompts(database)
+
+
+@pytest.mark.asyncio
+async def test_feed_polls_do_not_rescan_deals_every_time(database, monkeypatch):
+    # The bell polls the feed every 15s; the deal scan must not run on each poll.
+    scans = []
+    real = server.find_shipment
+    async def counted(*args, **kwargs):
+        scans.append(1)
+        return await real(*args, **kwargs)
+    monkeypatch.setattr(server, "find_shipment", counted)
+    await seed_booking(database, booking_status="accepted")
+    user = {"id": "creator", "role": "creator"}
+    await server.get_my_notifications(user)
+    first = len(scans)
+    await server.get_my_notifications(user)
+    await server.get_my_notifications(user)
+    assert first > 0 and len(scans) == first

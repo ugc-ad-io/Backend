@@ -15862,6 +15862,11 @@ async def get_notification_logs(current_user: dict = Depends(require_cap("edit_s
     return logs
 
 # In-App Notification System
+# The feed is polled every 15s by every open page; the recovery below scans the user's deals with
+# several queries each, so it runs at most once per user per interval (acceptance sends the prompt itself).
+ADDRESS_RECOVERY_INTERVAL_SECONDS = 600
+_address_recovery_ran_at: Dict[str, float] = {}
+
 async def recover_missing_address_notifications(current_user: dict):
     """Recover missed acceptance events for this user's still-unshipped deals.
 
@@ -15872,6 +15877,10 @@ async def recover_missing_address_notifications(current_user: dict):
     role = current_user.get("role")
     if role not in [UserRole.CREATOR, UserRole.BUSINESS]:
         return
+    now = time.monotonic()
+    if now - _address_recovery_ran_at.get(current_user["id"], -ADDRESS_RECOVERY_INTERVAL_SECONDS) < ADDRESS_RECOVERY_INTERVAL_SECONDS:
+        return
+    _address_recovery_ran_at[current_user["id"]] = now
     owner = ({"$or": [{"selected_creator": current_user["id"]},
                        {"selected_creators": current_user["id"]}]}
              if role == UserRole.CREATOR else {"business_id": _brand_ws_id(current_user)})
