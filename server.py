@@ -4,6 +4,11 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
+import os
+# Motor runs every database call on a thread pool sized cpu_count * 5 (5-10 threads on a small
+# AWS box). Each call waits a network round trip to Atlas, so the whole server capped out near
+# 20 queries/s and pages queued for 10+ s. Must be set before motor is imported.
+os.environ.setdefault("MOTOR_MAX_WORKERS", "64")
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import time
