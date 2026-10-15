@@ -18208,6 +18208,18 @@ _cors_origins = [o.strip() for o in os.environ.get('CORS_ORIGINS', _DEFAULT_CORS
 # every request from every origin.
 if '*' in _cors_origins:
     _cors_origins = [o.strip() for o in _DEFAULT_CORS_ORIGINS.split(',') if o.strip()]
+from starlette.middleware.gzip import GZipMiddleware
+
+class ApiGZipMiddleware(GZipMiddleware):
+    """Compress JSON API responses (campaign/deal lists are large). Uploads and videos are left
+    alone, and so is any Range request, so video seeking is never touched."""
+    async def __call__(self, scope, receive, send):
+        if (scope["type"] == "http" and scope["path"].startswith("/api/")
+                and not any(name == b"range" for name, _ in scope["headers"])):
+            return await super().__call__(scope, receive, send)
+        await self.app(scope, receive, send)
+
+app.add_middleware(ApiGZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -18599,6 +18611,36 @@ async def backfill_video_previews() -> None:
         logger.exception("[preview] backfill failed")
 
 
+# Lookups every list page relies on. Without these each request scans whole collections, which is
+# what makes pages slow as data grows. create_index is a no-op for an index that already exists.
+DB_INDEXES = {
+    "users": ["id", "email", "role", "public_creator_id"],
+    "campaigns": ["id", "business_id", "status", "selected_creator", "selected_creators"],
+    "escrow": ["campaign_id", "id"],
+    "work_submissions": ["campaign_id", "id", "creator_id"],
+    "chat_action_cards": ["id", "participants", "deal_id"],
+    "business_settings": ["business_id"],
+    "disputes": ["id", "campaign_id"],
+    "deal_content_submissions": ["campaign_id"],
+    "shipments": ["campaign_id"],
+    "business_team_members": ["business_id"],
+    "payment_transactions": ["user_id", "id", "gateway_order_id"],
+    "messages": ["sender_id", "recipient_id"],
+    "in_app_notifications": ["id", [("user_id", 1), ("created_at", -1)]],
+}
+
+async def ensure_indexes():
+    """Run in the background at boot; one failed index must never stop the others or the app."""
+    created = 0
+    for collection, keys in DB_INDEXES.items():
+        for key in keys:
+            try:
+                await db[collection].create_index(key)
+                created += 1
+            except Exception as exc:
+                logger.warning("Could not create index %s.%s: %s", collection, key, exc)
+    return created
+
 @app.on_event("startup")
 async def startup_initialization():
     """Initialize default data collections."""
@@ -18637,6 +18679,10 @@ async def startup_initialization():
 
     # Seed categories
     await seed_categories()
+
+    index_task = asyncio.create_task(ensure_indexes())
+    _video_job_tasks.add(index_task)
+    index_task.add_done_callback(_video_job_tasks.discard)
 
     # Thumbnails + small clips for older portfolio videos that have none.
     backfill = asyncio.create_task(backfill_video_previews())
