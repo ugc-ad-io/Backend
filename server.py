@@ -1664,15 +1664,15 @@ async def _email_category_allowed(user: dict, category: Optional[str]) -> bool:
     return True
 
 
-async def notify_user(user_id: str, title: str, message: str, link: Optional[str] = None, ntype: str = "info", email: bool = False, critical: bool = False, category: Optional[str] = None, email_subject: Optional[str] = None, email_html: Optional[str] = None):
+async def notify_user(user_id: str, title: str, message: str, link: Optional[str] = None, ntype: str = "info", email: bool = False, critical: bool = False, category: Optional[str] = None, email_subject: Optional[str] = None, email_html: Optional[str] = None, notification_id: Optional[str] = None):
     """Send an in-app notification to a single user. Set email=True to ALSO send an
     email (best-effort - a mail failure never breaks the in-app notification/action).
     Set critical=True for SLA/security emails that must bypass quiet hours + prefs.
     Set category to honor the recipient's per-category email preference.
     email_subject / email_html (set by notify_event) override the email's subject and
     body; they default to the notification's title and message."""
-    await db.in_app_notifications.insert_one({
-        "id": str(uuid.uuid4()),
+    notification = {
+        "id": notification_id or str(uuid.uuid4()),
         "user_id": user_id,
         "title": title,
         "message": message,
@@ -1682,7 +1682,14 @@ async def notify_user(user_id: str, title: str, message: str, link: Optional[str
         "read": False,
         "created_at": now_iso(),
         "created_by": "system",
-    })
+    }
+    if notification_id:
+        result = await db.in_app_notifications.update_one(
+            {"id": notification_id}, {"$setOnInsert": notification}, upsert=True)
+        if not result.upserted_id:
+            return  # Concurrent acceptance/recovery already persisted this prompt.
+    else:
+        await db.in_app_notifications.insert_one(notification)
     # Non-critical email is suppressed during quiet hours (the in-app record still shows).
     if email and (critical or not _in_quiet_hours()):
         try:
@@ -1824,7 +1831,7 @@ async def notify_event(user_id: str, event: str, ctx: Optional[dict] = None, **k
     body = o.get("email_body") or o.get("message") or ev["message"]
     email_html = _fill(body, ctx, esc=True).replace("\n", "<br>")
     send_mail = o["email_enabled"] if "email_enabled" in o else ev["email"]
-    await notify_user(user_id, title, message, email=send_mail, email_subject=subject, email_html=email_html, **kw)
+    await notify_user(user_id, title, message, email=kw.pop("email", send_mail), email_subject=subject, email_html=email_html, **kw)
 
 
 async def enforce_suspension(user: dict):
@@ -5270,6 +5277,8 @@ async def decide_booking_price(campaign_id: str, data: BookingPriceDecision,
     await notify_user(campaign["selected_creator"], "Your price was accepted",
                       f"The brand accepted ₹{new_subtotal:,.0f} for '{title}'. Wait for their brief to start.",
                       link="/my-deals", ntype="success")
+
+    await notify_confirm_delivery_address(campaign, campaign["selected_creator"])
 
     updated = await db.users.find_one({"id": current_user["id"]}, {"_id": 0, "balance": 1})
     return {
@@ -8719,6 +8728,9 @@ async def activate_deal_from_card(card: dict) -> Optional[dict]:
         # Already activated for this creator with escrow held → nothing to do.
         existing_escrow = await db.escrow.find_one({"campaign_id": campaign["id"]}, {"_id": 0})
         if campaign.get("selected_creator") == creator["id"] and existing_escrow:
+            # A private brief has its creator and reserved budget from the day it is posted, so
+            # accepting it lands here. The address request must still go out (once per creator).
+            await notify_confirm_delivery_address(campaign, creator["id"])
             return campaign
         if campaign.get("business_id") != brand["id"]:
             return None  # mismatched ownership; refuse to cross-wire
@@ -8830,6 +8842,12 @@ async def find_countered_private_campaign(card: dict) -> Optional[dict]:
         {"_id": 0},
         sort=[("created_at", -1)],
     )
+    if card.get("deal_id"):
+        # Explicit campaign context survives the two chat requests arriving out of order.
+        origin = await db.chat_action_cards.find_one({
+            "participants": {"$all": participants}, "type": "private_invitation",
+            "deal_id": card["deal_id"], "status": {"$in": ["open", "pending", "counter"]},
+        }, {"_id": 0})
     if not origin or origin.get("type") != "private_invitation" or not origin.get("deal_id"):
         return None
     campaign = await get_campaign_by_deal_id(origin["deal_id"])
@@ -8974,6 +8992,13 @@ async def activate_countered_private_deal(card: dict, campaign: dict) -> Optiona
             "accepted_at": now,
         },
     }
+    timeline = str((card.get("fields") or {}).get("timeline") or "").strip()
+    try:
+        agreed_date = datetime.strptime(timeline, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        agreed_date = None  # Older clients send relative timelines such as "7 days".
+    if agreed_date:
+        update.update({key: agreed_date for key in ("due_date", "deadline", "draft_delivery_by", "delivery_date")})
     revisions = str((card.get("fields") or {}).get("revisions") or "").strip()
     if revisions.isdigit():
         update["revision_limit"] = int(revisions)
@@ -12226,26 +12251,29 @@ def address_missing_fields(address: Optional[dict]) -> list:
     return [k for k in _ADDR_REQUIRED if not str((address or {}).get(k) or "").strip()]
 
 
-async def notify_confirm_delivery_address(campaign: dict, creator_id: Optional[str]):
+async def notify_confirm_delivery_address(campaign: dict, creator_id: Optional[str], *, in_app_only: bool = False):
     """Ask the hired creator to confirm where the product should be couriered, in-app and
     by email, so the UGC.ad team can schedule the delivery. Once per creator per brief."""
     if not creator_id or not campaign or not campaign.get("requires_shipment"):
         return
+    shipment = (await find_shipment(campaign["id"], creator_id) or {}) if in_app_only else {}
     link = f"/my-deals?campaign={campaign['id']}"
-    if not await db.in_app_notifications.find_one({"user_id": creator_id, "link": link, "category": "delivery_address"}):
+    if not shipment.get("delivery_address") and not await db.in_app_notifications.find_one({"user_id": creator_id, "link": link, "category": "delivery_address"}):
         await notify_event(
             creator_id, "delivery_address_creator",
             {"title": campaign.get('title', 'Your campaign')},
-            link=link, ntype="warning", category="delivery_address",
+            notification_id=f"delivery_address:{campaign['id']}:{creator_id}:creator",
+            link=link, ntype="warning", category="delivery_address", **({"email": False} if in_app_only else {}),
         )
     brand_id = campaign.get('business_id')
     brand_link = f"/dashboard/business/campaign/{campaign['id']}?creator={creator_id}"
-    if brand_id and not await db.in_app_notifications.find_one(
+    if brand_id and not shipment.get("pickup_address") and not await db.in_app_notifications.find_one(
             {"user_id": brand_id, "link": brand_link, "category": "delivery_address"}):
         await notify_event(
             brand_id, "delivery_address_brand",
             {"title": campaign.get('title', 'Your campaign')},
-            link=brand_link, ntype="warning", category="delivery_address",
+            notification_id=f"delivery_address:{campaign['id']}:{creator_id}:brand",
+            link=brand_link, ntype="warning", category="delivery_address", **({"email": False} if in_app_only else {}),
         )
 
 
@@ -12419,6 +12447,8 @@ async def create_shipping_label(deal_id: str, data: ShipLabelRequest, current_us
     PHASE 1: label + tracking are MOCKED. Replace the marked block below with a
     real Shiprocket 'create order + generate label' call when the API is wired in."""
     campaign, creator_id = await get_brand_deal_context(deal_id, current_user)
+    if campaign.get("status") in ["rejected", "cancelled", "banned"] or campaign.get("booking_status") == "declined":
+        raise HTTPException(status_code=400, detail="This campaign is closed and cannot request shipment")
     if not campaign.get("requires_shipment"):
         raise HTTPException(status_code=400, detail="This deal does not require a shipment")
 
@@ -12546,6 +12576,8 @@ async def request_shipment(deal_id: str, data: ShipLabelRequest, current_user: d
     shipping queue then generates the label and marks it shipped. The creator's
     delivery address is captured server-side and is NEVER shown to the brand."""
     campaign, creator_id = await get_brand_deal_context(deal_id, current_user)
+    if campaign.get("status") in ["rejected", "cancelled", "banned"] or campaign.get("booking_status") == "declined":
+        raise HTTPException(status_code=400, detail="This campaign is closed and cannot request shipment")
     if not campaign.get("requires_shipment"):
         raise HTTPException(status_code=400, detail="This deal does not require a shipment")
 
@@ -15830,6 +15862,52 @@ async def get_notification_logs(current_user: dict = Depends(require_cap("edit_s
     return logs
 
 # In-App Notification System
+async def recover_missing_address_notifications(current_user: dict):
+    """Recover missed acceptance events for this user's still-unshipped deals.
+
+    Run before reading the feed so old accepted deals also receive their prompt.
+    Pending invitations, declined deals and completed shipments never qualify.
+    Recovery is in-app only; acceptance remains responsible for the original email.
+    """
+    role = current_user.get("role")
+    if role not in [UserRole.CREATOR, UserRole.BUSINESS]:
+        return
+    owner = ({"$or": [{"selected_creator": current_user["id"]},
+                       {"selected_creators": current_user["id"]}]}
+             if role == UserRole.CREATOR else {"business_id": _brand_ws_id(current_user)})
+    campaigns = await db.campaigns.find({
+        **owner, "requires_shipment": True, "status": {"$in": ["active", "in_progress"]},
+        "booking_status": {"$nin": ["pending_creator", "price_revision", "declined"]},
+    }, {"_id": 0}).to_list(200)
+    for campaign in campaigns:
+        for creator_id in selected_creator_ids(campaign):
+            if role == UserRole.CREATOR and creator_id != current_user["id"]:
+                continue
+            # Private briefs name a creator before acceptance and hold a reservation.
+            # A reservation alone must never cause an address-confirmation request.
+            accepted = campaign.get("booking_status") == "accepted"
+            if not accepted:
+                accepted = await db.escrow.find_one({"campaign_id": campaign["id"],
+                    "creator_id": creator_id, "status": "held"}, {"_id": 0, "id": 1})
+            if not accepted:
+                accepted = await db.chat_action_cards.find_one({
+                    "type": {"$in": ["private_invitation", "counter_offer", "custom_offer"]},
+                    "status": {"$in": ["accept", "accepted"]},
+                    "participants": {"$all": [campaign["business_id"], creator_id]},
+                    "$or": [{"deal_id": {"$in": [campaign["id"], make_deal_id(campaign)]}},
+                            {"deal_campaign_id": campaign["id"]}],
+                }, {"_id": 0, "id": 1})
+            if not accepted:
+                continue
+            shipment = await find_shipment(campaign["id"], creator_id) or {}
+            if (shipment.get("status") or shipment.get("courier_status")) in [
+                    "shipped", "in_transit", "delivered", "received", "returned", "lost"]:
+                continue
+            if shipment.get("delivery_address") and shipment.get("pickup_address"):
+                continue
+            await notify_confirm_delivery_address(campaign, creator_id, in_app_only=True)
+
+
 @api_router.get("/notifications/my-notifications")
 async def get_my_notifications(current_user: dict = Depends(get_current_user)):
     """Get current user's in-app notifications.
@@ -15840,6 +15918,7 @@ async def get_my_notifications(current_user: dict = Depends(get_current_user)):
     both brands and creators. Derive the tag here from `created_by`: if an admin
     authored it, surface it as an admin message - retroactively, with no migration.
     """
+    await recover_missing_address_notifications(current_user)
     notifications = await db.in_app_notifications.find(
         {"user_id": current_user['id']},
         {"_id": 0}

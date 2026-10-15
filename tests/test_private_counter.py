@@ -47,7 +47,7 @@ def env(monkeypatch):
     def balance():
         return round(run(server.db.users.find_one({"id": brand})).get("balance", 0), 2)
 
-    def counter_and_accept(price, wallet=None, budget=1000):
+    def counter_and_accept(price, wallet=None, budget=1000, explicit=False):
         """Publish a private brief, approve it, creator counters at `price`, brand accepts."""
         # A private brief is priced at the creator's own rate, whatever the brand sends,
         # so `budget` is set as that rate.
@@ -69,10 +69,11 @@ def env(monkeypatch):
         orig_id = call("POST", "/campaigns", brand_t, json=payload).json()["campaign_id"]
         call("POST", "/admin/approve-campaign", admin_t, json={"item_id": orig_id, "action": "approve"})
         inv = run(server.db.chat_action_cards.find_one({"type": "private_invitation", "deal_id": orig_id}, {"_id": 0}))
-        card = call("POST", "/chat/action-cards", creator_t, json={"recipient_id": brand, "type": "counter_offer", "fields": {
-            "modified_price": price, "revisions": "1", "timeline": "7 days", "usage_rights": "Organic social",
+        card = call("POST", "/chat/action-cards", creator_t, json={"recipient_id": brand, "type": "counter_offer", "deal_id": orig_id if explicit else None, "fields": {
+            "modified_price": price, "revisions": "1", "timeline": "2027-02-10", "usage_rights": "Organic social",
             "diff_vs_original": "A different price because the brief asks for custom set design and a long script." * 2}}).json()["action_card"]
-        call("POST", f"/chat/action-cards/{inv['id']}/respond", creator_t, json={"action": "counter"})
+        if not explicit:
+            call("POST", f"/chat/action-cards/{inv['id']}/respond", creator_t, json={"action": "counter"})
         if wallet is not None:
             run(server.db.users.update_one({"id": brand}, {"$set": {"balance": wallet}}))
         before = balance()
@@ -121,3 +122,12 @@ def test_short_wallet_asks_for_top_up_and_creates_nothing(env):
     assert campaign["status"] != server.CampaignStatus.IN_PROGRESS
     assert env.run(env.db.escrow.count_documents({"status": "held"})) == 0
 
+
+
+def test_explicit_counter_keeps_original_campaign_and_agreed_date(env):
+    orig_id, _, resp = env.counter_and_accept(3000, explicit=True)
+    assert resp.status_code == 200, resp.text
+    campaigns = env.run(env.db.campaigns.find({}, {"_id": 0}).to_list(50))
+    assert len(campaigns) == 1 and campaigns[0]["id"] == orig_id
+    assert campaigns[0]["deadline"] == "2027-02-10"
+    assert campaigns[0]["draft_delivery_by"] == "2027-02-10"

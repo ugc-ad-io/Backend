@@ -157,3 +157,25 @@ async def test_one_combined_bid_covers_raw_and_edited_for_each_video(isolated):
     bid = campaign["bids"][0]
     assert bid["amount"] == 3000
     assert bid.get("raw_amount") is None and bid.get("edited_amount") is None
+
+
+@pytest.mark.asyncio
+async def test_accepting_a_private_brief_asks_both_parties_to_confirm_the_address(isolated, monkeypatch):
+    # A private brief already has its creator and reserved budget when it is posted, so
+    # accepting it used to hit activate_deal_from_card's early return and send nothing.
+    monkeypatch.setattr(server, "record_match_event", AsyncMock())
+    await isolated.users.insert_many([{"id": "brand", "role": "business", "balance": 100000},
+                                      {"id": "creator", "role": "creator"}])
+    await isolated.campaigns.insert_one({"id": "camp", "business_id": "brand", "title": "Tee", "visibility": "private",
+                                         "requires_shipment": True, "selected_creator": "creator", "status": "active"})
+    await isolated.escrow.insert_one({"id": "res", "campaign_id": "camp", "business_id": "brand", "status": "reserved",
+                                      "reserved_amount": 2070, "amount": 2070})
+    await isolated.chat_action_cards.insert_one({
+        "id": "card", "type": "private_invitation", "status": "open", "deal_id": "camp", "sender_id": "brand",
+        "recipient_id": "creator", "participants": ["brand", "creator"], "available_actions": ["accept"],
+        "fields": {"budget": 1800}, "created_at": server.now_iso()})
+    await server.respond_chat_action_card("card", server.ChatActionCardRespond(action="accept"),
+                                          {"id": "creator", "role": "creator"})
+    titles = {(call.args[0], call.args[1]) for call in server.notify_user.call_args_list}
+    assert ("creator", "Confirm your delivery address") in titles
+    assert ("brand", "Confirm product pickup and delivery details") in titles
