@@ -179,3 +179,42 @@ async def test_feed_polls_do_not_rescan_deals_every_time(database, monkeypatch):
     await server.get_my_notifications(user)
     await server.get_my_notifications(user)
     assert first > 0 and len(scans) == first
+
+
+@pytest.mark.asyncio
+async def test_notification_response_does_not_wait_for_recovery(database, monkeypatch):
+    from fastapi import BackgroundTasks
+    recovery = AsyncMock()
+    monkeypatch.setattr(server, "recover_missing_address_notifications", recovery)
+    tasks = BackgroundTasks()
+    assert await server.get_my_notifications({"id": "creator", "role": "creator"}, tasks) == []
+    recovery.assert_not_awaited()
+    await tasks()
+    recovery.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recovery_uses_fixed_batch_reads_for_many_shipped_deals(database, monkeypatch):
+    # Simulate a brand with 50 deals. Old recovery issued >=100 per-deal reads.
+    await database.campaigns.insert_many([{
+        "id": f"c{i}", "business_id": "brand", "selected_creator": f"creator-{i}",
+        "requires_shipment": True, "status": "in_progress", "booking_status": "accepted",
+    } for i in range(50)])
+    await database.shipments.insert_many([{
+        "campaign_id": f"c{i}", "creator_id": f"creator-{i}", "status": "shipped",
+    } for i in range(50)])
+    from types import SimpleNamespace
+    batches = []
+    collections = {}
+    for name in ["campaigns", "escrow", "chat_action_cards", "shipments", "in_app_notifications"]:
+        collection = database[name]
+        collections[name] = collection
+        original = collection.find
+        def counted(*args, _name=name, _find=original, **kwargs):
+            batches.append(_name)
+            return _find(*args, **kwargs)
+        monkeypatch.setattr(collection, "find", counted)
+        monkeypatch.setattr(collection, "find_one", AsyncMock(side_effect=AssertionError("Per-deal query")))
+    monkeypatch.setattr(server, "db", SimpleNamespace(**collections))
+    await server.recover_missing_address_notifications({"id": "brand", "role": "business"})
+    assert len(batches) == 5

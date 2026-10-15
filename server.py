@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Query, Request, Body
+from fastapi import BackgroundTasks, FastAPI, APIRouter, Depends, HTTPException, status, UploadFile, File, Query, Request, Body
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
@@ -15888,37 +15888,67 @@ async def recover_missing_address_notifications(current_user: dict):
         **owner, "requires_shipment": True, "status": {"$in": ["active", "in_progress"]},
         "booking_status": {"$nin": ["pending_creator", "price_revision", "declined"]},
     }, {"_id": 0}).to_list(200)
+    if not campaigns:
+        return
+    ids = [c["id"] for c in campaigns]
+    aliases = {key: c["id"] for c in campaigns for key in (c["id"], make_deal_id(c))}
+    # Batch reads: do not issue several queries for each of up to 200 campaigns.
+    escrows, cards, shipments, notifications = await asyncio.gather(
+        db.escrow.find({"campaign_id": {"$in": ids}, "status": "held"},
+                       {"_id": 0, "campaign_id": 1, "creator_id": 1}).to_list(None),
+        db.chat_action_cards.find({
+            "type": {"$in": ["private_invitation", "counter_offer", "custom_offer"]},
+            "status": {"$in": ["accept", "accepted"]},
+            "$or": [{"deal_id": {"$in": list(aliases)}}, {"deal_campaign_id": {"$in": ids}}],
+        }, {"_id": 0, "deal_id": 1, "deal_campaign_id": 1, "participants": 1}).to_list(None),
+        db.shipments.find({"campaign_id": {"$in": ids}},
+                         {"_id": 0, "campaign_id": 1, "creator_id": 1, "status": 1,
+                          "courier_status": 1, "delivery_address": 1, "pickup_address": 1}).to_list(None),
+        db.in_app_notifications.find({"category": "delivery_address", "user_id": {"$in": list({
+            uid for c in campaigns for uid in [c["business_id"], *selected_creator_ids(c)]})}},
+            {"_id": 0, "user_id": 1, "link": 1}).to_list(None),
+    )
+    funded = {(e.get("campaign_id"), e.get("creator_id")) for e in escrows}
+    accepted_by_campaign = {}
+    for card in cards:
+        cid = card.get("deal_campaign_id") or aliases.get(card.get("deal_id"))
+        accepted_by_campaign.setdefault(cid, []).append(set(card.get("participants") or []))
+    shipment_by_pair = {(sh.get("campaign_id"), sh.get("creator_id")): sh for sh in shipments}
+    notified = {(n.get("user_id"), n.get("link")) for n in notifications}
     for campaign in campaigns:
         for creator_id in selected_creator_ids(campaign):
             if role == UserRole.CREATOR and creator_id != current_user["id"]:
                 continue
-            # Private briefs name a creator before acceptance and hold a reservation.
-            # A reservation alone must never cause an address-confirmation request.
-            accepted = campaign.get("booking_status") == "accepted"
-            if not accepted:
-                accepted = await db.escrow.find_one({"campaign_id": campaign["id"],
-                    "creator_id": creator_id, "status": "held"}, {"_id": 0, "id": 1})
-            if not accepted:
-                accepted = await db.chat_action_cards.find_one({
-                    "type": {"$in": ["private_invitation", "counter_offer", "custom_offer"]},
-                    "status": {"$in": ["accept", "accepted"]},
-                    "participants": {"$all": [campaign["business_id"], creator_id]},
-                    "$or": [{"deal_id": {"$in": [campaign["id"], make_deal_id(campaign)]}},
-                            {"deal_campaign_id": campaign["id"]}],
-                }, {"_id": 0, "id": 1})
+            accepted = (campaign.get("booking_status") == "accepted"
+                        or (campaign["id"], creator_id) in funded
+                        or any({campaign["business_id"], creator_id}.issubset(participants)
+                               for participants in accepted_by_campaign.get(campaign["id"], [])))
             if not accepted:
                 continue
-            shipment = await find_shipment(campaign["id"], creator_id) or {}
+            shipment = (shipment_by_pair.get((campaign["id"], creator_id))
+                        or shipment_by_pair.get((campaign["id"], None))
+                        or shipment_by_pair.get((campaign["id"], "")) or {})
             if (shipment.get("status") or shipment.get("courier_status")) in [
                     "shipped", "in_transit", "delivered", "received", "returned", "lost"]:
                 continue
-            if shipment.get("delivery_address") and shipment.get("pickup_address"):
-                continue
-            await notify_confirm_delivery_address(campaign, creator_id, in_app_only=True)
+            creator_needed = (not shipment.get("delivery_address") and
+                (creator_id, f"/my-deals?campaign={campaign['id']}") not in notified)
+            brand_needed = (not shipment.get("pickup_address") and
+                (campaign["business_id"], f"/dashboard/business/campaign/{campaign['id']}?creator={creator_id}") not in notified)
+            if creator_needed or brand_needed:
+                await notify_confirm_delivery_address(campaign, creator_id, in_app_only=True)
+
+
+async def _recover_address_notifications_safely(current_user: dict):
+    try:
+        await recover_missing_address_notifications(current_user)
+    except Exception:
+        _address_recovery_ran_at.pop(current_user["id"], None)
+        logger.exception("Address notification recovery failed for user %s", current_user["id"])
 
 
 @api_router.get("/notifications/my-notifications")
-async def get_my_notifications(current_user: dict = Depends(get_current_user)):
+async def get_my_notifications(current_user: dict = Depends(get_current_user), background_tasks: BackgroundTasks = None):
     """Get current user's in-app notifications.
 
     The "Admin" chip is driven by `source == 'admin'`, which the broadcast endpoint
@@ -15927,7 +15957,10 @@ async def get_my_notifications(current_user: dict = Depends(get_current_user)):
     both brands and creators. Derive the tag here from `created_by`: if an admin
     authored it, surface it as an admin message - retroactively, with no migration.
     """
-    await recover_missing_address_notifications(current_user)
+    if background_tasks is not None:
+        background_tasks.add_task(_recover_address_notifications_safely, current_user)
+    else:
+        await recover_missing_address_notifications(current_user)
     notifications = await db.in_app_notifications.find(
         {"user_id": current_user['id']},
         {"_id": 0}
@@ -18618,7 +18651,7 @@ DB_INDEXES = {
     "campaigns": ["id", "business_id", "status", "selected_creator", "selected_creators"],
     "escrow": ["campaign_id", "id"],
     "work_submissions": ["campaign_id", "id", "creator_id"],
-    "chat_action_cards": ["id", "participants", "deal_id"],
+    "chat_action_cards": ["id", "participants", "deal_id", "deal_campaign_id"],
     "business_settings": ["business_id"],
     "disputes": ["id", "campaign_id"],
     "deal_content_submissions": ["campaign_id"],
