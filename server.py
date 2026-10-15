@@ -11002,8 +11002,80 @@ async def build_deal_rows(deal_ids_per_campaign: List[List[str]], current_user: 
     return [row for rows in groups for row in rows]
 
 
+async def creator_deal_summaries(campaigns: List[dict], creator_id: str, *, settle_due: bool = True) -> list:
+    """List cards need state and price, not chat, activity, content or revision history."""
+    if not campaigns:
+        return []
+    ids = [c["id"] for c in campaigns]
+    brands, works, escrows, shipments, receipts, cards = await asyncio.gather(
+        db.users.find({"id": {"$in": list({c.get("business_id") for c in campaigns})}},
+                      {"_id": 0, "id": 1, "nickname": 1, "business_name": 1,
+                       "profile.business_name": 1, "profile.logo": 1, "logo": 1, "profile_photo": 1}).to_list(None),
+        db.work_submissions.find({"campaign_id": {"$in": ids}}, {"_id": 0}).sort("submitted_at", -1).to_list(None),
+        db.escrow.find({"campaign_id": {"$in": ids}}, {"_id": 0}).to_list(None),
+        db.shipments.find({"campaign_id": {"$in": ids}}, {"_id": 0}).to_list(None),
+        db.deal_receipts.find({"campaign_id": {"$in": ids}}, {"_id": 0}).to_list(None),
+        db.deal_action_cards.find({"campaign_id": {"$in": ids}, "status": "open",
+            "type": {"$in": ["damage_report", "raise_dispute", "escalate_to_admin"]}}, {"_id": 0}).to_list(None),
+    )
+    # Keep lazy payouts/auto-approval working, but only settle campaigns that are due.
+    if settle_due:
+        now = datetime.now(timezone.utc)
+        due = {e["campaign_id"] for e in escrows if e.get("payout_status") == "scheduled"
+               and parse_iso(e.get("payout_scheduled_at")) and parse_iso(e["payout_scheduled_at"]) <= now}
+        approval_days = int(platform_setting("auto_approval_days", AUTO_APPROVE_DAYS))
+        due.update(w["campaign_id"] for w in works if w.get("status") == WorkStatus.SUBMITTED
+                   and parse_iso(w.get("submitted_at") or w.get("created_at"))
+                   and (now - parse_iso(w.get("submitted_at") or w.get("created_at"))).days >= approval_days)
+        if due:
+            # Sequential within this request, preserving the existing settlement behavior.
+            for campaign in campaigns:
+                if campaign["id"] in due:
+                    await settle_deal_lazily(campaign)
+            refreshed = {c["id"]: c for c in await db.campaigns.find(
+                {"id": {"$in": list(due)}}, {"_id": 0}).to_list(None)}
+            return await creator_deal_summaries([refreshed.get(c["id"], c) for c in campaigns], creator_id, settle_due=False)
+    brand_by_id = {b["id"]: b for b in brands}
+    def grouped(rows):
+        result = {}
+        for row in rows:
+            result.setdefault(row.get("campaign_id"), []).append(row)
+        return result
+    work_by_campaign, escrow_by_campaign, shipment_by_campaign, receipt_by_campaign, cards_by_campaign = map(
+        grouped, [works, escrows, shipments, receipts, cards])
+    def own(rows, campaign, *, fallback=False):
+        candidates = rows.get(campaign["id"], [])
+        exact = next((r for r in candidates if r.get("creator_id") == creator_id), None)
+        return exact or (next(iter(candidates), None) if fallback and len(selected_creator_ids(campaign)) <= 1 else None)
+    rows = []
+    for campaign in campaigns:
+        work = own(work_by_campaign, campaign)
+        escrow = own(escrow_by_campaign, campaign, fallback=True)
+        shipment = own(shipment_by_campaign, campaign, fallback=True)
+        receipt = own(receipt_by_campaign, campaign, fallback=True)
+        own_cards = [card for card in cards_by_campaign.get(campaign["id"], [])
+                     if not card.get("creator_id") or card.get("creator_id") == creator_id]
+        state = compute_deal_state(campaign, shipment, normalize_receipt(shipment, receipt), work, escrow, own_cards)
+        bid = next((b for b in campaign.get("bids", []) if b.get("creator_id") == creator_id), None)
+        brand = brand_by_id.get(campaign.get("business_id")) or {}
+        profile = brand.get("profile") or {}
+        rows.append({
+            "deal_id": person_deal_id(campaign, creator_id),
+            "campaign": {key: campaign[key] for key in ["id", "title", "brand_name", "business_name",
+                "business_nickname", "brand_logo_url", "budget_max", "budget_min", "booking_status",
+                "brief_sent", "direct_booking", "status"] if key in campaign},
+            "creator": {"id": creator_id},
+            "brand": {"id": brand.get("id"), "name": profile.get("business_name") or brand.get("business_name") or brand.get("nickname"),
+                      "logo_url": profile.get("logo") or brand.get("logo") or brand.get("profile_photo")},
+            "escrow": normalize_escrow(escrow, bid, state["current_state"]),
+            "my_bid": {"amount": bid.get("amount")} if bid else None,
+            **state,
+        })
+    return rows
+
+
 @api_router.get("/deals/my")
-async def get_my_deals(current_user: dict = Depends(get_current_user)):
+async def get_my_deals(current_user: dict = Depends(get_current_user), summary: bool = False):
     if current_user['role'] != UserRole.CREATOR:
         raise HTTPException(status_code=403, detail="Only creators can access this")
 
@@ -11032,6 +11104,8 @@ async def get_my_deals(current_user: dict = Depends(get_current_user)):
     }, {"_id": 0}).to_list(100)
 
     # This creator's own deal on each campaign (get_deal_context resolves it to the viewer).
+    if summary:
+        return await creator_deal_summaries(campaigns, current_user["id"])
     return await build_deal_rows([[person_deal_id(c, current_user['id'])] for c in campaigns], current_user)
 
 @api_router.get("/deals/business")
@@ -11424,6 +11498,15 @@ async def submit_revision_response(deal_id: str, data: DealRevisionResponseSubmi
         )
 
     return {"message": "Revision response submitted", "response": data.response, "dispute_id": None}
+
+@api_router.get("/deals/{deal_id}/detail")
+async def get_single_deal(deal_id: str, current_user: dict = Depends(get_current_user)):
+    context = await get_deal_context(deal_id, current_user)
+    if current_user.get("role") == UserRole.CREATOR and context["campaign"].get("status") in [
+            CampaignStatus.DRAFT, CampaignStatus.PENDING_APPROVAL, CampaignStatus.REJECTED]:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    return await build_deal_response(context, current_user)
+
 
 @api_router.get("/deals/{deal_id}/chat")
 async def get_deal_chat(deal_id: str, current_user: dict = Depends(get_current_user)):
