@@ -54,3 +54,13 @@ def test_paused_tds_flows_through_payout_wallet_invoice_and_receipt(monkeypatch)
         assert await database.payout_receipts.count_documents({}) == 1
         assert (await database.wallet_ledger.find_one({"user_id": "creator"}))['amount'] == 800
     asyncio.run(scenario())
+
+
+def test_brand_checkout_has_only_deal_value_and_platform_fee(monkeypatch):
+    import server
+    monkeypatch.delenv("TDS_WITHHOLDING_ENABLED", raising=False)
+    quote = server.quote_brief({"profile": {"rate_card": {"raw_payout": "1000"}}}, 1)
+    assert quote['subtotal'] == 1000
+    assert quote['fee'] == 200
+    assert quote['total'] == 1200
+    assert quote.get('tds_amount', 0) == 0
