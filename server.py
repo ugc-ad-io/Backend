@@ -9853,6 +9853,12 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
     else:
         raw_files, edited_files = data.raw_files, data.edited_files
 
+    previous = await db.work_submissions.find_one({
+        "campaign_id": data.campaign_id, "creator_id": current_user['id'], "stage": stage,
+    }, sort=[("submitted_at", -1)])
+    if previous and previous.get('status') == WorkStatus.SUBMITTED:
+        return {"message": "Work already submitted", "stage": stage}
+
     submitted_at = datetime.now(timezone.utc).isoformat()
     watermark = cf.build_watermark_record(primary_file, "video", uploads_dir)
     work_doc = {
@@ -9870,7 +9876,11 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         "watermark": watermark,
         "revisions": []
     }
-    await db.work_submissions.insert_one(work_doc)
+    claim = await db.work_submissions.update_one(
+        {"_id": f"work:{data.campaign_id}:{current_user['id']}:{stage}:{(previous or {}).get('id', 'first')}"},
+        {"$setOnInsert": work_doc}, upsert=True)
+    if not claim.upserted_id:
+        return {"message": "Work already submitted", "stage": stage}
 
     # Same per-version record /deals/{id}/content writes. approve_work's payout gate
     # (deliverables_progress), the version history and revision tracking all read
@@ -9998,6 +10008,7 @@ async def download_work(
     work_id: str,
     as_link: bool = False,
     name: Optional[str] = None,
+    asset: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
 ):
     """Download the delivered file. Allowed for the brand on the campaign, the
@@ -10058,6 +10069,13 @@ async def download_work(
             {"campaign_id": work.get("campaign_id")}, {"_id": 0}, sort=[("version", -1)]
         ) or {}
         url = sub.get("original_url") or sub.get("video_url")
+    if asset is not None:
+        if asset not in ("raw", "edited"):
+            raise HTTPException(status_code=400, detail="Choose raw or edited")
+        labeled = cf.to_brand_facing_asset(work, approved=True).get("files") or []
+        url = next((f['url'] for f in labeled if f.get('kind') == asset), None)
+        if not url:
+            raise HTTPException(status_code=404, detail=f"No {asset} file for this submission")
     if not url:
         raise HTTPException(status_code=404, detail="No downloadable file for this work")
     # Files live on S3, Cloudinary (older uploads) or /uploads.
@@ -11256,6 +11274,9 @@ async def submit_deal_receipt(deal_id: str, data: DealReceiptSubmit, current_use
         if not data.unboxing_video_url:
             raise HTTPException(status_code=400, detail="Upload an unboxing video before marking the parcel received")
 
+    receipt_key = {"campaign_id": campaign['id'], "creator_id": current_user['id']}
+    if await db.deal_receipts.find_one(receipt_key):
+        return {"message": "Receipt already submitted"}
     received_at = data.received_at or now_iso()
     receipt_doc = {
         "id": str(uuid.uuid4()),
@@ -11268,11 +11289,12 @@ async def submit_deal_receipt(deal_id: str, data: DealReceiptSubmit, current_use
         "damage_report": data.damage_report,
         "created_at": now_iso()
     }
-    await db.deal_receipts.update_one(
-        {"campaign_id": campaign['id'], "creator_id": current_user['id']},
-        {"$set": receipt_doc},
-        upsert=True
+    claim = await db.deal_receipts.update_one(
+        {"_id": f"receipt:{campaign['id']}:{current_user['id']}"},
+        {"$setOnInsert": receipt_doc}, upsert=True,
     )
+    if not claim.upserted_id:
+        return {"message": "Receipt already submitted"}
     shipment_update = {
         "status": "received",
         "received_at": received_at,
@@ -11366,6 +11388,13 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
             detail=f"deliverable_index {deliverable_index} is out of range - this brief requires {required_total} deliverable(s).",
         )
 
+    previous = await db.deal_content_submissions.find_one({
+        "campaign_id": campaign['id'], "creator_id": current_user['id'],
+        "deliverable_index": deliverable_index, "stage": stage,
+    }, sort=[("version", -1)])
+    if previous and previous.get("status") == "submitted":
+        return {"message": "Content already submitted", "version": previous['version'], "stage": stage}
+
     existing_versions = await db.deal_content_submissions.count_documents({
         "campaign_id": campaign['id'],
         "creator_id": current_user['id'],
@@ -11402,7 +11431,12 @@ async def submit_deal_content(deal_id: str, data: DealContentSubmit, current_use
         moderation = check_contact_info_policy(data.creator_note)
         if not moderation.get("safe"):
             raise HTTPException(status_code=400, detail={"message": "Your note to the brand contains contact information, which cannot be shared.", "violations": moderation.get("violations", [])})
-    await db.deal_content_submissions.insert_one(submission)
+    claim = await db.deal_content_submissions.update_one(
+        {"_id": f"content:{campaign['id']}:{current_user['id']}:{deliverable_index}:{stage}:{(previous or {}).get('id', 'first')}"},
+        {"$setOnInsert": submission}, upsert=True,
+    )
+    if not claim.upserted_id:
+        return {"message": "Content already submitted", "version": version, "stage": stage}
     work_doc = {
         "id": str(uuid.uuid4()),
         "campaign_id": campaign['id'],
@@ -13009,8 +13043,8 @@ async def get_work_by_id(work_id: str, current_user: dict = Depends(get_current_
 async def submit_review(data: ReviewSubmit, current_user: dict = Depends(get_current_user)):
     if current_user.get('role') not in (UserRole.CREATOR, UserRole.BUSINESS):
         raise HTTPException(status_code=403, detail="Only creators and brands can submit collaboration reviews")
-    if not 1 <= data.rating <= 5 or not data.review.strip():
-        raise HTTPException(status_code=400, detail="A rating from 1 to 5 and review text are required")
+    if not 1 <= data.rating <= 5:
+        raise HTTPException(status_code=400, detail="A rating from 1 to 5 is required")
     rates_brand = bool(data.business_id) and current_user.get('role') == UserRole.CREATOR
     campaign = await db.campaigns.find_one({"id": data.campaign_id})
     if not campaign:
@@ -13026,6 +13060,9 @@ async def submit_review(data: ReviewSubmit, current_user: dict = Depends(get_cur
     if not escrow and len(selected_creator_ids(campaign)) == 1:
         escrow = await db.escrow.find_one({"campaign_id": data.campaign_id})
     completed = campaign.get('status') == CampaignStatus.COMPLETED or (escrow or {}).get('status') == 'released'
+    if await db.work_submissions.count_documents({"campaign_id": data.campaign_id, "creator_id": creator_id,
+                                                 "status": WorkStatus.AWAITING_EDIT}):
+        completed = False
     if not completed:
         raise HTTPException(status_code=400, detail="You can review only after your deal is completed")
     # A creator can review a brand ONLY after that deal is completed, and only for a
@@ -13156,6 +13193,15 @@ async def receive_shipment(data: ShipmentReceive, current_user: dict = Depends(g
 
     # A creator only ever acts on their own shipment — never trust a client-supplied id here.
     creator_id = current_user['id']
+    if await db.deal_receipts.find_one({"campaign_id": data.campaign_id, "creator_id": creator_id}):
+        return {"message": "Shipment already marked as received"}
+    claim = await db.deal_receipts.update_one(
+        {"_id": f"receipt:{data.campaign_id}:{creator_id}"},
+        {"$setOnInsert": {"id": str(uuid.uuid4()), "campaign_id": data.campaign_id,
+                          "creator_id": creator_id, "received_at": now_iso(),
+                          "unboxing_video_url": data.unboxing_video}}, upsert=True)
+    if not claim.upserted_id:
+        return {"message": "Shipment already marked as received"}
     update_data = {
         "status": "received",
         "unboxing_video": data.unboxing_video,
@@ -17723,6 +17769,27 @@ async def admin_shipping_requests(current_user: dict = Depends(require_cap("mana
             })
     rows.sort(key=lambda r: r.get("requested_at") or "")
     return rows
+
+
+@api_router.post("/admin/shipping/{campaign_id}/remind-address")
+async def admin_remind_shipping_address(campaign_id: str, creator_id: Optional[str] = None,
+                                       current_user: dict = Depends(require_cap("manage_shipping"))):
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    target = resolve_shipment_creator_id(campaign, current_user, creator_id)
+    shipment = await find_shipment(campaign_id, target) or {}
+    recipients = []
+    if not shipment.get("pickup_address"):
+        recipients.append((campaign['business_id'], "/dashboard/business/shipments"))
+    if not shipment.get("delivery_address"):
+        recipients.append((target, "/my-deals"))
+    for recipient, link in recipients:
+        await notify_user(recipient, "Confirm your shipping address",
+                          f"Please fill and confirm your shipping address ASAP for {campaign.get('title', 'your campaign')} so we can dispatch the product.", link=link)
+    await log_admin_action(current_user, "shipping.address_reminder", target_type="deal", target_id=campaign_id,
+                           after={"creator_id": target, "recipients": [r[0] for r in recipients]})
+    return {"message": "Address reminder sent" if recipients else "Both addresses are already confirmed"}
 
 
 @api_router.post("/admin/shipping/{campaign_id}/generate-label")
