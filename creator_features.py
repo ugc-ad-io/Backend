@@ -19,6 +19,7 @@ gating, which is the security-critical part).
 
 from __future__ import annotations
 
+import os
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -192,14 +193,15 @@ def payout_delay_days(level: Optional[str]) -> int:
     return PAYOUT_DELAY_DAYS_BY_LEVEL.get(normalize_level(level), 12)
 
 
-# TDS (Tax Deducted at Source): 10% on professional services under Indian law.
+# Automatic TDS is paused until applicable withholding rules are confirmed.
 TDS_RATE = 0.10
 
 
 def compute_tds(gross_amount: float, exempt: bool = False) -> float:
     """TDS owed on a gross payout. `exempt` reflects the creator's declared tax
     status (e.g. below-threshold / exempt). Returns rounded INR."""
-    if exempt or not gross_amount or gross_amount <= 0:
+    enabled = os.environ.get("TDS_WITHHOLDING_ENABLED", "false").strip().lower() in {"true", "1", "yes"}
+    if not enabled or exempt or not gross_amount or gross_amount <= 0:
         return 0.0
     return round(float(gross_amount) * TDS_RATE, 2)
 
