@@ -10532,7 +10532,8 @@ async def release_scheduled_payout(escrow: dict) -> bool:
         logger.error("release_scheduled_payout: no resolvable creator_id for escrow %s", escrow.get('id'))
         return False
     gross = float(escrow.get('gross_amount') or escrow.get('amount') or 0)
-    tds = float(escrow.get('tds_amount') or 0)
+    stored_tds = float(escrow.get('tds_amount') or 0)
+    tds = stored_tds if cf.tds_withholding_enabled() else 0.0
     penalty = float(escrow.get('penalty_amount') or 0)
     commission = float(escrow.get('commission_amount') if escrow.get('commission_amount') is not None else creator_commission(gross))
     revision_credit = float(escrow.get('revision_credit_owed') or 0)
@@ -10542,11 +10543,22 @@ async def release_scheduled_payout(escrow: dict) -> bool:
     claimed = await db.escrow.update_one(
         {"id": escrow['id'], "payout_status": "scheduled", "status": {"$ne": "released"}},
         {"$set": {"status": "released", "payout_status": "released", "released_at": now, "net_payable": net,
-                  "revision_credit_paid": revision_credit}})
+                  "revision_credit_paid": revision_credit, "tds_amount": tds,
+                  "deductions": [dict(item, amount=tds) if str(item.get('label', '')).lower() == 'tds' else item
+                                 for item in (escrow.get('deductions') or [])]}})
     if claimed.modified_count != 1:
         return False
     if creator_id:
         await db.users.update_one({"id": creator_id}, {"$inc": {"balance": net}})
+    # Align this unpaid deal's latest invoice with the amount actually released.
+    # Earlier settled receipts and wallet entries are never rewritten.
+    if stored_tds != tds:
+        invoice = await db.invoices.find_one(
+            {"campaign_id": campaign['id'], "creator_id": creator_id},
+            sort=[("created_at", -1)])
+        if invoice and invoice.get('id'):
+            await db.invoices.update_one({"id": invoice['id']},
+                {"$set": {"tds_amount": tds, "net_to_creator": net}})
     # Half of any late penalty is credited to the brand as goodwill (PRD 8.8).
     brand_credit = float(escrow.get('penalty_brand_credit') or 0)
     if brand_credit > 0 and campaign.get('business_id'):

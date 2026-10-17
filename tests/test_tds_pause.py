@@ -64,3 +64,34 @@ def test_brand_checkout_has_only_deal_value_and_platform_fee(monkeypatch):
     assert quote['fee'] == 200
     assert quote['total'] == 1200
     assert quote.get('tds_amount', 0) == 0
+
+
+def test_previously_scheduled_payout_drops_saved_tds_when_released(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from mongomock_motor import AsyncMongoMockClient
+    import server
+    db = AsyncMongoMockClient()["previously_scheduled"]
+    monkeypatch.setattr(server, "db", db)
+    monkeypatch.setenv("TDS_WITHHOLDING_ENABLED", "false")
+    monkeypatch.setattr(server, "notify_event", AsyncMock())
+    monkeypatch.setattr(server, "insert_deal_activity", AsyncMock())
+    async def scenario():
+        await db.campaigns.insert_one({"id": "c", "business_id": "brand", "selected_creator": "creator"})
+        await db.users.insert_one({"id": "creator", "balance": 0})
+        escrow = {"id": "e", "campaign_id": "c", "creator_id": "creator", "amount": 1000,
+                  "status": "held", "payout_status": "scheduled", "tds_amount": 100,
+                  "commission_amount": 200, "net_payable": 700, "deductions": [{"label": "TDS", "amount": 100}]}
+        await db.escrow.insert_one(dict(escrow))
+        await db.invoices.insert_one({"id": "i", "campaign_id": "c", "creator_id": "creator", "tds_amount": 100, "net_to_creator": 700})
+        assert await server.release_scheduled_payout(escrow)
+        assert (await db.users.find_one({"id": "creator"}))['balance'] == 800
+        updated = await db.escrow.find_one({"id": "e"})
+        assert updated['tds_amount'] == 0 and updated['net_payable'] == 800
+        assert updated['deductions'][0]['amount'] == 0
+        assert (await db.invoices.find_one({"id": "i"}))['net_to_creator'] == 800
+        receipt = await db.payout_receipts.find_one({"campaign_id": "c"})
+        assert receipt['tds_amount'] == 0 and receipt['net_amount'] == 800
+        assert not await server.release_scheduled_payout(escrow)
+        assert (await db.users.find_one({"id": "creator"}))['balance'] == 800
+    asyncio.run(scenario())

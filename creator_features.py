@@ -197,10 +197,14 @@ def payout_delay_days(level: Optional[str]) -> int:
 TDS_RATE = 0.10
 
 
+def tds_withholding_enabled() -> bool:
+    return os.environ.get("TDS_WITHHOLDING_ENABLED", "false").strip().lower() in {"true", "1", "yes"}
+
+
 def compute_tds(gross_amount: float, exempt: bool = False) -> float:
     """TDS owed on a gross payout. `exempt` reflects the creator's declared tax
     status (e.g. below-threshold / exempt). Returns rounded INR."""
-    enabled = os.environ.get("TDS_WITHHOLDING_ENABLED", "false").strip().lower() in {"true", "1", "yes"}
+    enabled = tds_withholding_enabled()
     if not enabled or exempt or not gross_amount or gross_amount <= 0:
         return 0.0
     return round(float(gross_amount) * TDS_RATE, 2)
