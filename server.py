@@ -6635,6 +6635,34 @@ async def remove_saved_brief(campaign_id: str, current_user: dict = Depends(get_
     await db.users.update_one({"id": current_user["id"]}, {"$pull": {"saved_briefs": campaign_id}})
     return {"saved": False}
 
+# ---- Saved creators (brand shortlist of creators, was localStorage-only) ------------
+# Stored on the brand workspace owner so every team member sees the same list.
+@api_router.get("/business/saved-creators")
+async def list_saved_creators(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only brands can save creators")
+    owner = await db.users.find_one({"id": _brand_ws_id(current_user)}, {"_id": 0, "saved_creators": 1})
+    return {"creator_ids": (owner or {}).get("saved_creators") or []}
+
+
+@api_router.post("/business/saved-creators/{creator_id}")
+async def add_saved_creator(creator_id: str, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only brands can save creators")
+    if not await db.users.find_one({"id": creator_id, "role": UserRole.CREATOR}, {"_id": 1}):
+        raise HTTPException(status_code=404, detail="Creator not found")
+    await db.users.update_one({"id": _brand_ws_id(current_user)}, {"$addToSet": {"saved_creators": creator_id}})
+    return {"saved": True}
+
+
+@api_router.delete("/business/saved-creators/{creator_id}")
+async def remove_saved_creator(creator_id: str, current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != UserRole.BUSINESS:
+        raise HTTPException(status_code=403, detail="Only brands can save creators")
+    await db.users.update_one({"id": _brand_ws_id(current_user)}, {"$pull": {"saved_creators": creator_id}})
+    return {"saved": False}
+
+
 class ChangePasswordBody(BaseModel):
     old_password: str
     new_password: str
@@ -8291,6 +8319,10 @@ You can now communicate directly with {creator_display} to coordinate the work. 
         "creators_hired": len(already) + 1,
         "slots_left": max(0, slots_left),
         "fully_staffed": fully_staffed,
+        # What the brand paid for this hire (budget + brand commission), and whether the money was
+        # really taken: funded=False means the wallet was short and the clients should prompt a recharge.
+        "amount_charged": brand_total,
+        "funded": funded,
     }
 
 
