@@ -5686,9 +5686,10 @@ async def update_business_settings_company(
     company_data = data.dict()
     require_non_empty(company_data, ["business_type", "business_category", "country", "billing_address", "city", "state"])
     company_data["pincode"] = re.sub(r"\D", "", str(company_data.get("pincode") or ""))[:6]
-    validate_choice(company_data.get("kyb_status"), ["pending", "verified", "rejected"], "kyb_status")
-    if not company_data.get("kyb_status"):
-        company_data["kyb_status"] = business_company_defaults(current_user).get("kyb_status", "pending")
+    # kyb_status is derived from the admin's approval of the brand (business_company_defaults), never taken from the client:
+    # a brand must not be able to mark itself "verified".
+    company_data.pop("kyb_status", None)
+    company_data["kyb_status"] = business_company_defaults(current_user).get("kyb_status", "pending")
 
     now = datetime.now(timezone.utc).isoformat()
     await db.business_settings.update_one(
@@ -6634,9 +6635,27 @@ async def remove_saved_brief(campaign_id: str, current_user: dict = Depends(get_
     await db.users.update_one({"id": current_user["id"]}, {"$pull": {"saved_briefs": campaign_id}})
     return {"saved": False}
 
+class ChangePasswordBody(BaseModel):
+    old_password: str
+    new_password: str
+
+
 @api_router.post("/profile/change-password")
-async def change_password(old_password: str, new_password: str, current_user: dict = Depends(get_current_user)):
-    """Change user password"""
+async def change_password(
+    old_password: Optional[str] = None,
+    new_password: Optional[str] = None,
+    body: Optional[ChangePasswordBody] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Change user password.
+
+    Send the passwords in the JSON body: URLs end up in access logs and browser history.
+    The query parameters still work so a client that was not updated yet keeps working.
+    """
+    if body is not None:
+        old_password, new_password = body.old_password, body.new_password
+    if not old_password or not new_password:
+        raise HTTPException(status_code=422, detail="old_password and new_password are required")
     # Get user from database
     user = await db.users.find_one({"id": current_user['id']})
     if not user:
