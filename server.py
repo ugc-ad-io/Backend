@@ -18368,6 +18368,7 @@ async def payout_overview(current_user: dict = Depends(get_current_user)):
     kyc = current_user.get("kyc") or {}
 
     return {
+        "min_withdrawal": MIN_WITHDRAWAL_AMOUNT,  # so no client has to hard-code it
         "balance": balance,
         "pending_release": pending,
         "paid_this_month": paid_this_month,

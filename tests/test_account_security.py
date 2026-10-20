@@ -65,3 +65,11 @@ async def test_a_brand_cannot_mark_its_own_company_verified(isolated):
     approved = {**brand, "approval_status": server.ApprovalStatus.APPROVED}
     await server.update_business_settings_company(data, approved)
     assert (await isolated.business_settings.find_one({"business_id": "b1"}))["company"]["kyb_status"] == "verified"
+
+
+@pytest.mark.asyncio
+async def test_payout_overview_publishes_the_minimum_withdrawal(isolated):
+    creator = {"id": "c1", "role": "creator"}
+    await isolated.users.insert_one(dict(creator))
+    overview = await server.payout_overview(current_user=creator)
+    assert overview["min_withdrawal"] == server.MIN_WITHDRAWAL_AMOUNT
