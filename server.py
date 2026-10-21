@@ -415,6 +415,10 @@ class WorkSubmission(BaseModel):
     # delivered".
     edited_files: List[str] = []
     raw_files: List[str] = []
+    # Only needed when the brief asks for a caption / script or a thumbnail; the
+    # endpoint then rejects a submission without them (same rule as /deals/{id}/content).
+    caption_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
 
 class ReviewSubmit(BaseModel):
     campaign_id: str
@@ -9924,6 +9928,19 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
     if stage == 'ugc_editing':
         raise HTTPException(status_code=400, detail="Your raw video is approved - UGC.ad's team is editing it. There's nothing more to submit.")
     files = [f for f in (data.work_files or []) if f]
+    # Same required-asset rule as /deals/{id}/content: a brief that asks for a caption /
+    # script or a thumbnail cannot be submitted without it.
+    required = get_required_assets(campaign)
+    missing = []
+    if required['caption_script'] and not data.caption_url:
+        missing.append('caption_url')
+    if required['thumbnail'] and not data.thumbnail_url:
+        missing.append('thumbnail_url')
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required assets: {', '.join(missing)}")
+    # The extras ride along in work_files (after the video, which must stay first) just
+    # like /deals/{id}/content stores them.
+    all_files = list(data.work_files) + [u for u in (data.caption_url, data.thumbnail_url) if u and u not in data.work_files]
     if stage == 'raw':
         raw_files, edited_files = (data.raw_files or files), []
     elif stage == 'edited':
@@ -9945,7 +9962,9 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         "creator_id": current_user['id'],
         "deliverable_index": 0,
         "stage": stage,
-        "work_files": data.work_files,
+        "work_files": all_files,
+        "caption_url": data.caption_url,
+        "thumbnail_url": data.thumbnail_url,
         "edited_files": edited_files,
         "raw_files": raw_files,
         "description": data.description,
@@ -9975,6 +9994,8 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
         "stage": stage,
         "version": version,
         "video_url": (edited_files or files or [None])[0],
+        "caption_url": data.caption_url,
+        "thumbnail_url": data.thumbnail_url,
         "raw_footage_url": (raw_files or [None])[0],
         "original_url": primary_file,
         "watermark": watermark,
@@ -9991,11 +10012,12 @@ async def submit_work(data: WorkSubmission, current_user: dict = Depends(get_cur
             "work_submission": {
                 "id": work_doc["id"],
                 "creator_id": current_user['id'],
-                "work_files": data.work_files,
+                "work_files": all_files,
                 "edited_files": edited_files,
                 "raw_files": raw_files,
                 "stage": stage,
                 "video_url": primary_file,
+                "thumbnail_url": data.thumbnail_url,
                 "creator_note": data.description,
                 "submitted_at": work_doc["submitted_at"],
                 "version": version,
