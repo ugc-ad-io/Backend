@@ -6152,6 +6152,21 @@ def _is_established_member(user: dict) -> bool:
     )
 
 
+def _resubmission_fields(current_user: dict, now_str: str) -> dict:
+    """Fields that put a profile the admin sent back ("more info needed") into the review queue again.
+
+    Only /profile/creator and /profile/business used to do this, so a creator who answered the
+    request by adding portfolio samples or editing their details stayed on "more information
+    needed" forever. Any edit that answers the request now resubmits it; an approved, pending or
+    rejected profile is left alone.
+    """
+    if current_user.get("approval_status") != ApprovalStatus.MORE_INFO:
+        return {}
+    review = dict(current_user.get("review") or {})
+    review["resubmitted_at"] = now_str
+    return {"approval_status": ApprovalStatus.PENDING, "review": review}
+
+
 @api_router.put("/profile/creator")
 async def update_creator_profile(data: CreatorProfileUpdate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] != UserRole.CREATOR:
@@ -6254,15 +6269,21 @@ async def update_portfolio(portfolio: List[Any], current_user: dict = Depends(ge
             item = {**item, "original_url": asset_url, "watermark": cf.build_watermark_record(asset_url, kind, uploads_dir)}
         enriched.append(item)
 
+    now_str = datetime.now(timezone.utc).isoformat()
+    resubmitted = _resubmission_fields(current_user, now_str)
     await db.users.update_one(
         {"id": current_user['id']},
         {"$set": {
             "portfolio": enriched,
-            "updated_at": datetime.now(timezone.utc).isoformat()
+            "updated_at": now_str,
+            **resubmitted,
         }}
     )
 
-    return {"message": "Portfolio updated successfully", "count": len(enriched)}
+    result = {"message": "Portfolio updated successfully", "count": len(enriched)}
+    if resubmitted:
+        result["approval_status"] = ApprovalStatus.PENDING
+    return result
 
 @api_router.put("/profile/business")
 async def update_business_profile(data: BusinessProfileUpdate, current_user: dict = Depends(get_current_user)):
@@ -6457,7 +6478,10 @@ async def update_profile_info(
     """Update basic profile information without affecting approval status.
     `language` accepts multiple values, e.g. ?language=English&language=Hindi
     """
-    update_data = {"updated_at": datetime.now(timezone.utc).isoformat()}
+    now_str = datetime.now(timezone.utc).isoformat()
+    update_data = {"updated_at": now_str}
+    resubmitted = _resubmission_fields(current_user, now_str)
+    update_data.update(resubmitted)
 
     if bio is not None:
         update_data["bio"] = bio
@@ -6478,7 +6502,10 @@ async def update_profile_info(
         {"$set": update_data}
     )
 
-    return {"message": "Profile updated successfully"}
+    result = {"message": "Profile updated successfully"}
+    if resubmitted:
+        result["approval_status"] = ApprovalStatus.PENDING
+    return result
 
 
 @api_router.put("/profile/payment-info")

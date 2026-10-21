@@ -73,3 +73,26 @@ async def test_payout_overview_publishes_the_minimum_withdrawal(isolated):
     await isolated.users.insert_one(dict(creator))
     overview = await server.payout_overview(current_user=creator)
     assert overview["min_withdrawal"] == server.MIN_WITHDRAWAL_AMOUNT
+
+
+@pytest.mark.asyncio
+async def test_answering_a_more_info_request_resubmits_the_profile(isolated, monkeypatch):
+    monkeypatch.setattr(server.cf, "validate_portfolio", lambda items: (True, ""))
+    monkeypatch.setattr(server.cf, "build_watermark_record", lambda *a, **k: {})
+    creator = {"id": "c9", "role": "creator", "approval_status": "more_info",
+               "review": {"more_info_message": "Add samples", "more_info_items": ["3 clips"]}}
+    await isolated.users.insert_one(dict(creator))
+    result = await server.update_portfolio([{"video_url": "/uploads/1.mp4"}], creator)
+    stored = await isolated.users.find_one({"id": "c9"})
+    assert result["approval_status"] == "pending" and stored["approval_status"] == "pending"
+    assert stored["review"]["more_info_message"] == "Add samples" and stored["review"]["resubmitted_at"]
+
+    await isolated.users.update_one({"id": "c9"}, {"$set": {"approval_status": "more_info"}})
+    info = await server.update_profile_info(bio="Hello", language=None, current_user=creator)
+    assert info["approval_status"] == "pending"
+
+
+def test_resubmission_only_touches_more_info_profiles():
+    for status in ("approved", "pending", "rejected"):
+        assert server._resubmission_fields({"approval_status": status}, "now") == {}
+    assert server._resubmission_fields({"approval_status": "more_info"}, "now")["approval_status"] == "pending"
