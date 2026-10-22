@@ -15,7 +15,7 @@ def isolated(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_creator_counteroffer_notifies_brand_with_campaign_room_link(isolated, monkeypatch):
+async def test_creator_counteroffer_notifies_brand_with_a_link_to_the_chat(isolated, monkeypatch):
     monkeypatch.setattr(server, 'validate_chat_access', AsyncMock())
     monkeypatch.setattr(server, 'validate_action_card_payload', AsyncMock(return_value={'modified_price': 1500}))
     monkeypatch.setattr(server, 'record_match_event', AsyncMock())
@@ -26,7 +26,8 @@ async def test_creator_counteroffer_notifies_brand_with_campaign_room_link(isola
     assert args[0] == 'brand'
     assert args[1] == 'Creator sent a counteroffer'
     assert '1,500' in args[2]
-    assert kwargs['link'] == '/dashboard/business/campaign/private-campaign?creator=creator'
+    # The counter lives in the chat, so the brand's notification opens the chat with this creator.
+    assert kwargs['link'] == '/messages?conv=creator'
     assert server.notify_user.call_count == 2
 
 
@@ -38,7 +39,8 @@ async def test_counteroffer_without_campaign_opens_messages(isolated, monkeypatc
     monkeypatch.setattr(server, 'find_countered_private_campaign', AsyncMock(return_value=None))
     data = server.ChatActionCardCreate(recipient_id='brand', type='counter_offer', fields={'modified_price': 1500})
     await server.create_chat_action_card(data, {'id': 'creator', 'role': 'creator'})
-    assert all(call.kwargs['link'] == '/messages' for call in server.notify_user.call_args_list)
+    links = [call.kwargs['link'] for call in server.notify_user.call_args_list]
+    assert links == ['/messages?conv=creator', '/messages']  # brand: this chat; the creator's own receipt: the inbox
 
 
 @pytest.mark.asyncio
@@ -50,8 +52,13 @@ async def test_private_offer_response_notifies_both_parties(isolated, kind, acti
     await server.notify_private_offer_response(card, action, actor, {'id': 'private'})
     calls = server.notify_user.call_args_list
     assert {call.args[0] for call in calls} == {'brand', 'creator'}
-    assert next(call.kwargs['link'] for call in calls if call.args[0] == 'brand') == '/dashboard/business/campaign/private?creator=creator'
-    assert next(call.kwargs['link'] for call in calls if call.args[0] == 'creator') == '/my-deals?campaign=private'
+    if action == 'counter':
+        # A counter is negotiated in the chat: each side lands on the other's thread.
+        assert next(call.kwargs['link'] for call in calls if call.args[0] == 'brand') == '/messages?conv=creator'
+        assert next(call.kwargs['link'] for call in calls if call.args[0] == 'creator') == '/messages?conv=brand'
+    else:
+        assert next(call.kwargs['link'] for call in calls if call.args[0] == 'brand') == '/dashboard/business/campaign/private?creator=creator'
+        assert next(call.kwargs['link'] for call in calls if call.args[0] == 'creator') == '/my-deals?campaign=private'
 
 
 @pytest.mark.asyncio

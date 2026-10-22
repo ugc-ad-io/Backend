@@ -9179,7 +9179,7 @@ async def notify_private_offer_response(card: dict, action: str, current_user: d
         if action == 'reject' and card.get('type') == 'private_invitation' and user['id'] == card.get('sender_id') and current_user.get('role') == UserRole.CREATOR:
             continue
         link = '/messages'
-        if card.get('type') == 'counter_offer' or action == 'counter':
+        if action == 'counter':
             # A counter is negotiated in the chat: open it, on the other person's thread.
             other = next((u for u in users if u['id'] != user['id']), None)
             if other:
