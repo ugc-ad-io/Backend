@@ -222,3 +222,47 @@ def test_counter_notifications_open_the_chat_and_count_as_unread(env):
     assert note["link"] == f"/messages?conv={env.creator}"
     # ... and the card counts toward the brand's unread badge.
     assert env.call("GET", "/chat/unread-count", env.brand_t).json()["unread_count"] == 1
+
+
+def test_unanswered_private_brief_cannot_submit_work(env):
+    budget = 1000
+    env.run(env.db.users.update_one({"id": env.creator}, {"$set": {"profile.rate_card.expected_payout": str(budget)}}))
+    payload = {
+        "status": "pending_approval", "title": "White label perfume", "product_name": "Perfume",
+        "product_category": "Beauty & Cosmetics", "category": "Beauty & Cosmetics",
+        "product_description": "A white label perfume range for daily wear.", "campaign_hook": "Show the unboxing and first spritz.",
+        "key_message": "Long lasting everyday fragrance.", "brief_type": "Reel", "video_format": "Reel", "aspect_ratio": "9:16",
+        "duration_seconds": 30, "creator_level": "New", "content_quality_tier": "standard", "brief_text": "Authentic unboxing.",
+        "target_audience": "Women 20-35 who enjoy fragrances and daily self care routines.", "objectives": ["Awareness"],
+        "tone_tags": ["warm"], "free_revisions": 2, "revision_limit": 2, "due_date": "2027-01-20", "deadline": "2027-01-20",
+        "currency": "INR", "product_type": "digital", "requires_shipment": False, "shipment_option": "no",
+        "draft_delivery_by": "2027-01-20", "budget_min": budget, "budget_max": budget, "per_video_budget": budget, "total_budget": budget,
+        "selected_creator": env.creator, "visibility": "private",
+        "deliverable_items": [{"type": "Reel", "quantity": 1, "duration": "30 seconds", "aspect_ratios": ["9:16"], "raw_required": True, "edited_required": False}],
+    }
+    cid = env.call("POST", "/campaigns", env.brand_t, json=payload).json()["campaign_id"]
+    admin_t = server.create_token("adm", "adm@example.com", "admin")
+    env.call("POST", "/admin/approve-campaign", admin_t, json={"item_id": cid, "action": "approve"})
+    creator_t = env.call("POST", "/auth/login", json={"email": "pc-creator-1@example.com", "password": "Passw0rd!x"}).json()["token"]
+
+    row = env.call("GET", "/deals/my", creator_t).json()[0]
+    assert row["current_state"] == "Awaiting Creator Response"
+    detail = env.call("GET", f"/deals/{row['deal_id']}/detail", creator_t).json()
+    assert detail["current_state"] == "Awaiting Creator Response"
+    assert detail["can_submit_content"] is False
+
+    # Once the creator accepts, it is a normal deal again.
+    inv = env.run(env.db.chat_action_cards.find_one({"type": "private_invitation", "deal_id": cid}, {"_id": 0}))
+    assert env.call("POST", f"/chat/action-cards/{inv['id']}/respond", creator_t, json={"action": "accept"}).status_code == 200
+    row = env.call("GET", "/deals/my", creator_t).json()[0]
+    assert row["current_state"] != "Awaiting Creator Response"
+
+
+def test_brand_deals_list_newest_first(env):
+    def camp(cid, when):
+        return {"id": cid, "title": cid, "status": "active", "business_id": env.brand, "selected_creator": env.creator,
+                "selected_creators": [env.creator], "created_at": when, "updated_at": when, "visibility": "public"}
+    env.run(env.db.campaigns.insert_many([camp("old", "2026-01-01T00:00:00+00:00"), camp("newest", "2026-10-01T00:00:00+00:00"),
+                                          camp("mid", "2026-05-01T00:00:00+00:00")]))
+    rows = env.call("GET", "/deals/business", env.brand_t).json()
+    assert [r["campaign"]["id"] for r in rows] == ["newest", "mid", "old"]

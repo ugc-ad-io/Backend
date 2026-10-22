@@ -3219,7 +3219,7 @@ def normalize_revision_tracker(work: Optional[dict], response: Optional[dict],
         "accepted_changes": (response or {}).get('accepted_changes') or []
     }
 
-def compute_deal_state(campaign: dict, shipment: Optional[dict], receipt: dict, work: Optional[dict], escrow: Optional[dict], action_cards: List[dict]) -> dict:
+def compute_deal_state(campaign: dict, shipment: Optional[dict], receipt: dict, work: Optional[dict], escrow: Optional[dict], action_cards: List[dict], invitation_pending: bool = False) -> dict:
     # The campaign-level `status` fallbacks below predate multi-creator hiring and
     # were written for a single shared deal. On a multi-creator brief that field is
     # one shared string for the whole campaign, so trusting it here would show
@@ -3242,6 +3242,12 @@ def compute_deal_state(campaign: dict, shipment: Optional[dict], receipt: dict, 
     if campaign.get('status') == 'cancelled':
         state, party, action = "Cancelled", "system", "Deal cancelled"
         started = campaign.get('cancelled_at') or campaign.get('updated_at')
+    elif invitation_pending:
+        # A private brief the creator has not accepted or declined yet is NOT a deal in progress:
+        # without this it fell through to "Received - Content in Progress" and offered
+        # "Submit raw video" before anything was agreed.
+        state, party, action = "Awaiting Creator Response", "creator", "Accept or decline the brief"
+        started = campaign.get('created_at')
     elif damaged:
         state, party, action = "Damaged/Wrong Product Reported", "brand", "Resolve damage report"
         started = receipt.get('received_at') or now_iso()
@@ -3489,13 +3495,23 @@ async def get_deal_context(deal_id: str, current_user: dict) -> dict:
         "revision_history": revision_history
     }
 
+async def private_invitation_pending(campaign: dict) -> bool:
+    """True while a private brief's invitation card is still waiting for the creator's answer."""
+    if campaign.get("visibility") != PRIVATE_VISIBILITY:
+        return False
+    return bool(await db.chat_action_cards.find_one(
+        {"deal_id": campaign.get("id"), "type": "private_invitation", "status": {"$in": ["open", "pending"]}},
+        {"_id": 0, "id": 1}))
+
+
 async def build_deal_response(context: dict, viewer: dict) -> dict:
     campaign = context['campaign']
     creator = context['creator']
     brand = context['brand']
     normalized_shipment = normalize_shipment(campaign, context['shipment'])
     normalized_receipt = normalize_receipt(context['shipment'], context['receipt'])
-    state = compute_deal_state(campaign, context['shipment'], normalized_receipt, context['work'], context['escrow'], context['action_cards'])
+    state = compute_deal_state(campaign, context['shipment'], normalized_receipt, context['work'], context['escrow'], context['action_cards'],
+                               invitation_pending=await private_invitation_pending(campaign))
     escrow = normalize_escrow(context['escrow'], context['my_bid'], state['current_state'])
     content_submission = normalize_content_submission(campaign, context['content_versions'], context['work'])
     # Watermark gating: a brand viewer only sees raw originals once the work is
@@ -11230,6 +11246,11 @@ async def creator_deal_summaries(campaigns: List[dict], creator_id: str, *, sett
                 {"id": {"$in": list(due)}}, {"_id": 0}).to_list(None)}
             return await creator_deal_summaries([refreshed.get(c["id"], c) for c in campaigns], creator_id, settle_due=False)
     brand_by_id = {b["id"]: b for b in brands}
+    # Only private briefs can be waiting on an answer, so public lists cost no extra read.
+    private_ids = [c["id"] for c in campaigns if c.get("visibility") == PRIVATE_VISIBILITY]
+    pending_invites = {c["deal_id"] for c in await db.chat_action_cards.find(
+        {"deal_id": {"$in": private_ids}, "type": "private_invitation", "status": {"$in": ["open", "pending"]}},
+        {"_id": 0, "deal_id": 1}).to_list(None)} if private_ids else set()
     def grouped(rows):
         result = {}
         for row in rows:
@@ -11249,7 +11270,8 @@ async def creator_deal_summaries(campaigns: List[dict], creator_id: str, *, sett
         receipt = own(receipt_by_campaign, campaign, fallback=True)
         own_cards = [card for card in cards_by_campaign.get(campaign["id"], [])
                      if not card.get("creator_id") or card.get("creator_id") == creator_id]
-        state = compute_deal_state(campaign, shipment, normalize_receipt(shipment, receipt), work, escrow, own_cards)
+        state = compute_deal_state(campaign, shipment, normalize_receipt(shipment, receipt), work, escrow, own_cards,
+                                   invitation_pending=campaign.get("visibility") == PRIVATE_VISIBILITY and campaign["id"] in pending_invites)
         bid = next((b for b in campaign.get("bids", []) if b.get("creator_id") == creator_id), None)
         brand = brand_by_id.get(campaign.get("business_id")) or {}
         profile = brand.get("profile") or {}
@@ -11314,7 +11336,9 @@ async def get_business_deals(current_user: dict = Depends(get_current_user)):
         "business_id": _brand_ws_id(current_user),  # team members see the owner's deals
         "$or": [{"selected_creators": {"$nin": [None, [], ""]}}, {"selected_creator": {"$nin": [None, ""]}}],
         "archived_by_brand": {"$ne": True},  # hide what the brand has archived
-    }, {"_id": 0}).to_list(200)
+    }, {"_id": 0}).sort("updated_at", -1).to_list(200)
+    # Newest first, same as the creator's list.
+    campaigns.sort(key=lambda c: str(c.get("updated_at") or c.get("created_at") or ""), reverse=True)
 
     # One deal per hired creator — a multi-creator brief yields several deal rows,
     # each addressed by its own per-creator deal id.
