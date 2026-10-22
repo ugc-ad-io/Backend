@@ -179,3 +179,15 @@ async def test_accepting_a_private_brief_asks_both_parties_to_confirm_the_addres
     titles = {(call.args[0], call.args[1]) for call in server.notify_user.call_args_list}
     assert ("creator", "Confirm your delivery address") in titles
     assert ("brand", "Confirm product pickup and delivery details") in titles
+
+
+def test_same_clip_under_two_urls_is_listed_once():
+    from portfolio_helpers import creator_portfolio
+    user = {"profile": {"portfolio_items": [{"videoUrl": "https://res.cloudinary.com/x/video/upload/t_a,w_9/v12/ugc/clip1.mp4"}]},
+            "portfolio": [{"video_url": "https://bucket.s3.amazonaws.com/ugc/clip1.mp4?X-Amz-Signature=abc"},
+                          {"video_url": "https://bucket.s3.amazonaws.com/ugc/clip2.mp4"}]}
+    assert [portfolio_url_of(i) for i in creator_portfolio(user)] == ["https://res.cloudinary.com/x/video/upload/t_a,w_9/v12/ugc/clip1.mp4", "https://bucket.s3.amazonaws.com/ugc/clip2.mp4"]
+
+
+def portfolio_url_of(item):
+    return item["videoUrl"]

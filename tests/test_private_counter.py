@@ -85,7 +85,8 @@ def env(monkeypatch):
         return out if isinstance(out, list) else out.get("deals", [])
 
     yield type("Env", (), dict(run=run, db=server.db, counter_and_accept=staticmethod(counter_and_accept),
-                               balance=staticmethod(balance), my_deals=staticmethod(my_deals), creator=creator))
+                               balance=staticmethod(balance), my_deals=staticmethod(my_deals), creator=creator,
+                               brand=brand, brand_t=brand_t, call=staticmethod(call)))
     loop.close()
 
 
@@ -131,3 +132,56 @@ def test_explicit_counter_keeps_original_campaign_and_agreed_date(env):
     assert len(campaigns) == 1 and campaigns[0]["id"] == orig_id
     assert campaigns[0]["deadline"] == "2027-02-10"
     assert campaigns[0]["draft_delivery_by"] == "2027-02-10"
+
+
+def test_creator_is_notified_when_the_brand_sends_a_counter_offer(env):
+    """A brand-sent counter used to reach the creator with no notification at all."""
+    resp = env.call("POST", "/chat/action-cards", env.brand_t, json={"recipient_id": env.creator, "type": "counter_offer", "fields": {
+        "modified_price": 2500, "revisions": "1", "timeline": "7 days", "usage_rights": "Organic social",
+        "diff_vs_original": "The timeline is tight and we need a slightly higher price for it."}})
+    assert resp.status_code == 200, resp.text
+    notes = env.run(env.db.in_app_notifications.find({"user_id": env.creator, "title": "You've received a counteroffer"}).to_list(5))
+    assert len(notes) == 1 and "2,500" in notes[0]["message"] and notes[0]["link"] == f"/messages?conv={env.brand}"
+
+
+def test_header_unread_badge_matches_the_messages_list(env):
+    env.run(env.db.messages.insert_many([
+        {"id": "m1", "sender_id": env.creator, "recipient_id": env.brand, "content": "hi", "read": False, "created_at": "2027-01-01T00:00:00+00:00"},
+        {"id": "m2", "sender_id": "system", "recipient_id": env.brand, "content": "welcome", "read": False, "created_at": "2027-01-01T00:00:01+00:00"},
+    ]))
+    badge = env.call("GET", "/chat/unread-count", env.brand_t).json()["unread_count"]
+    listed = sum(c["unread_count"] for c in env.call("GET", "/chat/conversations", env.brand_t).json())
+    assert badge == listed == 1
+
+
+def test_login_accepts_email_or_the_mobile_number(env):
+    # The fixture gives the brand and creator one shared number; a shared number must NOT sign in.
+    assert env.call("POST", "/auth/login", json={"email": "9876546001", "password": "Passw0rd!x"}).status_code == 401
+    env.run(env.db.users.update_one({"id": env.creator}, {"$set": {"phone": "9000000000"}}))
+    by_email = env.call("POST", "/auth/login", json={"email": "pc-business-1@example.com", "password": "Passw0rd!x"})
+    by_phone = env.call("POST", "/auth/login", json={"email": "+91 98765 46001", "password": "Passw0rd!x"})
+    wrong = env.call("POST", "/auth/login", json={"email": "9876546001", "password": "nope"})
+    assert by_email.status_code == by_phone.status_code == 200
+    assert by_phone.json()["user_id"] == by_email.json()["user_id"] == env.brand
+    assert wrong.status_code == 401
+
+
+def test_creator_deals_list_newest_first(env):
+    def camp(cid, when):
+        return {"id": cid, "title": cid, "status": "active", "business_id": env.brand, "selected_creator": env.creator,
+                "selected_creators": [env.creator], "created_at": when, "updated_at": when, "visibility": "public"}
+    env.run(env.db.campaigns.insert_many([camp("old", "2026-01-01T00:00:00+00:00"), camp("newest", "2026-10-01T00:00:00+00:00"),
+                                          camp("mid", "2026-05-01T00:00:00+00:00")]))
+    creator_t = env.call("POST", "/auth/login", json={"email": "pc-creator-1@example.com", "password": "Passw0rd!x"}).json()["token"]
+    rows = env.call("GET", "/deals/my", creator_t).json()
+    assert [r["campaign"]["id"] for r in rows] == ["newest", "mid", "old"]
+
+
+def test_nobody_can_bid_on_a_private_brief(env, monkeypatch):
+    monkeypatch.setattr(server, "creator_profile_missing", lambda user: [])  # get past the profile gate
+    env.run(env.db.campaigns.insert_one({"id": "pb", "title": "Private tee", "status": "active", "visibility": "private",
+                                         "business_id": env.brand, "selected_creator": env.creator, "selected_creators": [env.creator]}))
+    creator_t = env.call("POST", "/auth/login", json={"email": "pc-creator-1@example.com", "password": "Passw0rd!x"}).json()["token"]
+    resp = env.call("POST", "/campaigns/pb/bid", creator_t, json={"campaign_id": "pb", "amount": 1000, "proposal": "I would love to do this", "estimated_delivery_days": 3})
+    assert resp.status_code == 400 and "private brief" in resp.text
+    assert env.run(env.db.campaigns.find_one({"id": "pb"})).get("bids") in (None, [])

@@ -15,15 +15,27 @@ def portfolio_url(item):
     return next((value for value in candidates if value), "")
 
 
+def clip_key(url):
+    """The same clip reached through a Cloudinary, bucket or signed link must count once
+    (mirrors clipKey in the app's mediaPreview.ts)."""
+    url = str(url or "")
+    cloud = re.match(r"^https?://res\.cloudinary\.com/[^/]+/video/upload/(?:[^/]*,[^/]*/)?(?:v\d+/)?(.+)$", url, re.I)
+    path = cloud.group(1) if cloud else re.sub(r"^https?://[^/]+/", "", url, flags=re.I)
+    path = re.sub(r"[?#].*$", "", path.lstrip("/"))
+    path = re.sub(r"\.[a-z0-9]{2,4}$", "", path, flags=re.I)
+    return re.sub(r"^previews/", "", path, flags=re.I).lower()
+
+
 def creator_portfolio(user):
     profile = user.get("profile") or {}
     result, seen = [], set()
     for source in (profile.get("portfolio_items"), user.get("portfolio"), profile.get("portfolio")):
         for item in source if isinstance(source, list) else [source]:
             url = portfolio_url(item)
-            if not url or str(url).startswith("blob:") or url in seen:
+            key = clip_key(url)
+            if not url or str(url).startswith("blob:") or key in seen:
                 continue
-            seen.add(url)
+            seen.add(key)
             result.append({**item, "videoUrl": url} if isinstance(item, dict) else item)
     if not result:
         intro = user.get("intro_video") or profile.get("intro_video")

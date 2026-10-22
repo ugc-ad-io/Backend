@@ -279,7 +279,7 @@ class SignupRequest(BaseModel):
     dial_code: str = "+91"
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    email: str  # email OR mobile number (the field keeps its name for old clients)
     password: str
 
 class GoogleAuthRequest(BaseModel):
@@ -3113,7 +3113,7 @@ def normalize_receipt(shipment: Optional[dict], receipt: Optional[dict]) -> dict
 
 def normalize_escrow(escrow: Optional[dict], my_bid: Optional[dict], state: Optional[str] = None) -> dict:
     escrow = escrow or {}
-    amount = float(escrow.get('amount') or escrow.get('held_amount') or (my_bid or {}).get('amount') or 0)
+    amount = float(escrow.get('amount') or escrow.get('held_amount') or escrow.get('reserved_amount') or escrow.get('slot_amount') or (my_bid or {}).get('amount') or 0)
     status_value = escrow.get('status') or ("released" if state == "Paid - Complete" else "held")
     status_map = {
         "held": "held",
@@ -3780,9 +3780,23 @@ def two_factor_gate(user: dict, totp_token: Optional[str]) -> Optional[dict]:
     return None
 
 
+async def find_login_user(identifier: str) -> Optional[dict]:
+    """Account for an email or a mobile number. A number signs in only when exactly one
+    account carries it (phones are not unique), otherwise it is treated as not found."""
+    ident = (identifier or "").strip()
+    if "@" in ident:
+        return await db.users.find_one({"email": ident}, {"_id": 0})
+    digits = re.sub(r"\D", "", ident)
+    if len(digits) < 7:
+        return None
+    candidates = {digits, digits[-10:]} if len(digits) > 10 else {digits}
+    matches = await db.users.find({"phone": {"$in": list(candidates)}}, {"_id": 0}).to_list(2)
+    return matches[0] if len(matches) == 1 else None
+
+
 @api_router.post("/auth/login")
 async def login(data: LoginRequest, totp_token: Optional[str] = None):
-    user = await db.users.find_one({"email": data.email}, {"_id": 0})
+    user = await find_login_user(data.email)
     if not user or not user.get('password') or not verify_password(data.password, user['password']):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
@@ -7959,6 +7973,10 @@ async def submit_bid(campaign_id: str, data: BidCreate, current_user: dict = Dep
     campaign = await db.campaigns.find_one({"id": campaign_id})
     if not campaign or campaign['status'] != CampaignStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Campaign not available for bidding")
+    if campaign.get("visibility") == PRIVATE_VISIBILITY:
+        # A private brief goes to one named creator, who accepts, declines or counters it
+        # from Messages / My Deals. There is nothing to bid on.
+        raise HTTPException(status_code=400, detail="This is a private brief. Accept, decline or counter it from Messages.")
 
     quantity = total_deliverable_quantity(campaign)
     editing_quantity = creator_editing_quantity(campaign)
@@ -8572,12 +8590,17 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
 
 @api_router.get("/chat/unread-count")
 async def get_unread_count(current_user: dict = Depends(get_current_user)):
+    # Same rule as the per-thread unread_count in /chat/conversations (system senders are
+    # not threads), so the header badge can never exceed what the Messages list shows.
     count = await db.messages.count_documents({
         "recipient_id": current_user['id'],
-        "read": False
+        "sender_id": {"$ne": "system"},
+        "read": {"$ne": True},
+        "read_by": {"$ne": current_user['id']}
     })
     count += await db.chat_action_cards.count_documents({
         "recipient_id": current_user['id'],
+        "sender_id": {"$ne": "system"},
         "read_by": {"$ne": current_user['id']}
     })
     return {"unread_count": count}
@@ -8699,6 +8722,17 @@ async def create_chat_action_card(data: ChatActionCardCreate, current_user: dict
             await notify_user(current_user['id'], "Counteroffer sent",
                               "Your counteroffer has been sent to the brand. You'll be notified when they respond.",
                               link="/messages", category="deal_updates")
+        else:
+            # Brand -> creator counter: the creator had no signal at all that one arrived.
+            campaign = await find_countered_private_campaign(card)
+            if not campaign and data.deal_id:
+                campaign = await get_campaign_by_deal_id(data.deal_id)
+            await notify_user(
+                data.recipient_id, "You've received a counteroffer",
+                f"{person_display_name(current_user, 'A brand')} proposed \u20b9{parse_money(fields.get('modified_price')):,.0f}. Open Messages to accept, decline or counter.",
+                link=f"/messages?conv={current_user['id']}",
+                ntype="info", category="deal_updates",
+            )
     return {"message": "Action card created", "action_card": {key: value for key, value in card.items() if key != "_id"}}
 
 # Offer cards that, when accepted, should create/activate a funded deal.
@@ -9117,7 +9151,7 @@ async def notify_private_offer_response(card: dict, action: str, current_user: d
     creator_id = (creator or {}).get('id') or (current_user['id'] if current_user.get('role') == UserRole.CREATOR else card.get('sender_id'))
     subject = 'Counteroffer' if card.get('type') == 'counter_offer' else 'Private brief'
     verb = {'accept': 'accepted', 'reject': 'rejected', 'counter': 'counteroffer requested'}[action]
-    title = f"{subject} {verb}"
+    title = f"{subject} {verb}" if action != 'counter' else f"{subject} requested"
     actor = person_display_name(current_user, 'The other party')
     message = f"{actor}: {subject.lower()} {verb}. Open the offer to review the details."
     for user in users:
@@ -11236,7 +11270,10 @@ async def get_my_deals(current_user: dict = Depends(get_current_user), summary: 
             CampaignStatus.PENDING_APPROVAL.value,
             CampaignStatus.REJECTED.value,
         ]},
-    }, {"_id": 0}).to_list(100)
+    }, {"_id": 0}).sort("updated_at", -1).to_list(100)
+    # Newest first (the sort above keeps the 100-row cap from cutting the newest deals;
+    # this one orders rows that have no updated_at by their created_at).
+    campaigns.sort(key=lambda c: str(c.get("updated_at") or c.get("created_at") or ""), reverse=True)
 
     # This creator's own deal on each campaign (get_deal_context resolves it to the viewer).
     if summary:
