@@ -8735,29 +8735,23 @@ async def create_chat_action_card(data: ChatActionCardCreate, current_user: dict
     elif data.type == "counter_offer":
         await record_match_event("counter_sent", None, None, card_id=card["id"])
         if current_user.get("role") == UserRole.CREATOR:
-            campaign = await find_countered_private_campaign(card)
-            if not campaign and data.deal_id:
-                campaign = await get_campaign_by_deal_id(data.deal_id)
-            link = (f"/dashboard/business/campaign/{campaign['id']}?creator={current_user['id']}"
-                    if campaign else "/messages")
+            # The offer lives in the chat, so the notification opens the chat (with an email as
+            # well, so it reaches the brand outside the app).
             await notify_user(
                 data.recipient_id, "Creator sent a counteroffer",
                 f"{current_user.get('nickname') or 'A creator'} proposed ₹{parse_money(fields.get('modified_price')):,.0f}. Open the offer to review and respond.",
-                link=link, ntype="info", category="deal_updates",
+                link=f"/messages?conv={current_user['id']}", ntype="info", email=True, category="deal_updates",
             )
             await notify_user(current_user['id'], "Counteroffer sent",
                               "Your counteroffer has been sent to the brand. You'll be notified when they respond.",
                               link="/messages", category="deal_updates")
         else:
             # Brand -> creator counter: the creator had no signal at all that one arrived.
-            campaign = await find_countered_private_campaign(card)
-            if not campaign and data.deal_id:
-                campaign = await get_campaign_by_deal_id(data.deal_id)
             await notify_user(
                 data.recipient_id, "You've received a counteroffer",
                 f"{person_display_name(current_user, 'A brand')} proposed \u20b9{parse_money(fields.get('modified_price')):,.0f}. Open Messages to accept, decline or counter.",
                 link=f"/messages?conv={current_user['id']}",
-                ntype="info", category="deal_updates",
+                ntype="info", email=True, category="deal_updates",
             )
     return {"message": "Action card created", "action_card": {key: value for key, value in card.items() if key != "_id"}}
 
@@ -9185,7 +9179,12 @@ async def notify_private_offer_response(card: dict, action: str, current_user: d
         if action == 'reject' and card.get('type') == 'private_invitation' and user['id'] == card.get('sender_id') and current_user.get('role') == UserRole.CREATOR:
             continue
         link = '/messages'
-        if campaign:
+        if card.get('type') == 'counter_offer' or action == 'counter':
+            # A counter is negotiated in the chat: open it, on the other person's thread.
+            other = next((u for u in users if u['id'] != user['id']), None)
+            if other:
+                link = f"/messages?conv={other['id']}"
+        elif campaign:
             link = (f"/dashboard/business/campaign/{campaign['id']}?creator={creator_id}"
                     if user.get('role') == UserRole.BUSINESS else f"/my-deals?campaign={campaign['id']}")
         await notify_user(user['id'], title, message, link=link, category='deal_updates', ntype='warning' if action == 'reject' else 'info')

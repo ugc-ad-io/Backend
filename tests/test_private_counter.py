@@ -210,3 +210,15 @@ def test_brand_logo_reaches_everything_a_creator_reads(env, monkeypatch, tmp_pat
     env.call("DELETE", "/business/settings/logo", env.brand_t)
     gone = env.run(env.db.users.find_one({"id": env.brand}))
     assert gone["profile"]["logo"] == "" and gone["profile_photo"] == ""
+
+
+def test_counter_notifications_open_the_chat_and_count_as_unread(env):
+    creator_t = env.call("POST", "/auth/login", json={"email": "pc-creator-1@example.com", "password": "Passw0rd!x"}).json()["token"]
+    fields = {"modified_price": 2500, "revisions": "1", "timeline": "7 days", "usage_rights": "Organic social",
+              "diff_vs_original": "The timeline is tight and we need a slightly higher price for it."}
+    assert env.call("POST", "/chat/action-cards", creator_t, json={"recipient_id": env.brand, "type": "counter_offer", "fields": fields}).status_code == 200
+    note = env.run(env.db.in_app_notifications.find_one({"user_id": env.brand, "title": "Creator sent a counteroffer"}))
+    # The brand lands in the chat with this creator (not on a campaign page) ...
+    assert note["link"] == f"/messages?conv={env.creator}"
+    # ... and the card counts toward the brand's unread badge.
+    assert env.call("GET", "/chat/unread-count", env.brand_t).json()["unread_count"] == 1
