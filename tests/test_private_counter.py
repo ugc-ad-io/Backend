@@ -266,3 +266,13 @@ def test_brand_deals_list_newest_first(env):
                                           camp("mid", "2026-05-01T00:00:00+00:00")]))
     rows = env.call("GET", "/deals/business", env.brand_t).json()
     assert [r["campaign"]["id"] for r in rows] == ["newest", "mid", "old"]
+
+
+def test_creator_campaigns_list_newest_first(env):
+    def camp(cid, when):
+        return {"id": cid, "title": cid, "status": "active", "business_id": env.brand, "created_at": when, "updated_at": when}
+    env.run(env.db.campaigns.insert_many([camp("old", "2026-01-01T00:00:00+00:00"), camp("newest", "2026-10-01T00:00:00+00:00"),
+                                          camp("mid", "2026-05-01T00:00:00+00:00")]))
+    creator_t = env.call("POST", "/auth/login", json={"email": "pc-creator-1@example.com", "password": "Passw0rd!x"}).json()["token"]
+    rows = env.call("GET", "/campaigns?status=active", creator_t).json()
+    assert [r["id"] for r in rows if r["id"] in ("old", "mid", "newest")] == ["newest", "mid", "old"]

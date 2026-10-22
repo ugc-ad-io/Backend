@@ -7863,7 +7863,9 @@ async def get_campaigns(
     elif status:
         query['status'] = status
     
-    campaigns = await db.campaigns.find(query, {"_id": 0}).to_list(1000)
+    campaigns = await db.campaigns.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    # Newest first (rows with no created_at fall to the end), for creators' Campaigns and brands alike.
+    campaigns.sort(key=lambda c: str(c.get("created_at") or c.get("updated_at") or ""), reverse=True)
 
     if current_user['role'] == UserRole.CREATOR:
         campaigns = [await scope_campaign_to_creator(c, current_user['id']) for c in campaigns]
