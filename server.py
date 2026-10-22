@@ -5591,11 +5591,33 @@ async def get_business_dashboard(current_user: dict = Depends(get_current_user))
         }
     }
 
+async def sync_brand_logo(current_user: dict, logo_url: str, now: Optional[str] = None) -> None:
+    """Put the brand's logo everywhere OTHER users read it. The settings page reads
+    business_settings, but creators see the brand through the owner's user document
+    (chat list, deal rows) and the campaigns (browse cards) - so the logo has to land
+    in all of them, on the workspace OWNER's account even when a team member uploads it."""
+    now = now or datetime.now(timezone.utc).isoformat()
+    ws_id = _brand_ws_id(current_user)
+    await db.users.update_many(
+        {"id": {"$in": list({ws_id, current_user["id"]})}},
+        {"$set": {"profile.logo": logo_url, "profile.profile_photo": logo_url, "profile_photo": logo_url, "updated_at": now}},
+    )
+    await db.campaigns.update_many({"business_id": ws_id}, {"$set": {"brand_logo_url": logo_url, "updated_at": now}})
+
+
 # Business Settings Routes
 @api_router.get("/business/settings/profile")
 async def get_business_settings_profile(current_user: dict = Depends(get_current_business_user)):
     settings = await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0})
-    return business_profile_defaults(current_user, (settings or {}).get("profile"))
+    profile = business_profile_defaults(current_user, (settings or {}).get("profile"))
+    # Heals a logo uploaded before it was copied to the places creators read: opening the
+    # settings page is enough to publish it.
+    logo = (profile.get("logo_url") or "").strip()
+    if logo:
+        owner = await db.users.find_one({"id": _brand_ws_id(current_user)}, {"_id": 0, "profile.logo": 1, "profile_photo": 1}) or {}
+        if (owner.get("profile") or {}).get("logo") != logo or owner.get("profile_photo") != logo:
+            await sync_brand_logo(current_user, logo)
+    return profile
 
 @api_router.put("/business/settings/profile")
 async def update_business_settings_profile(
@@ -5604,6 +5626,10 @@ async def update_business_settings_profile(
 ):
     profile_data = data.dict()
     require_non_empty(profile_data, ["brand_name", "contact_person", "work_email"])
+    if not profile_data.get("logo_url"):
+        # Saving the form must not wipe a logo the form did not carry (removal has its own DELETE).
+        existing = await db.business_settings.find_one({"business_id": _brand_ws_id(current_user)}, {"_id": 0, "profile.logo_url": 1})
+        profile_data["logo_url"] = ((existing or {}).get("profile") or {}).get("logo_url", "")
 
     now = datetime.now(timezone.utc).isoformat()
     await db.business_settings.update_one(
@@ -5633,6 +5659,7 @@ async def update_business_settings_profile(
             "updated_at": now
         }}
     )
+    await sync_brand_logo(current_user, profile_data.get("logo_url", ""), now)
     return profile_data
 
 @api_router.post("/business/settings/logo")
@@ -5669,8 +5696,7 @@ async def upload_business_settings_logo(
         },
         upsert=True
     )
-    await db.users.update_one({"id": current_user["id"]}, {"$set": {"profile.logo": logo_url, "updated_at": now}})
-    await db.campaigns.update_many({"business_id": _brand_ws_id(current_user)}, {"$set": {"brand_logo_url": logo_url, "updated_at": now}})
+    await sync_brand_logo(current_user, logo_url, now)
     return {"logo_url": logo_url}
 
 @api_router.delete("/business/settings/logo")
@@ -5687,8 +5713,7 @@ async def delete_business_settings_logo(current_user: dict = Depends(get_current
         },
         upsert=True
     )
-    await db.users.update_one({"id": current_user["id"]}, {"$set": {"profile.logo": "", "updated_at": now}})
-    await db.campaigns.update_many({"business_id": _brand_ws_id(current_user)}, {"$set": {"brand_logo_url": "", "updated_at": now}})
+    await sync_brand_logo(current_user, "", now)
     return {"logo_url": ""}
 
 @api_router.get("/business/settings/company")
@@ -8567,6 +8592,7 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
                     "username": other_user.get('username'),
                     "role": other_user.get('role', ''),
                     "profile_picture": first_non_empty(
+                        (other_user.get('profile') or {}).get('logo') if other_user.get('role') == UserRole.BUSINESS else None,
                         other_user.get('profile_photo'), other_user.get('profile_picture'),
                         (other_user.get('profile') or {}).get('profile_photo'),
                         (other_user.get('profile') or {}).get('profile_picture'),

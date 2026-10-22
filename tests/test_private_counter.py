@@ -185,3 +185,28 @@ def test_nobody_can_bid_on_a_private_brief(env, monkeypatch):
     resp = env.call("POST", "/campaigns/pb/bid", creator_t, json={"campaign_id": "pb", "amount": 1000, "proposal": "I would love to do this", "estimated_delivery_days": 3})
     assert resp.status_code == 400 and "private brief" in resp.text
     assert env.run(env.db.campaigns.find_one({"id": "pb"})).get("bids") in (None, [])
+
+
+def test_brand_logo_reaches_everything_a_creator_reads(env, monkeypatch, tmp_path):
+    monkeypatch.setenv("UPLOAD_DIR", str(tmp_path))
+    png = bytes([137]) + b"PNG" + b"0" * 64
+    env.run(env.db.campaigns.insert_one({"id": "c1", "business_id": env.brand, "title": "T", "status": "active"}))
+    # Pretend an older, different photo is already on the brand's account: the logo must win.
+    env.run(env.db.users.update_one({"id": env.brand}, {"$set": {"profile_photo": "https://old.example/photo.jpg"}}))
+    url = env.call("POST", "/business/settings/logo", env.brand_t, files={"file": ("logo.png", png, "image/png")}).json()["logo_url"]
+    brand = env.run(env.db.users.find_one({"id": env.brand}))
+    assert brand["profile"]["logo"] == brand["profile"]["profile_photo"] == brand["profile_photo"] == url
+    assert env.run(env.db.campaigns.find_one({"id": "c1"}))["brand_logo_url"] == url
+
+    # Saving the form without a logo must not wipe it ...
+    form = {"brand_name": "Sleek soul", "contact_person": "S", "work_email": "s@example.com"}
+    assert env.call("PUT", "/business/settings/profile", env.brand_t, json=form).status_code == 200
+    assert env.run(env.db.users.find_one({"id": env.brand}))["profile"]["logo"] == url
+    # ... and opening the settings heals an account whose copy went missing.
+    env.run(env.db.users.update_one({"id": env.brand}, {"$set": {"profile.logo": "", "profile_photo": ""}}))
+    assert env.call("GET", "/business/settings/profile", env.brand_t).json()["logo_url"] == url
+    assert env.run(env.db.users.find_one({"id": env.brand}))["profile_photo"] == url
+    # Removing it clears every copy.
+    env.call("DELETE", "/business/settings/logo", env.brand_t)
+    gone = env.run(env.db.users.find_one({"id": env.brand}))
+    assert gone["profile"]["logo"] == "" and gone["profile_photo"] == ""
