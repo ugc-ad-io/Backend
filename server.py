@@ -4398,6 +4398,18 @@ def _portfolio_video_url(item: Any) -> str:
             return url
     return ""
 
+def _positive_days(*values) -> Optional[int]:
+    """First value that parses to a whole number of days > 0, else None (never invented)."""
+    for value in values:
+        try:
+            days = int(float(value))
+        except (TypeError, ValueError):
+            continue
+        if days > 0:
+            return days
+    return None
+
+
 def creator_directory_public_view(creator: dict, deliverables_completed: int) -> dict:
     profile = creator.get("profile") or {}
     portfolio_preview = ""
@@ -4468,6 +4480,12 @@ def creator_directory_public_view(creator: dict, deliverables_completed: int) ->
             (profile.get("rate_card") or {}).get("expected_payout"),
             profile.get("expectedPayout"),
         ) or "",
+        # Typical turnaround the creator set on their profile; brand cards show "N-day delivery".
+        "delivery_days": _positive_days(
+            profile.get("delivery_days"),
+            (profile.get("rate_card") or {}).get("delivery_days"),
+            profile.get("deliveryDays"),
+        ),
         "level": cf.normalize_level(creator.get("level")),
         "level_label": cf.CREATOR_LEVELS[cf.normalize_level(creator.get("level"))]["label"],
     }
