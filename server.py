@@ -3525,9 +3525,11 @@ async def private_invitation_pending(campaign: dict) -> bool:
     """True while a private brief's invitation card is still waiting for the creator's answer."""
     if campaign.get("visibility") != PRIVATE_VISIBILITY:
         return False
-    return bool(await db.chat_action_cards.find_one(
-        {"deal_id": campaign.get("id"), "type": "private_invitation", "status": {"$in": ["open", "pending"]}},
-        {"_id": 0, "id": 1}))
+    # An accepted invitation settles it: a second, still-open card for the same brief (a duplicate delivery)
+    # must not keep showing "Accept or decline" on a deal the creator already accepted.
+    statuses = {c.get("status") for c in await db.chat_action_cards.find(
+        {"deal_id": campaign.get("id"), "type": "private_invitation"}, {"_id": 0, "status": 1}).to_list(None)}
+    return not statuses & {"accept", "accepted"} and bool(statuses & {"open", "pending"})
 
 
 async def build_deal_response(context: dict, viewer: dict) -> dict:
@@ -11308,9 +11310,12 @@ async def creator_deal_summaries(campaigns: List[dict], creator_id: str, *, sett
     brand_by_id = {b["id"]: b for b in brands}
     # Only private briefs can be waiting on an answer, so public lists cost no extra read.
     private_ids = [c["id"] for c in campaigns if c.get("visibility") == PRIVATE_VISIBILITY]
-    pending_invites = {c["deal_id"] for c in await db.chat_action_cards.find(
-        {"deal_id": {"$in": private_ids}, "type": "private_invitation", "status": {"$in": ["open", "pending"]}},
-        {"_id": 0, "deal_id": 1}).to_list(None)} if private_ids else set()
+    invite_cards = await db.chat_action_cards.find(
+        {"deal_id": {"$in": private_ids}, "type": "private_invitation", "status": {"$in": ["open", "pending", "accept", "accepted"]}},
+        {"_id": 0, "deal_id": 1, "status": 1}).to_list(None) if private_ids else []
+    # Same rule as private_invitation_pending: an accepted card settles the brief even if a duplicate is still open.
+    accepted_invites = {c["deal_id"] for c in invite_cards if c.get("status") in ("accept", "accepted")}
+    pending_invites = {c["deal_id"] for c in invite_cards if c.get("status") in ("open", "pending")} - accepted_invites
     def grouped(rows):
         result = {}
         for row in rows:

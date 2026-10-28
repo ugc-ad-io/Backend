@@ -277,16 +277,24 @@ def transcode_video_file(src: str, dst: str, timeout: int = 300) -> bool:
     codec = _video_codec(src)
     if codec is None:
         return False
+    # Re-encoding: cap the size (a 4K iPhone clip re-encodes ~4x slower than 1080p and can run a small
+    # server out of memory; brands watch it on a phone) and keep only the first video + audio track so the
+    # extra data tracks iPhones record (timecode / metadata) cannot make the MP4 muxer fail.
     video_args = ["-c:v", "copy"] if codec == "h264" else [
+        "-vf", "scale='if(gt(iw,ih),min(1920,iw),min(1080,iw))':-2",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
     ]
     try:
         subprocess.run(
-            ["ffmpeg", "-y", "-i", src, *video_args, "-c:a", "aac", "-movflags", "+faststart", dst],
+            ["ffmpeg", "-y", "-i", src, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+             *video_args, "-c:a", "aac", "-movflags", "+faststart", dst],
             capture_output=True, timeout=timeout, check=True,
         )
     except Exception as exc:
-        logger.error("[video] transcode failed (codec=%s): %s", codec, exc)
+        # ffmpeg's own message is the only thing that says WHY (it is not in str(exc)).
+        stderr = getattr(exc, "stderr", None)
+        tail = stderr.decode("utf-8", "replace")[-800:] if isinstance(stderr, bytes) else ""
+        logger.error("[video] transcode failed (codec=%s): %s %s", codec, exc, tail)
         raise CloudStorageError(
             "Could not process this video. Please try a different file or format; "
             "if this keeps happening, contact support."
