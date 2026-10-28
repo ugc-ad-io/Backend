@@ -17,7 +17,7 @@ import requests
 import logging
 import html
 from pathlib import Path
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, validator
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -87,11 +87,21 @@ JWT_ALGORITHM = 'HS256'
 
 # Google Sign-In — OAuth 2.0 Web client id (must match the frontend's).
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
+# Every client id whose ID tokens we accept (web + iOS + Android). GOOGLE_CLIENT_IDS is an
+# optional comma-separated extra list; GOOGLE_CLIENT_ID is always included.
+GOOGLE_EXTRA_CLIENT_IDS = [c.strip() for c in os.environ.get('GOOGLE_CLIENT_IDS', '').split(',') if c.strip()]
+
+
+def _google_audiences() -> List[str]:
+    return [c for c in [GOOGLE_CLIENT_ID, *GOOGLE_EXTRA_CLIENT_IDS] if c]
 
 # Sign in with Apple. For a native iOS sign-in the identity token's audience is
 # the app's bundle id, not a separate client id. PyJWKClient fetches and caches
 # Apple's rotating signing keys, so there is nothing to refresh by hand.
 APPLE_BUNDLE_ID = os.environ.get('APPLE_BUNDLE_ID', 'io.ugcad.app')
+# Accepted token audiences: the bundle id plus an optional Services ID (web flow) and any
+# extra ids in APPLE_AUDIENCES (comma-separated).
+APPLE_AUDIENCES = [a.strip() for a in ','.join([APPLE_BUNDLE_ID, os.environ.get('APPLE_SERVICES_ID', ''), os.environ.get('APPLE_AUDIENCES', '')]).split(',') if a.strip()]
 _APPLE_JWKS = jwt.PyJWKClient('https://appleid.apple.com/auth/keys', cache_keys=True)
 
 # Anti-Cheat Content Filtering
@@ -292,6 +302,12 @@ class AppleAuthRequest(BaseModel):
     # Apple returns the name ONLY on the very first authorization, and never in
     # the token — the client has to pass it through or it is lost for good.
     full_name: Optional[str] = None
+
+    @validator('full_name', pre=True)
+    def _flatten_name(cls, v):
+        if isinstance(v, dict):
+            v = ' '.join(str(v.get(k) or '').strip() for k in ('givenName', 'familyName', 'given_name', 'family_name')).strip()
+        return v or None
 
 class VerifyPasswordRequest(BaseModel):
     password: str
@@ -1699,6 +1715,7 @@ async def notify_user(user_id: str, title: str, message: str, link: Optional[str
             return  # Concurrent acceptance/recovery already persisted this prompt.
     else:
         await db.in_app_notifications.insert_one(notification)
+    queue_push(user_id, title, message, link, notification["id"])  # best-effort, no-op unless Firebase is configured
     # Non-critical email is suppressed during quiet hours (the in-app record still shows).
     if email and (critical or not _in_quiet_hours()):
         try:
@@ -1943,6 +1960,15 @@ async def validate_chat_access(current_user: dict, recipient_id: str, allow_acti
         raise HTTPException(status_code=404, detail="Recipient not found")
     if current_user["id"] == recipient_id:
         raise HTTPException(status_code=400, detail="You cannot send chat messages to yourself")
+
+    block = await db.blocks.find_one({"$or": [
+        {"blocker_id": recipient_id, "blocked_id": current_user["id"]},
+        {"blocker_id": current_user["id"], "blocked_id": recipient_id},
+    ]}, {"_id": 0, "blocker_id": 1})
+    if block:
+        raise HTTPException(status_code=403, detail=(
+            "You have blocked this user. Unblock them to send messages." if block.get("blocker_id") == current_user["id"]
+            else "You can't message this user."))
 
     pause = await db.chat_pauses.find_one({
         "user_id": current_user["id"],
@@ -3884,7 +3910,7 @@ async def google_auth(data: GoogleAuthRequest, totp_token: Optional[str] = None)
     """Sign in / sign up with Google. The client sends the ID token (credential)
     from Google Identity Services; we verify it, find-or-create the user, then
     issue our own JWT - same response shape as /auth/login."""
-    if not GOOGLE_CLIENT_ID:
+    if not _google_audiences():
         raise HTTPException(status_code=500, detail="Google sign-in is not configured on the server")
 
     info = await asyncio.to_thread(_verify_google_id_token, data.credential)
@@ -3892,7 +3918,7 @@ async def google_auth(data: GoogleAuthRequest, totp_token: Optional[str] = None)
         raise HTTPException(status_code=401, detail="Invalid or expired Google credential")
 
     # Token must have been issued for THIS app.
-    if info.get("aud") != GOOGLE_CLIENT_ID:
+    if info.get("aud") not in _google_audiences():
         raise HTTPException(status_code=401, detail="Google credential audience mismatch")
 
     email = (info.get("email") or "").lower()
@@ -4051,7 +4077,7 @@ async def apple_auth(data: AppleAuthRequest, totp_token: Optional[str] = None):
             data.identity_token,
             signing_key.key,
             algorithms=["RS256"],
-            audience=APPLE_BUNDLE_ID,
+            audience=APPLE_AUDIENCES,
             issuer="https://appleid.apple.com",
         )
     except Exception:
@@ -4139,16 +4165,7 @@ async def apple_auth(data: AppleAuthRequest, totp_token: Optional[str] = None):
             await db.users.update_one({"id": user.get("id") or link.get("id")}, {"$set": link})
             user.update(link)
 
-    token = create_token(user["id"], user.get("email", email), user.get("role"))
-    return {
-        "token": token,
-        "user_id": user["id"],
-        "role": user.get("role"),
-        "nickname": user.get("nickname"),
-        "creator_code": user.get("creator_code"),
-        "profile_completed": user.get("profile_completed", False),
-        "approval_status": user.get("approval_status"),
-    }
+    return _auth_response(user)
 
 
 @api_router.post("/auth/verify-password")
@@ -6507,6 +6524,7 @@ async def deactivate_profile(current_user: dict = Depends(get_current_user)):
         {"id": current_user['id']},
         {"$set": {"active": False, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
+    await db.device_tokens.delete_many({"user_id": current_user['id']})  # no pushes while hidden
     # critical=True: an account-status change must reach the inbox regardless of
     # quiet hours / notification prefs — this isn't a marketing/digest email.
     await notify_event(
@@ -6519,12 +6537,29 @@ async def deactivate_profile(current_user: dict = Depends(get_current_user)):
 
 @api_router.delete("/profile")
 async def delete_profile(current_user: dict = Depends(get_current_user)):
-    """Permanently delete the signed-in user's account."""
+    """Permanently delete the signed-in user's account (the caller's own only; no id is accepted)."""
+    if current_user.get('role') in (UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF):
+        raise HTTPException(status_code=403, detail="Staff accounts are removed by the founder, not from the app")
     # Capture the address/name BEFORE deleting — notify_user looks the user up by id,
     # which would find nothing once the row is gone.
     addr = current_user.get('email')
     name = first_name_of(current_user, fallback="")
     await db.users.delete_one({"id": current_user['id']})
+    # Personal data that lives outside the user row: push tokens, blocks, notifications,
+    # sessions. Chat/deal/payment records stay for the counterparty and for financial
+    # records, but no longer carry this person's name.
+    uid = current_user['id']
+    for coll, q in (("device_tokens", {"user_id": uid}), ("in_app_notifications", {"user_id": uid}),
+                    ("user_sessions", {"user_id": uid}), ("chat_pauses", {"user_id": uid}),
+                    ("blocks", {"$or": [{"blocker_id": uid}, {"blocked_id": uid}]})):
+        try:
+            await db[coll].delete_many(q)
+        except Exception as e:
+            logger.warning(f"[delete-account] cleanup of {coll} failed: {e}")
+    try:
+        await db.messages.update_many({"sender_id": uid}, {"$set": {"sender_nickname": "Deleted user"}})
+    except Exception as e:
+        logger.warning(f"[delete-account] message anonymisation failed: {e}")
     if addr:
         html = _notification_email_html(
             "Your account has been deleted",
@@ -8391,6 +8426,7 @@ You can now communicate directly with {creator_display} to coordinate the work. 
         "created_by": "system"
     }
     await db.in_app_notifications.insert_one(notification_doc)
+    queue_push(creator_id, notification_doc["title"], notification_doc["message"], notification_doc["link"], notification_doc["id"])
     await notify_confirm_delivery_address(campaign, creator_id)
 
     # Notify the brand that their payment is now held in escrow.
@@ -8564,6 +8600,7 @@ async def send_message(data: ChatMessage, current_user: dict = Depends(get_curre
 
 @api_router.get("/chat/conversations")
 async def get_conversations(current_user: dict = Depends(get_current_user)):
+    blocked = set(await blocked_ids_for(current_user['id']))  # threads with blocked users are hidden
     messages = await db.messages.find({
         "$or": [
             {"sender_id": current_user['id']},
@@ -8586,6 +8623,8 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
             continue
 
         other_id = item['recipient_id'] if item['sender_id'] == current_user['id'] else item['sender_id']
+        if other_id in blocked:
+            continue
         item_timestamp = item.get("created_at") or item.get("timestamp") or ""
 
         if item['sender_id'] == other_id and item['recipient_id'] == current_user['id'] and current_user['id'] not in item.get('read_by', []) and not item.get('read'):
@@ -8654,15 +8693,16 @@ async def get_conversations(current_user: dict = Depends(get_current_user)):
 async def get_unread_count(current_user: dict = Depends(get_current_user)):
     # Same rule as the per-thread unread_count in /chat/conversations (system senders are
     # not threads), so the header badge can never exceed what the Messages list shows.
+    blocked = await blocked_ids_for(current_user['id'])
     count = await db.messages.count_documents({
         "recipient_id": current_user['id'],
-        "sender_id": {"$ne": "system"},
+        "sender_id": {"$nin": ["system", *blocked]},
         "read": {"$ne": True},
         "read_by": {"$ne": current_user['id']}
     })
     count += await db.chat_action_cards.count_documents({
         "recipient_id": current_user['id'],
-        "sender_id": {"$ne": "system"},
+        "sender_id": {"$nin": ["system", *blocked]},
         "read_by": {"$ne": current_user['id']}
     })
     return {"unread_count": count}
@@ -14965,7 +15005,7 @@ USER_REF_FIELDS = [
     "sender_id", "recipient_id", "other_user_id",
     "user1_id", "user2_id", "reviewer_id", "reviewee_id",
     "reported_user_id", "reporter_id", "target_user_id",
-    "member_id", "public_creator_id", "banned_by",
+    "member_id", "public_creator_id", "banned_by", "blocker_id", "blocked_id",
 ]
 
 # Collections that hold per-user data. Global config (business_settings,
@@ -14981,7 +15021,7 @@ USER_DATA_COLLECTIONS = [
     "uploaded_files", "notification_logs", "deal_receipts", "user_sessions",
     "private_invitations", "match_events", "deal_revision_responses",
     "chat_typing", "chat_false_positive_reviews", "brand_penalties",
-    "campaign_views", "reviews",
+    "campaign_views", "reviews", "device_tokens", "blocks", "reports",
 ]
 
 # Collections keyed by campaign_id rather than directly by user. When a brand is
@@ -16519,6 +16559,268 @@ async def create_notification(
     
     await db.in_app_notifications.insert_one(notification_doc)
     return {"message": "Notification created", "notification_id": notification_doc['id']}
+
+# ---- Push notifications (device tokens + optional Firebase Cloud Messaging) ----
+# Env (all optional): FIREBASE_CREDENTIALS_JSON = service-account JSON (raw or base64),
+# or FIREBASE_CREDENTIALS_PATH = path to that JSON file. Needs `pip install firebase-admin`
+# (optional dependency, imported lazily): without the package or a credential every push
+# helper below is a silent no-op and the in-app notification is unaffected.
+FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON", "")
+FIREBASE_CREDENTIALS_PATH = os.environ.get("FIREBASE_CREDENTIALS_PATH", "")
+_firebase_state = {"app": None, "failed": False}
+_push_tasks: set = set()  # strong refs so a running push is never garbage-collected
+
+
+def _firebase_ready() -> bool:
+    if _firebase_state["app"] is not None:
+        return True
+    if _firebase_state["failed"] or not (FIREBASE_CREDENTIALS_JSON or FIREBASE_CREDENTIALS_PATH):
+        return False
+    try:
+        import firebase_admin
+        from firebase_admin import credentials
+        if FIREBASE_CREDENTIALS_JSON:
+            raw = FIREBASE_CREDENTIALS_JSON.strip()
+            if not raw.startswith("{"):
+                raw = base64.b64decode(raw).decode("utf-8")
+            cred = credentials.Certificate(json.loads(raw))
+        else:
+            cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
+        _firebase_state["app"] = firebase_admin.initialize_app(cred)
+        return True
+    except Exception as exc:  # missing package, bad credential, ...
+        _firebase_state["failed"] = True
+        logger.warning("Push notifications disabled (firebase init failed): %s", exc)
+        return False
+
+
+def _fcm_send_all(tokens: List[str], title: str, body: str, data: dict) -> List[str]:
+    """Blocking FCM sends (run in a thread). Returns tokens FCM says are dead."""
+    from firebase_admin import messaging
+    dead = []
+    for token in tokens:
+        try:
+            messaging.send(messaging.Message(
+                token=token,
+                notification=messaging.Notification(title=title, body=body),
+                data=data,
+                android=messaging.AndroidConfig(priority="high"),
+                apns=messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound="default"))),
+            ))
+        except Exception as exc:
+            if type(exc).__name__ in ("UnregisteredError", "SenderIdMismatchError", "InvalidArgumentError"):
+                dead.append(token)
+            else:
+                logger.warning("[push] send failed: %s", exc)
+    return dead
+
+
+async def send_push_to_user(user_id: str, title: str, body: str, data: Optional[dict] = None) -> int:
+    """Best-effort push to every registered device of a user. Never raises.
+    Returns the number of devices attempted (0 when push is not configured)."""
+    try:
+        if not _firebase_ready():
+            return 0
+        docs = await db.device_tokens.find({"user_id": user_id}, {"_id": 0, "token": 1}).to_list(20)
+        tokens = [d["token"] for d in docs if d.get("token")]
+        if not tokens:
+            return 0
+        payload = {str(k): str(v) for k, v in (data or {}).items() if v is not None}
+        dead = await asyncio.to_thread(_fcm_send_all, tokens, (title or "")[:100], (body or "")[:200], payload)
+        if dead:
+            await db.device_tokens.delete_many({"user_id": user_id, "token": {"$in": dead}})
+        return len(tokens)
+    except Exception as exc:
+        logger.warning("[push] failed for user %s: %s", user_id, exc)
+        return 0
+
+
+def queue_push(user_id: str, title: str, body: str, link: Optional[str] = None, notification_id: Optional[str] = None) -> None:
+    """Fire-and-forget push next to an in-app notification. Never blocks or raises."""
+    try:
+        if not (FIREBASE_CREDENTIALS_JSON or FIREBASE_CREDENTIALS_PATH) or _firebase_state["failed"]:
+            return
+        task = asyncio.create_task(send_push_to_user(
+            user_id, title, body, {"path": link or "/", "notification_id": notification_id}))
+        _push_tasks.add(task)
+        task.add_done_callback(_push_tasks.discard)
+    except Exception:
+        pass
+
+
+class DeviceTokenIn(BaseModel):
+    token: str
+    platform: Optional[str] = None
+    app_version: Optional[str] = None
+
+
+class DeviceTokenRemove(BaseModel):
+    token: str
+
+
+@api_router.post("/notifications/device-token")
+async def register_device_token(data: DeviceTokenIn, current_user: dict = Depends(get_current_user)):
+    """Register (or refresh) this device's push token for the signed-in user."""
+    token = (data.token or "").strip()
+    platform = (data.platform or "").strip().lower()
+    if not 10 <= len(token) <= 4096:
+        raise HTTPException(status_code=400, detail="Invalid device token")
+    if platform not in ("ios", "android"):
+        raise HTTPException(status_code=400, detail="platform must be 'ios' or 'android'")
+    now = now_iso()
+    # A phone shared by two accounts must only push to whoever is signed in now.
+    await db.device_tokens.delete_many({"token": token, "user_id": {"$ne": current_user["id"]}})
+    await db.device_tokens.update_one(
+        {"user_id": current_user["id"], "token": token},
+        {"$set": {"platform": platform, "app_version": (data.app_version or "")[:32], "updated_at": now},
+         "$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now}},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+@api_router.delete("/notifications/device-token")
+async def remove_device_token(data: DeviceTokenRemove, current_user: dict = Depends(get_current_user)):
+    """Forget this device's push token (called on logout). Only the caller's own token."""
+    await db.device_tokens.delete_many({"user_id": current_user["id"], "token": (data.token or "").strip()})
+    return {"ok": True}
+
+
+# ---- UGC safety (App Store 1.2): block users, report content ----
+async def blocked_ids_for(user_id: str) -> List[str]:
+    """Ids this user has blocked."""
+    docs = await db.blocks.find({"blocker_id": user_id}, {"_id": 0, "blocked_id": 1}).to_list(5000)
+    return [d["blocked_id"] for d in docs if d.get("blocked_id")]
+
+
+class BlockIn(BaseModel):
+    user_id: str
+
+
+@api_router.post("/blocks")
+async def block_user(data: BlockIn, current_user: dict = Depends(get_current_user)):
+    target_id = (data.user_id or "").strip()
+    if not target_id or target_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="You cannot block yourself")
+    target = await db.users.find_one({"id": target_id}, {"_id": 0, "role": 1})
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.get("role") in (UserRole.ADMIN, UserRole.CAMPAIGN_MANAGER, UserRole.SUPPORT_STAFF):
+        raise HTTPException(status_code=400, detail="Support and admin accounts cannot be blocked")
+    await db.blocks.update_one(
+        {"blocker_id": current_user["id"], "blocked_id": target_id},
+        {"$setOnInsert": {"id": str(uuid.uuid4()), "created_at": now_iso()}},
+        upsert=True,
+    )
+    return {"ok": True, "blocked": True, "user_id": target_id}
+
+
+@api_router.delete("/blocks/{user_id}")
+async def unblock_user(user_id: str, current_user: dict = Depends(get_current_user)):
+    await db.blocks.delete_many({"blocker_id": current_user["id"], "blocked_id": user_id})
+    return {"ok": True, "blocked": False, "user_id": user_id}
+
+
+@api_router.get("/blocks")
+async def list_blocks(current_user: dict = Depends(get_current_user)):
+    rows = await db.blocks.find({"blocker_id": current_user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    users = {u["id"]: u async for u in db.users.find(
+        {"id": {"$in": [r["blocked_id"] for r in rows]}},
+        {"_id": 0, "id": 1, "nickname": 1, "full_name": 1, "role": 1, "profile_photo": 1})}
+    out = []
+    for r in rows:
+        u = users.get(r["blocked_id"]) or {}
+        out.append({
+            "user_id": r["blocked_id"],
+            "nickname": u.get("nickname") or u.get("full_name") or "Unknown user",
+            "role": u.get("role"),
+            "profile_photo": u.get("profile_photo"),
+            "created_at": r.get("created_at"),
+        })
+    return {"blocks": out}
+
+
+REPORT_TARGET_TYPES = ("message", "user", "campaign", "review", "conversation")
+REPORTS_PER_HOUR = 10
+
+
+class ContentReportIn(BaseModel):
+    target_type: str
+    target_id: str
+    reason: str
+    note: Optional[str] = None
+
+
+@api_router.post("/reports")
+async def create_content_report(data: ContentReportIn, current_user: dict = Depends(get_current_user)):
+    """Report objectionable content/users (Apple 1.2). One open report per reporter+target."""
+    target_type = (data.target_type or "").strip().lower()
+    target_id = (data.target_id or "").strip()
+    reason = (data.reason or "").strip()
+    if target_type not in REPORT_TARGET_TYPES:
+        raise HTTPException(status_code=400, detail=f"target_type must be one of: {', '.join(REPORT_TARGET_TYPES)}")
+    if not target_id or len(target_id) > 128:
+        raise HTTPException(status_code=400, detail="target_id is required")
+    if not reason or len(reason) > 100:
+        raise HTTPException(status_code=400, detail="A reason (up to 100 characters) is required")
+    note = (data.note or "").strip()[:1000]
+    uid = current_user["id"]
+    if target_type in ("user", "conversation") and target_id == uid:
+        raise HTTPException(status_code=400, detail="You cannot report yourself")
+
+    existing = await db.reports.find_one(
+        {"reporter_id": uid, "target_type": target_type, "target_id": target_id, "status": "open"}, {"_id": 0, "id": 1})
+    if existing:
+        return {"ok": True, "report_id": existing["id"], "already_reported": True}
+    since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    if await db.reports.count_documents({"reporter_id": uid, "created_at": {"$gte": since}}) >= REPORTS_PER_HOUR:
+        raise HTTPException(status_code=429, detail="Too many reports. Please try again later.")
+
+    reported_user_id = target_id if target_type in ("user", "conversation") else None
+    excerpt = None
+    if target_type == "message":
+        msg = await db.messages.find_one({"id": target_id}, {"_id": 0, "sender_id": 1, "recipient_id": 1, "message": 1})
+        # Snapshot the text so the report survives edits/deletes; only a participant may report it.
+        if msg and uid in (msg.get("sender_id"), msg.get("recipient_id")):
+            reported_user_id = msg.get("sender_id") if msg.get("sender_id") != uid else None
+            excerpt = (msg.get("message") or "")[:500]
+    report = {
+        "id": str(uuid.uuid4()),
+        "reporter_id": uid,
+        "reporter_role": current_user.get("role"),
+        "target_type": target_type,
+        "target_id": target_id,
+        "reported_user_id": reported_user_id,
+        "reason": reason,
+        "note": note,
+        "content_excerpt": excerpt,
+        "status": "open",
+        "created_at": now_iso(),
+    }
+    await db.reports.insert_one(report)
+    try:
+        await notify_admins("New content report", f"{current_user.get('nickname', uid)} reported a {target_type} ({reason}).",
+                            link="/dashboard/admin/disputes")
+    except Exception as exc:
+        logger.warning("[reports] admin notification failed: %s", exc)
+    return {"ok": True, "report_id": report["id"], "already_reported": False}
+
+
+@api_router.get("/admin/reports")
+async def admin_list_reports(status: str = "open", current_user: dict = Depends(require_cap("warn_suspend_users"))):
+    query = {} if status == "all" else {"status": status}
+    rows = await db.reports.find(query, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return {"reports": rows}
+
+
+@api_router.post("/admin/reports/{report_id}/resolve")
+async def admin_resolve_report(report_id: str, current_user: dict = Depends(require_cap("warn_suspend_users"))):
+    res = await db.reports.update_one(
+        {"id": report_id}, {"$set": {"status": "resolved", "resolved_by": current_user["id"], "resolved_at": now_iso()}})
+    if not res.matched_count:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return {"ok": True}
+
 
 # Staff Management
 @api_router.post("/admin/staff/create")
@@ -19034,6 +19336,9 @@ DB_INDEXES = {
     "payment_transactions": ["user_id", "id", "gateway_order_id"],
     "messages": ["sender_id", "recipient_id"],
     "in_app_notifications": ["id", [("user_id", 1), ("created_at", -1)]],
+    "device_tokens": ["user_id", "token"],
+    "blocks": ["blocker_id", "blocked_id"],
+    "reports": ["reporter_id"],
 }
 
 async def ensure_indexes():
